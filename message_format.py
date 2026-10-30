@@ -92,6 +92,95 @@ def escape_label(label):
     return ''.join('\\' + char if char in string.punctuation else char for char in label)
 
 
+def code_text(text):
+    """Display a destination literally, even when its filename contains backticks."""
+    marker = '`' * (max((len(m[0]) for m in re.finditer(r'`+', text)), default=0) + 1)
+    return marker + ' ' + text.replace('\n', ' ').replace('\r', ' ') + ' ' + marker
+
+
+def closing_delimiter(text, start, opening, closing):
+    depth, pos = 1, start + 1
+    while pos < len(text):
+        if text[pos] == '\\':
+            pos += 2
+            continue
+        if text[pos] == opening:
+            depth += 1
+        elif text[pos] == closing:
+            depth -= 1
+            if not depth:
+                return pos
+        pos += 1
+    return None
+
+
+def display_destination(destination):
+    destination = destination.strip()
+    if destination.startswith('<') and '>' in destination:
+        destination = destination[1:destination.index('>')]
+    else:
+        # An optional Markdown title is not part of the file path.
+        destination = re.sub(r'''\s+(?:"[^"\n]*"|'[^'\n]*')\s*$''', '', destination)
+    return re.sub(r'\\([\\`*{}\[\]()#+.!_<> -])', r'\1', destination)
+
+
+def normalize_local_links(markdown):
+    """Local files cannot be fetched by Telegram; retain them as literal text.
+
+    Operate only on the display copy at delivery, preserving queued source and
+    existing chunk boundaries. Code examples and public/Telegram links stay intact.
+    This function never reads or uploads a local file.
+    """
+    output, fence = [], None
+    for line in markdown.splitlines(keepends=True):
+        next_fence = fence_after(line, fence)
+        if fence or next_fence or FENCE.fullmatch(line):
+            output.append(line)
+            fence = next_fence
+            continue
+        pos = 0
+        while pos < len(line):
+            if line[pos] == '\\' and pos + 1 < len(line):
+                output.append(line[pos:pos + 2])
+                pos += 2
+                continue
+            if line[pos] == '`':
+                marker = re.match(r'`+', line[pos:])[0]
+                match = re.search(r'(?<!`)' + re.escape(marker) + r'(?!`)', line[pos + len(marker):])
+                end = pos + len(marker) + match.end() if match else pos + len(marker)
+                output.append(line[pos:end])
+                pos = end
+                continue
+            image = line.startswith('![', pos)
+            start = pos + 1 if image else pos
+            if line[start:start + 1] == '[':
+                label_end = closing_delimiter(line, start, '[', ']')
+                if label_end is not None and line[label_end + 1:label_end + 2] == '(':
+                    end = closing_delimiter(line, label_end + 1, '(', ')')
+                    if end is not None:
+                        destination = display_destination(line[label_end + 2:end])
+                        if destination and not re.match(r'(?i)^(?:https?://|tg://|mailto:|tel:|#)', destination):
+                            label = line[start + 1:label_end] or ('图片' if image else '文件')
+                            kind = '本机图片，尚未上传' if image else '本机文件'
+                            output.append(label + '（' + kind + '：' + code_text(destination) + '）')
+                        else:
+                            output.append(line[pos:end + 1])
+                        pos = end + 1
+                        continue
+            output.append(line[pos])
+            pos += 1
+    return ''.join(output)
+
+
+def formatting_reason(error):
+    description = str(error).lower()
+    if 'url' in description:
+        return 'invalid_url'
+    if getattr(error, 'code', None) == 404:
+        return 'unsupported_method'
+    return 'invalid_format'
+
+
 async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None, label=None):
     label = str(label)[:128] if label else None
     route = {'chat_id': chat_id}
@@ -99,7 +188,7 @@ async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None,
         route['message_thread_id'] = topic_id
     plain = (f'〔{label}〕\n' if label else '') + text
     if rich_text is not None and getattr(telegram, 'rich_supported', None) is not False:
-        markdown = (f'〔{escape_label(label)}〕\n\n' if label else '') + rich_text
+        markdown = (f'〔{escape_label(label)}〕\n\n' if label else '') + normalize_local_links(rich_text)
         try:
             result = await telegram.call('sendRichMessage', **route, rich_message={'markdown': markdown})
             telegram.rich_supported = True
@@ -110,6 +199,6 @@ async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None,
                 raise
             if getattr(error, 'code', None) == 404:
                 telegram.rich_supported = False
-            LOG.warning('Rich Markdown rejected (%s); sending this source chunk as plain text',
-                        getattr(error, 'code', None))
+            LOG.warning('Rich Markdown rejected (%s, %s); sending this source chunk as plain text',
+                        getattr(error, 'code', None), formatting_reason(error))
     return await telegram.call('sendMessage', **route, text=plain)
