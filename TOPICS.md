@@ -1,0 +1,96 @@
+# One Bot, multiple existing Codex conversations
+
+`topics_bridge.py` reuses the single-thread bridge's native socket, attachment
+handling and durable recovery. One Telegram poller routes the owner's private
+topics to separate target queues and Codex subscriptions. It never creates or
+forks a Codex conversation.
+
+Enable Threaded Mode for the existing Bot in BotFather. Verify
+`getMe.has_topics_enabled`, create private topics with `createForumTopic`, and
+verify each existing native conversation using `thread/read` and `thread/resume`.
+Back up and stop the old collector before switching modes. Bind only explicit
+existing IDs; an unrecognized or missing target is not a reason to create a new
+conversation.
+
+The normal configuration retains its credentials, owner, socket and `thread_id`.
+Add these fields (the IDs below are placeholders):
+
+```json
+{
+  "mode": "topics",
+  "host_id": "zbox",
+  "root_target": "meeting",
+  "initial_telegram_offset": 123456,
+  "targets": [
+    {"key": "meeting", "name": "会议记录", "thread_id": "EXISTING_MEETING_ID", "message_thread_id": 100},
+    {"key": "instagram", "name": "Instagram 短片", "thread_id": "EXISTING_INSTAGRAM_ID", "message_thread_id": 101}
+  ]
+}
+```
+
+The original top-level `thread_id` must match `root_target`. Messages without a
+topic retain this original binding. `initial_telegram_offset` must come from the
+old collector's database after a clean stop with an empty queue; it is used only
+when creating `topics.sqlite` for the first time. Preserve the original database
+and its backups. Do not change a target key to a different native thread: each
+target database records its native ID and refuses such reuse.
+
+Use the usual `/usr/bin/python3 manage.py start|stop|status` on zbox. `manage.py`
+selects the entry point from `config.json`; configurations without `mode: topics`
+continue using `bridge.py`. Topic mode does not use `--notify`.
+
+Inside any private topic, `/sessions` opens the session menu. Choose **添加会话**,
+page through native conversations, select one, check its name and full ID, and
+choose **确认绑定到新话题**. The new topic becomes available without restarting
+the collector. Bindings are written atomically to `config.json`, with previous
+configurations in `binding-config-backups/`. The picker restores subscriptions
+after a restart and never creates or forks a Codex conversation. Create any new
+Codex conversation on the computer first, then refresh the picker.
+
+`/status` shows the
+native conversation's complete ID, model and effort. `/model`, `/effort` and
+`/stop` affect that topic's conversation. Unknown topics are rejected. User-made
+topics are not automatically bound or converted into new Codex conversations.
+
+`topics.sqlite` atomically records each accepted input's target and Telegram
+offset. The per-target `targets/<key>/bridge.sqlite` retains dispatch state and
+each reply's topic. A crash between handoff and acknowledgement is deduplicated.
+Outputs and attachment albums retain their original destinations across
+restarts. Failed/deleted topic delivery is never retried in another topic.
+Older native conversations that do not implement `thread/items/list` are read
+through paginated `thread/turns/list` with `itemsView: full`. Recovery preserves
+native client IDs and item timestamps and never repeats an ambiguous request.
+
+Only the existing allowlisted owner's private chat is accepted. There is one
+poller per Bot; another Bot can continue using its independent state directory.
+All targets in this first version use the same host/socket. Multi-host routing
+would also require moving attachments onto their actual execution host.
+
+Picker buttons belong to the owner's exact private chat, topic and message and
+expire after 15 minutes. A repeated selection returns an existing binding.
+Topic creation has a persistent operation record: when its network response is
+uncertain, retrying does not blindly create another topic. If a topic ID was
+recorded before interruption, startup finishes that binding using the recorded
+ID. An uncertain operation requires reviewing the actual Telegram topic before
+editing `binding_ops` to resolve it.
+
+If a Telegram topic is deleted, open `/sessions`, select its already-bound
+conversation, then **重新创建话题** → **确认重新创建话题**. This replaces the
+Telegram destination while keeping the same native thread ID, target key and
+queue. It does not delete or fork the Codex conversation. The conversation's
+current native name is used for the replacement topic. A second click for the
+old topic returns the replacement instead of creating another one.
+
+The HTTP Bot API does not expose a dedicated topic-deletion service message.
+Explicit `message thread not found` delivery failures mark that binding's topic
+unavailable and permit rebinding. Closed topics, permission errors and network
+failures do not establish deletion. An empty `editForumTopic` or typing request
+can succeed even for a deleted topic and is not used as proof of existence.
+The repair button remains available even before a delivery failure is observed.
+Historical outbox rows keep their original topic; failed replies remain stored
+and are not automatically resent, and native requests are never re-executed.
+
+Validation: `python3 -m unittest test_session_picker test_topics_bridge test_bridge test_attachments test_bus_reminder`.
+Deployment records distinguish simulated inbound probes from actual Telegram
+uploads/downloads, native model turns and topic replies. A phone-sent message
+in each topic completes the real inbound check.

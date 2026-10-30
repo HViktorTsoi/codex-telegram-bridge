@@ -1,0 +1,27 @@
+__pycache__/
+.venv/
+*.log
+config.json
+*.sqlite*
+.env
+.env.*
+!.env.example
+access.json
+health.json
+setup-session.json
+config.*.json
+!config.single.example.json
+!config.topics.example.json
+state/
+inbox/
+backups/
+upgrades/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+# Machine-specific handoff notes stay local.
+HANDOFF_ZBOX.md

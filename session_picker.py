@@ -1,0 +1,334 @@
+"""Owner-only Telegram buttons for binding existing native Codex conversations."""
+import asyncio
+import hashlib
+import json
+import secrets
+import time
+
+from bridge import RpcError, TelegramError, permitted
+
+
+class BindingError(Exception):
+    """An expected binding failure that can be shown to the owner."""
+
+
+def clean_name(value, limit=90):
+    return ' '.join(str(value).split())[:limit]
+
+
+def topic_missing_error(error):
+    if not isinstance(error, TelegramError) or error.code != 400:
+        return False
+    description = str(error).lower()
+    return any(term in description for term in (
+        'message thread not found', 'topic_id_invalid', 'topic_deleted', 'topic_not_found'))
+
+
+class SessionPicker:
+    def __init__(self, router):
+        self.router, self.db = router, router.store.db
+        self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS ui_jobs(
+                id INTEGER PRIMARY KEY,payload TEXT,state TEXT DEFAULT 'pending',error TEXT);
+            CREATE TABLE IF NOT EXISTS ui_buttons(
+                token TEXT PRIMARY KEY,chat_id TEXT,topic_id INTEGER,message_id INTEGER,
+                action TEXT,data TEXT,expires_at REAL,state TEXT DEFAULT 'active');
+            CREATE TABLE IF NOT EXISTS binding_ops(
+                thread_id TEXT PRIMARY KEY,target_json TEXT,status TEXT,error TEXT,updated_at REAL);
+        ''')
+
+    def ingest(self, update):
+        callback = update.get('callback_query')
+        message = update.get('message', {})
+        if callback is not None:
+            message = callback.get('message', {})
+            identity = {'from': callback.get('from', {}), 'chat': message.get('chat', {})}
+            valid = (permitted(identity, self.router.access(), self.router.owner)
+                     and message.get('message_id') and message.get('date') != 0
+                     and (not self.router.bot_id or message.get('from', {}).get('id') == self.router.bot_id))
+        else:
+            text = message.get('text', '').strip().split(maxsplit=1)
+            # A caption or a media message must never execute a control command.
+            from attachments import payload_from
+            if not text or text[0].split('@')[0].lower() != '/sessions' or payload_from(message):
+                return False
+            valid = permitted(message, self.router.access(), self.router.owner)
+        with self.db:
+            if valid:
+                self.db.execute('INSERT OR IGNORE INTO ui_jobs(id,payload) VALUES(?,?)',
+                                (update['update_id'], json.dumps(update, ensure_ascii=False)))
+            self.db.execute("UPDATE kv SET value=? WHERE key='offset'",
+                            (str(max(self.router.store.offset(), update['update_id'] + 1)),))
+        return True
+
+    def _button(self, chat_id, topic_id, label, action, data):
+        token = secrets.token_urlsafe(12)
+        with self.db:
+            self.db.execute('INSERT INTO ui_buttons(token,chat_id,topic_id,action,data,expires_at) VALUES(?,?,?,?,?,?)',
+                            (token, str(chat_id), topic_id, action, json.dumps(data), time.time() + 900))
+        return {'text': clean_name(label, 55), 'callback_data': 'ui:' + token}
+
+    async def panel(self, update, text, rows):
+        callback = update.get('callback_query')
+        origin = callback['message'] if callback else update['message']
+        chat_id = str(origin['chat']['id'])
+        topic_id = origin.get('message_thread_id') or None
+        keyboard = [[self._button(chat_id, topic_id, *entry) for entry in row] for row in rows]
+        tokens = [b['callback_data'][3:] for row in keyboard for b in row]
+        params = {'chat_id': chat_id, 'text': text, 'reply_markup': {'inline_keyboard': keyboard}}
+        if callback:
+            params['message_id'] = origin['message_id']
+            try:
+                result = await self.router.telegram.call('editMessageText', **params)
+            except TelegramError as error:
+                if error.code != 400 or 'message to edit not found' not in str(error).lower():
+                    raise
+                params.pop('message_id')
+                if topic_id:
+                    params['message_thread_id'] = topic_id
+                result = await self.router.telegram.call('sendMessage', **params)
+        else:
+            if topic_id:
+                params['message_thread_id'] = topic_id
+            result = await self.router.telegram.call('sendMessage', **params)
+        message_id = result['message_id']
+        with self.db:
+            # Buttons are tied to the exact chat, topic and message that displayed them.
+            self.db.execute("UPDATE ui_buttons SET state='expired' WHERE chat_id=? AND message_id=?",
+                            (chat_id, origin['message_id'] if callback else message_id))
+            for token in tokens:
+                self.db.execute('UPDATE ui_buttons SET message_id=?,state=\'active\' WHERE token=?',
+                                (message_id, token))
+
+    async def home(self, update):
+        text = self.router.sessions_text() + '\n\n点击“添加会话”，选择本机已有的 Codex 会话并绑定到新话题。'
+        text += '\n点击已绑定会话可管理或重新创建其话题入口。'
+        rows = [[(clean_name(t['name'], 40), 'select', {'thread_id': t['thread_id']})]
+                for t in list(self.router.targets.values())[:12]]
+        rows.extend([[('➕ 添加会话', 'catalog', {})], [('刷新', 'home', {})]])
+        await self.panel(update, text, rows)
+
+    async def catalog(self, update, data):
+        params = {'limit': 6, 'sortKey': 'updated_at', 'sortDirection': 'desc', 'archived': False}
+        cursor, history = data.get('cursor'), data.get('history', [])
+        if cursor:
+            params['cursor'] = cursor
+        result = await self.router.catalog_call('thread/list', params)
+        bound = {t['thread_id']: t for t in self.router.targets.values()}
+        rows = []
+        for thread in result.get('data', []):
+            if thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
+                continue
+            label = clean_name(thread.get('name') or '未命名会话', 32) + ' · ' + thread['id'][-6:]
+            if thread['id'] in bound:
+                label = ('⚠ 话题失效 ' if bound[thread['id']].get('topic_missing') else '✓ 已绑定 ') + label
+            rows.append([(label, 'select', {'thread_id': thread['id']})])
+        navigation = []
+        if history:
+            navigation.append(('上一页', 'catalog', {'cursor': history[-1], 'history': history[:-1]}))
+        if result.get('nextCursor'):
+            navigation.append(('下一页', 'catalog', {'cursor': result['nextCursor'], 'history': history + [cursor]}))
+        if navigation:
+            rows.append(navigation)
+        rows.append([('重新加载', 'catalog', {}), ('返回', 'home', {})])
+        host = self.router.config.get('host_id', '本机')
+        text = f'{host} 上的 Codex 会话\n按最近更新排序。请选择要接入的原会话：'
+        if len(rows) == 1:
+            text += '\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。'
+        await self.panel(update, text, rows)
+
+    async def selected(self, update, thread_id):
+        existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
+        if existing:
+            if existing.get('topic_missing'):
+                return await self.repair_selected(update, thread_id, existing['message_thread_id'])
+            return await self.bound_panel(update, existing, already=True)
+        result = await self.router.catalog_call('thread/read', {'threadId': thread_id})
+        thread = result['thread']
+        if thread['id'] != thread_id or thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
+            raise BindingError('所选会话当前不可绑定，请重新选择。')
+        text = (f"确认接入这个原会话？\n\n名称：{clean_name(thread.get('name') or '未命名会话', 140)}\n"
+                f"主机：{self.router.config.get('host_id', '本机')}\nID：{thread_id}\n"
+                f"目录：{clean_name(thread.get('cwd') or '默认', 220)}\n\n确认后会创建新 Telegram 话题，沿用此会话的历史和设置。")
+        await self.panel(update, text, [[('确认绑定到新话题', 'confirm', {'thread_id': thread_id})],
+                                        [('返回会话列表', 'catalog', {}), ('取消', 'home', {})]])
+
+    def operation(self, thread_id, target, status, error=None):
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO binding_ops VALUES(?,?,?,?,?)',
+                            (thread_id, json.dumps(target, ensure_ascii=False), status, error, time.time()))
+
+    async def bind(self, thread_id, allow_create=True):
+        existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
+        if existing:
+            if existing.get('topic_missing'):
+                return await self.repair(thread_id, existing['message_thread_id'], allow_create)
+            return existing
+        previous = self.db.execute('SELECT * FROM binding_ops WHERE thread_id=?', (thread_id,)).fetchone()
+        if previous:
+            if previous['status'] in ('topic_created', 'configured', 'active'):
+                target = json.loads(previous['target_json'])
+                await self.router.install_target(target)
+                self.operation(thread_id, target, 'active')
+                return target
+            if previous['status'] in ('creating', 'uncertain'):
+                raise BindingError('上一次创建话题的结果尚未确认。请先核对 Telegram 中的话题，避免重复创建。')
+        if not allow_create:
+            raise BindingError('这个确认按钮已处理，请重新打开 /sessions。')
+        thread = await self.router.verify_existing(thread_id)
+        name = clean_name(thread.get('name') or 'Codex ' + thread_id[-8:])
+        if any(t['name'] == name for t in self.router.targets.values()):
+            name += ' · ' + thread_id[-6:]
+        target = {'key': 'session_' + hashlib.sha256(thread_id.encode()).hexdigest()[:32],
+                  'name': name, 'thread_id': thread_id}
+        target = await self.create_topic(thread_id, target)
+        await self.router.install_target(target)
+        self.operation(thread_id, target, 'active')
+        return target
+
+    async def create_topic(self, thread_id, target):
+        self.operation(thread_id, target, 'creating')
+        try:
+            topic = await self.router.telegram.call('createForumTopic', chat_id=int(self.router.owner), name=target['name'])
+        except TelegramError as error:
+            status = 'uncertain' if error.code >= 500 else 'failed'
+            self.operation(thread_id, target, status, 'Telegram ' + str(error.code))
+            if status == 'uncertain':
+                raise BindingError('Telegram 服务异常，话题创建结果待核对；不会自动重复创建。') from None
+            raise BindingError('Telegram 未能创建话题，请检查话题功能后重新选择绑定。') from None
+        except (ConnectionError, asyncio.TimeoutError):
+            self.operation(thread_id, target, 'uncertain', 'Topic creation response unavailable')
+            raise BindingError('话题创建结果未确认，请先检查 Telegram；不会自动重复创建。') from None
+        topic_id = topic.get('message_thread_id')
+        if not isinstance(topic_id, int) or topic_id <= 0:
+            self.operation(thread_id, target, 'uncertain', 'Invalid topic response')
+            raise BindingError('Telegram 的话题返回结果异常，需要先核对实际话题。')
+        target['message_thread_id'] = topic_id
+        self.operation(thread_id, target, 'topic_created')
+        return target
+
+    async def repair_selected(self, update, thread_id, topic_id):
+        target = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
+        if not target:
+            return await self.selected(update, thread_id)
+        if target['message_thread_id'] != topic_id:
+            return await self.bound_panel(update, target, already=True)
+        thread = (await self.router.catalog_call('thread/read', {'threadId': thread_id}))['thread']
+        if thread['id'] != thread_id:
+            raise BindingError('会话 ID 不一致，请重新打开 /sessions。')
+        text = (f"重新创建这个会话的 Telegram 话题？\n\n名称：{clean_name(thread.get('name') or target['name'])}\n"
+                f"ID：{thread_id}\n旧话题：{topic_id}\n\n新话题仍连接这个原会话，保留其历史和设置。"
+                '旧话题的待回传消息不会被自动重发；已执行的请求也不会重复执行。')
+        await self.panel(update, text, [[('确认重新创建话题', 'repair_confirm', {'thread_id': thread_id, 'topic_id': topic_id})],
+                                        [('取消', 'home', {})]])
+
+    async def repair(self, thread_id, topic_id, allow_create=True):
+        existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
+        if not existing:
+            raise BindingError('原绑定已改变，请重新打开 /sessions。')
+        if existing['message_thread_id'] != topic_id:
+            return existing  # A second click must not replace the topic created by the first.
+        previous = self.db.execute('SELECT * FROM binding_ops WHERE thread_id=?', (thread_id,)).fetchone()
+        if previous:
+            saved = json.loads(previous['target_json'])
+            if saved.get('previous_message_thread_id') == topic_id:
+                if previous['status'] in ('topic_created', 'configured'):
+                    await self.router.install_target(saved, replace_topic=True, expected_topic_id=topic_id)
+                    self.operation(thread_id, saved, 'active')
+                    return saved
+                if previous['status'] in ('creating', 'uncertain'):
+                    raise BindingError('上次重建话题的结果待核对，不会自动重复创建。')
+        if not allow_create:
+            raise BindingError('这个重建按钮已处理，请重新打开 /sessions。')
+        thread = await self.router.verify_existing(thread_id)
+        target = {k: v for k, v in existing.items() if k not in ('message_thread_id', 'topic_missing', 'topic_missing_reason')}
+        target.update({'name': clean_name(thread.get('name') or existing['name']), 'previous_message_thread_id': topic_id})
+        target = await self.create_topic(thread_id, target)
+        await self.router.install_target(target, replace_topic=True, expected_topic_id=topic_id)
+        self.operation(thread_id, target, 'active')
+        return target
+
+    async def bound_panel(self, update, target, already=False):
+        text = (('此会话已经绑定。' if already else '已绑定，立即生效。') +
+                f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n"
+                '在该话题发送 /status 可核对会话。')
+        await self.panel(update, text, [
+            [('重新创建话题', 'repair_select', {'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']})],
+            [('继续添加', 'catalog', {}), ('返回', 'home', {})]])
+
+    async def handle_one(self):
+        job = self.db.execute("SELECT * FROM ui_jobs WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
+        if job is None:
+            return False
+        if not self.router.owner_allowed():
+            with self.db:
+                self.db.execute("UPDATE ui_jobs SET state='denied' WHERE id=?", (job['id'],))
+            return True
+        with self.db:
+            self.db.execute("UPDATE ui_jobs SET state='processing' WHERE id=?", (job['id'],))
+        update = json.loads(job['payload'])
+        callback = update.get('callback_query')
+        try:
+            if not callback:
+                await self.home(update)
+            else:
+                try:
+                    await self.router.telegram.call('answerCallbackQuery', callback_query_id=callback['id'])
+                except (TelegramError, ConnectionError):
+                    pass  # Old callback acknowledgements can expire while the durable job is pending.
+                token = callback.get('data', '')
+                button = self.db.execute('SELECT * FROM ui_buttons WHERE token=?', (token[3:],)).fetchone() if token.startswith('ui:') else None
+                origin = callback['message']
+                if (not button or button['expires_at'] < time.time() or button['state'] == 'expired'
+                        or button['message_id'] != origin['message_id'] or button['chat_id'] != str(origin['chat']['id'])
+                        or button['topic_id'] != (origin.get('message_thread_id') or None)):
+                    raise BindingError('这个按钮已失效，请发送 /sessions 重新打开。')
+                data, action = json.loads(button['data']), button['action']
+                if action == 'home':
+                    await self.home(update)
+                elif action == 'catalog':
+                    await self.catalog(update, data)
+                elif action == 'select':
+                    await self.selected(update, data['thread_id'])
+                elif action == 'confirm':
+                    allow_create = button['state'] == 'active'
+                    with self.db:
+                        self.db.execute("UPDATE ui_buttons SET state='consumed' WHERE token=?", (button['token'],))
+                    target = await self.bind(data['thread_id'], allow_create=allow_create)
+                    await self.bound_panel(update, target)
+                elif action == 'repair_select':
+                    await self.repair_selected(update, data['thread_id'], data['topic_id'])
+                elif action == 'repair_confirm':
+                    allow_create = button['state'] == 'active'
+                    with self.db:
+                        self.db.execute("UPDATE ui_buttons SET state='consumed' WHERE token=?", (button['token'],))
+                    target = await self.repair(data['thread_id'], data['topic_id'], allow_create)
+                    await self.bound_panel(update, target)
+                else:
+                    raise BindingError('未知按钮，请发送 /sessions 重新打开。')
+            with self.db:
+                self.db.execute("UPDATE ui_jobs SET state='done' WHERE id=?", (job['id'],))
+        except (BindingError, RpcError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TelegramError) as error:
+            detail = str(error) if isinstance(error, BindingError) else '暂时无法完成，请稍后发送 /sessions 重试。'
+            with self.db:
+                self.db.execute("UPDATE ui_jobs SET state='failed',error=? WHERE id=?", (type(error).__name__, job['id']))
+                origin = callback['message'] if callback else update['message']
+                self.db.execute('INSERT OR IGNORE INTO notices(id,chat_id,topic_id,text) VALUES(?,?,?,?)',
+                                (job['id'], str(origin['chat']['id']), origin.get('message_thread_id') or None, detail))
+        return True
+
+    async def loop(self):
+        while True:
+            if not await self.handle_one():
+                await asyncio.sleep(0.2)
+
+    async def recover(self):
+        with self.db:
+            self.db.execute("UPDATE ui_jobs SET state='pending' WHERE state='processing'")
+            # createForumTopic has no idempotency key; an interrupted call needs review.
+            self.db.execute("UPDATE binding_ops SET status='uncertain' WHERE status='creating'")
+        for row in self.db.execute("SELECT * FROM binding_ops WHERE status IN ('topic_created','configured','active')").fetchall():
+            target = json.loads(row['target_json'])
+            old_topic = target.get('previous_message_thread_id')
+            await self.router.install_target(target, replace_topic=old_topic is not None, expected_topic_id=old_topic)
+            self.operation(row['thread_id'], target, 'active')

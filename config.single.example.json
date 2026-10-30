@@ -1,0 +1,8 @@
+{
+  "setup_required": true,
+  "owner_id": "YOUR_TELEGRAM_USER_ID",
+  "thread_id": "EXISTING_CODEX_THREAD_ID",
+  "socket_path": "/home/YOUR_USER/.codex/app-server-control/app-server-control.sock",
+  "telegram_state_dir": "/home/YOUR_USER/.claude/channels/telegram",
+  "expected_bot_username": "YOUR_BOT_USERNAME"
+}
