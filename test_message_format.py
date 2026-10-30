@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from bridge import Store, TelegramError
-from message_format import message_parts, send_output, utf16_size
+from message_format import message_parts, normalize_local_links, send_output, utf16_size
 from topics_bridge import RoutedStore
 
 
@@ -91,6 +91,42 @@ class QueueTests(unittest.TestCase):
                 store.db.close()
 
 
+class LocalLinkTests(unittest.TestCase):
+    def test_local_image_and_download_link_preserve_surrounding_formatting(self):
+        source = '**18 人、6,219 窗**\n\n![训练图](/data/研究/训练图.png)\n\n[下载高清图片](/data/研究/训练图.png)\n\n| A | B |\n|---|---|\n| 1 | 2 |'
+        rendered = normalize_local_links(source)
+        self.assertIn('**18 人、6,219 窗**', rendered)
+        self.assertIn('训练图（本机图片，尚未上传：` /data/研究/训练图.png `）', rendered)
+        self.assertIn('下载高清图片（本机文件：` /data/研究/训练图.png `）', rendered)
+        self.assertTrue(rendered.endswith('| 1 | 2 |'))
+
+    def test_balanced_parentheses_spaces_angle_brackets_and_titles(self):
+        source = '[图](</data/a b/图(1).png> "标题") [文件](../result(2).csv)'
+        rendered = normalize_local_links(source)
+        self.assertIn('` /data/a b/图(1).png `', rendered)
+        self.assertIn('` ../result(2).csv `', rendered)
+        self.assertNotIn('标题', rendered)
+
+    def test_file_sandbox_relative_and_windows_paths_are_literal(self):
+        for target in ('file:///data/image.png', 'sandbox:/mnt/data/image.png',
+                       './report.md', 'README.md', '~/a.png', r'C:\Users\me\a.png'):
+            with self.subTest(target=target):
+                self.assertIn('本机文件', normalize_local_links('[文件](' + target + ')'))
+
+    def test_public_urls_anchors_and_code_examples_are_not_rewritten(self):
+        source = ('[web](https://example.com/a_(b)) ![remote](https://example.com/a.png)\n'
+                  '[user](tg://user?id=123) [email](mailto:a@example.com) [anchor](#here)\n'
+                  '`![literal](/tmp/a.png)`\n``[example](/tmp/a`b.md)``\n'
+                  '````markdown\n![example](/tmp/a.png)\n```\n````\n'
+                  '~~~text\n[file](/tmp/example.md)\n~~~\n')
+        self.assertEqual(normalize_local_links(source), source)
+
+    def test_backtick_filename_remains_literal_and_normalizing_twice_is_safe(self):
+        rendered = normalize_local_links('![图](/data/a`b.png)')
+        self.assertIn('`` /data/a`b.png ``', rendered)
+        self.assertEqual(normalize_local_links(rendered), rendered)
+
+
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     def telegram(self, error=None):
         class StubTelegram:
@@ -119,6 +155,25 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             await send_output(tg, chat_id='123', topic_id=42, text='raw **broken', rich_text='raw **broken')
         self.assertEqual([m for m, _ in tg.calls], ['sendRichMessage', 'sendMessage'])
         self.assertEqual(tg.calls[1][1], {'chat_id': '123', 'message_thread_id': 42, 'text': 'raw **broken'})
+
+    async def test_local_image_is_normalized_before_send_without_disabling_rich(self):
+        tg = self.telegram()
+        source = '**bold**\n\n![plot](/data/plot.png)'
+        await send_output(tg, chat_id='123', topic_id=42, text=source, rich_text=source)
+        self.assertEqual([m for m, _ in tg.calls], ['sendRichMessage'])
+        params = tg.calls[0][1]
+        self.assertEqual(params['message_thread_id'], 42)
+        self.assertIn('**bold**', params['rich_message']['markdown'])
+        self.assertNotIn('](/data/', params['rich_message']['markdown'])
+
+    async def test_failed_normalized_payload_still_falls_back_to_original_source(self):
+        tg = self.telegram(TelegramError('sendRichMessage', 400, 'Bad Request: RICH_MESSAGE_URL_INVALID'))
+        source = '**bold** ![plot](/data/plot.png)'
+        with self.assertLogs('codex_telegram_format', level='WARNING') as logs:
+            await send_output(tg, chat_id='123', topic_id=42, text=source, rich_text=source)
+        self.assertIn('invalid_url', logs.output[0])
+        self.assertNotIn('/data/plot', logs.output[0])
+        self.assertEqual(tg.calls[-1][1]['text'], source)
 
     async def test_missing_method_is_cached_but_other_sends_keep_working(self):
         tg = self.telegram(TelegramError('sendRichMessage', 404, 'Not Found'))
