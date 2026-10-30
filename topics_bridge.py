@@ -20,6 +20,7 @@ import aiohttp
 from attachments import payload_from
 from bridge import BOT_COMMANDS, Bridge, Codex, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted
 from session_picker import topic_missing_error
+from message_format import send_output
 
 LOG = logging.getLogger("codex_telegram_topics")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -111,10 +112,12 @@ class RoutedStore(Store):
 
     def enqueue_at(self, key, chat_id, text, topic_id):
         with self.db:
-            for i, part in enumerate(chunks(text)):
+            if self.db.execute('SELECT 1 FROM outbox WHERE key=?', (f'{key}:topic:{topic_id or 0}:0',)).fetchone():
+                return
+            for i, (part, rich_text) in enumerate(self.output_parts(key, text)):
                 self.db.execute(
-                    "INSERT OR IGNORE INTO outbox(key,chat_id,text,message_thread_id) VALUES(?,?,?,?)",
-                    (f"{key}:topic:{topic_id or 0}:{i}", str(chat_id), part, topic_id))
+                    "INSERT OR IGNORE INTO outbox(key,chat_id,text,message_thread_id,rich_text) VALUES(?,?,?,?,?)",
+                    (f"{key}:topic:{topic_id or 0}:{i}", str(chat_id), part, topic_id, rich_text))
 
     def enqueue(self, key, chat_id, text):
         if key.startswith("input:"):
@@ -165,6 +168,7 @@ class TargetBridge(Bridge):
                      "/sessions 查看会话并添加绑定\n"
                      "/status 查看此会话及完整 ID\n/model 查看或切换此会话模型\n"
                      "/effort 查看或修改此会话强度\n/stop 停止此会话的当前任务\n"
+                     "/format rich 开启 Markdown 排版；/format plain 使用纯文本\n"
                      "支持图片、文件和相册；附件上限20MB。语音视频暂按文件接收。\n"
                      "未绑定话题不会创建或改用其他 Codex 会话。")
         elif command == "/status":
@@ -188,10 +192,9 @@ class TargetBridge(Bridge):
                 await asyncio.sleep(0.5)
                 continue
             try:
-                params = {"chat_id": row["chat_id"], "text": f"〔{self.target['name']}〕\n{row['text']}"}
-                if row["message_thread_id"]:
-                    params["message_thread_id"] = row["message_thread_id"]
-                sent = await self.telegram.call("sendMessage", **params)
+                sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
+                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'],
+                                         label=self.target['name'])
                 with self.store.db:
                     self.store.db.execute("UPDATE outbox SET message_id=? WHERE key=?",
                                           (sent["message_id"], row["key"]))

@@ -18,6 +18,7 @@ import time
 
 import aiohttp
 from attachments import AttachmentError, inputs_for, payload_from
+from message_format import message_parts, send_output
 
 LOG = logging.getLogger("codex_telegram")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -25,6 +26,7 @@ BOT_COMMANDS = [
     {"command": "start", "description": "开始使用 Codex 对话"},
     {"command": "model", "description": "查看或切换模型，例如 /model gpt-6.1-sol"},
     {"command": "effort", "description": "查看或修改推理强度，例如 /effort high"},
+    {"command": "format", "description": "回复格式：/format rich 或 /format plain"},
     {"command": "status", "description": "查看连接状态、模型和推理强度"},
     {"command": "stop", "description": "停止当前任务"},
     {"command": "help", "description": "查看命令说明"},
@@ -81,6 +83,8 @@ class Store:
             for name in ["message_json", "media_group_id"]:
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE inbox ADD COLUMN {name} TEXT")
+            if 'rich_text' not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
+                self.db.execute('ALTER TABLE outbox ADD COLUMN rich_text TEXT')
 
     def get(self, key, default=None):
         row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
@@ -135,11 +139,16 @@ class Store:
 
     def enqueue(self, key, chat_id, text):
         with self.db:
-            for i, part in enumerate(chunks(text)):
+            if self.db.execute('SELECT 1 FROM outbox WHERE key=?', (f'{key}:0',)).fetchone():
+                return  # Preserve already-queued legacy chunk boundaries during recovery.
+            for i, (part, rich_text) in enumerate(self.output_parts(key, text)):
                 self.db.execute(
-                    "INSERT OR IGNORE INTO outbox(key,chat_id,text) VALUES(?,?,?)",
-                    (f"{key}:{i}", str(chat_id), part),
+                    "INSERT OR IGNORE INTO outbox(key,chat_id,text,rich_text) VALUES(?,?,?,?)",
+                    (f"{key}:{i}", str(chat_id), part, rich_text),
                 )
+
+    def output_parts(self, key, text):
+        return message_parts(text, rich=key.startswith('turn:') and self.get('output_format', 'rich') == 'rich')
 
     def routes(self, turn_id):
         return self.db.execute(
@@ -299,6 +308,8 @@ class Bridge:
         self.thread_id, self.owner = config["thread_id"], str(config["owner_id"])
         self.telegram_dir = Path(config["telegram_state_dir"])
         self.store = Store(self.state_dir / "bridge.sqlite")
+        if self.store.get('output_format') is None:
+            self.store.set('output_format', config.get('output_format', 'rich'))
         self.codex = Codex(config["socket_path"], self.thread_id)
         self.ready, self.dispatch_lock = asyncio.Event(), asyncio.Lock()
         self.last_error, self.username, self.last_poll_at = None, None, None
@@ -499,6 +510,7 @@ class Bridge:
             reply = ("这里已连接你现有的 Codex 会话，直接发送文字即可继续对话。\n"
                      "/model 查看当前模型和可选模型\n/model <模型 ID> 切换模型\n"
                      "/effort 查看当前强度和可选级别\n/effort <级别> 修改推理强度\n"
+                     "/format rich 开启 Markdown 排版；/format plain 使用纯文本\n"
                      "/status 查看状态、model 和 effort\n/stop 停止当前任务\n/help 查看说明\n\n"
                      "支持文字、图片、文件、位置和联系人；相册会合并发送。附件目前上限20MB。\n"
                      "语音和视频可接收为文件，尚未自动转写或提取视频帧。\n"
@@ -506,6 +518,17 @@ class Bridge:
                      "会话忙碌时，新消息会作为补充要求加入当前任务。电脑和 Codex 服务运行期间可用。")
         elif command in {"/model", "/effort"}:
             reply = await self.model_command(command, argument)
+        elif command == '/format':
+            if argument and argument.lower() not in {'rich', 'plain'}:
+                reply = '用法：/format rich 或 /format plain。'
+            else:
+                if argument:
+                    self.store.set('output_format', argument.lower())
+                    if argument.lower() == 'rich' and self.telegram is not None:
+                        self.telegram.rich_supported = None
+                mode = self.store.get('output_format', 'rich')
+                reply = ('当前回复格式：' + ('Rich Markdown' if mode == 'rich' else '纯文本') +
+                         '\n对之后生成的回复生效；格式解析失败时保留原文发送。\n/format rich 开启排版；/format plain 使用纯文本。')
         elif command == "/status":
             settings = await self.codex.settings()
             status = settings["thread"]
@@ -590,7 +613,7 @@ class Bridge:
                 await asyncio.sleep(0.5)
                 continue
             try:
-                sent = await self.telegram.call("sendMessage", chat_id=row["chat_id"], text=row["text"])
+                sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'], rich_text=row['rich_text'])
                 with self.store.db:
                     self.store.db.execute("UPDATE outbox SET message_id=? WHERE key=?", (sent["message_id"], row["key"]))
                 LOG.info("Sent Telegram message %s (%s)", sent["message_id"], row["key"])
