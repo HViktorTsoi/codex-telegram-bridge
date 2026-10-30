@@ -52,6 +52,12 @@ native conversation's complete ID, model and effort. `/model`, `/effort` and
 `/stop` affect that topic's conversation. Unknown topics are rejected. User-made
 topics are not automatically bound or converted into new Codex conversations.
 
+Codex replies use Rich Markdown by default. `/format rich` and `/format plain`
+persist a preference for the selected conversation; `/format` reads it without
+starting a model turn. Delivery keeps the original topic ID in both modes.
+`rich_text` is an additive outbox column. Existing queued chunks remain plain,
+and recovery reuses already-queued groups rather than recalculating boundaries.
+
 `topics.sqlite` atomically records each accepted input's target and Telegram
 offset. The per-target `targets/<key>/bridge.sqlite` retains dispatch state and
 each reply's topic. A crash between handoff and acknowledgement is deduplicated.

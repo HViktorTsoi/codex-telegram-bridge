@@ -189,7 +189,8 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0.01)
             self.assertEqual({p['message_thread_id'] for _, p in sends}, {11, 22})
-            self.assertIn('instagram', next(p['text'] for _, p in sends if p['message_thread_id'] == 22))
+            self.assertIn('instagram', next(p.get('text') or p['rich_message']['markdown']
+                                           for _, p in sends if p['message_thread_id'] == 22))
         finally:
             for task in tasks:
                 task.cancel()

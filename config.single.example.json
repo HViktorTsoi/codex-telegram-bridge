@@ -1,5 +1,6 @@
 {
   "setup_required": true,
+  "output_format": "rich",
   "owner_id": "YOUR_TELEGRAM_USER_ID",
   "thread_id": "EXISTING_CODEX_THREAD_ID",
   "socket_path": "/home/YOUR_USER/.codex/app-server-control/app-server-control.sock",

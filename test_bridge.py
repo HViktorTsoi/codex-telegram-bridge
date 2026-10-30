@@ -287,6 +287,18 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/help", reply)
         self.assertEqual(self.codex.updates, [])
 
+    async def test_reply_format_commands_persist_without_model_or_permission_changes(self):
+        reply = await self.command('/format')
+        self.assertIn('Rich Markdown', reply)
+        reply = await self.command('/format plain')
+        self.assertEqual(self.bridge.store.get('output_format'), 'plain')
+        self.assertIn('纯文本', reply)
+        await self.command('/format invalid')
+        self.assertEqual(self.bridge.store.get('output_format'), 'plain')
+        await self.command('/format RICH')
+        self.assertEqual(self.bridge.store.get('output_format'), 'rich')
+        self.assertEqual(self.codex.updates, [])
+
     async def test_revoked_owner_cannot_change_settings(self):
         path = Path(self.tmp.name) / "access.json"
         path.write_text(json.dumps({"dmPolicy": "allowlist", "allowFrom": []}))
