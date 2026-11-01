@@ -111,6 +111,7 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_menu_and_pagination_are_control_events_without_native_turns(self):
         menu = await self.menu()
+        self.assertNotIn('message_thread_id', menu)
         self.assertIsNone(self.router.bridges['meeting'].store.pending())
         catalog = await self.click(menu, '添加会话')
         self.assertIn('新会话', str(catalog['reply_markup']))
@@ -121,6 +122,30 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m for m, _ in self.native_calls], ['thread/list'] * 3)
         self.assertEqual(self.native_calls[1][1]['cursor'], 'second-page')
         self.assertTrue(all(len(b['callback_data'].encode()) <= 64 for row in first['reply_markup']['inline_keyboard'] for b in row))
+        self.assertEqual(self.telegram.created, [])
+
+    async def test_unknown_topic_sessions_menu_is_sent_to_main_chat(self):
+        menu = await self.menu(topic_id=999)
+        self.assertNotIn('message_thread_id', menu)
+        catalog = await self.click(menu, '添加会话')
+        self.assertEqual(catalog['message_id'], menu['message_id'])
+        self.assertNotIn('message_thread_id', catalog)
+        self.assertEqual(self.telegram.created, [])
+
+    async def test_legacy_topic_callback_sends_new_main_panel(self):
+        menu = await self.menu()
+        legacy = self.telegram.messages[menu['message_id']]
+        legacy['message_thread_id'] = 11
+        self.router.store.db.execute('UPDATE ui_buttons SET topic_id=11')
+        self.router.store.db.commit()
+        self.router.ingest(self.callback(legacy, '添加会话'))
+        await self.router.picker.handle_one()
+        migrated = self.telegram.messages[self.telegram.next_id]
+        self.assertNotEqual(migrated['message_id'], menu['message_id'])
+        self.assertNotIn('message_thread_id', migrated)
+        self.assertFalse(any(method == 'editMessageText' for method, _ in self.telegram.calls))
+        await self.click(migrated, '返回')
+        self.assertEqual(self.telegram.created, [])
 
     async def test_confirmation_binds_exact_id_atomically_and_activates_without_restart(self):
         confirmation = await self.confirmation()
