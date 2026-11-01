@@ -168,6 +168,7 @@ class TargetBridge(Bridge):
         if command in {"/help", "/start", "/sessions"}:
             reply = (self.sessions_text() + "\n\n进入对应话题即可继续原会话。\n"
                      "/sessions 查看会话并添加绑定\n"
+                     "/tasks 全局进度；/inbox 待我处理\n/to 选择会话派单；/aliases 查看 @别名\n"
                      "/status 查看此会话及完整 ID\n/model 查看或切换此会话模型\n"
                      "/effort 查看或修改此会话强度\n/stop 停止此会话的当前任务\n"
                      "/format rich 开启 Markdown 排版；/format plain 使用纯文本\n"
@@ -350,6 +351,8 @@ class TopicRouter:
         self.running, self.stopping, self.failure = False, False, None
         from session_picker import SessionPicker
         self.picker = SessionPicker(self)
+        from control_center import ControlCenter
+        self.control = ControlCenter(self)
 
     def access(self):
         try:
@@ -371,6 +374,8 @@ class TopicRouter:
         return "\n".join(lines)
 
     def ingest(self, update):
+        if self.control.ingest(update):
+            return
         if self.picker.ingest(update):
             return
         message = update.get("message", {})
@@ -436,10 +441,8 @@ class TopicRouter:
                 await asyncio.sleep(0.5)
                 continue
             try:
-                params = {"chat_id": row["chat_id"], "text": row["text"]}
-                if row["topic_id"]:
-                    params["message_thread_id"] = row["topic_id"]
-                sent = await self.telegram.call("sendMessage", **params)
+                sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
+                                         rich_text=row['rich_text'], topic_id=row['topic_id'], label=row['label'])
                 with self.store.db:
                     self.store.db.execute("UPDATE notices SET message_id=? WHERE id=?", (sent["message_id"], row["id"]))
             except (TelegramError, ConnectionError) as error:
@@ -629,7 +632,8 @@ class TopicRouter:
             if (await self.telegram.call('getWebhookInfo')).get('url'):
                 raise RuntimeError("Bot already has a webhook; leaving it unchanged")
             scope = {'type': 'chat', 'chat_id': int(self.owner)}
-            commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'}]
+            from control_center import COMMANDS
+            commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'}, *COMMANDS]
             if await self.telegram.call('getMyCommands', scope=scope) != commands:
                 await self.telegram.call('setMyCommands', scope=scope, commands=commands)
             self.failure = asyncio.get_running_loop().create_future()
@@ -640,6 +644,10 @@ class TopicRouter:
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
                     self.spawn(coro)
+                for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
+                    self.spawn(coro)
+                if self.config.get('control_hub'):
+                    self.spawn(self.control.sync_loop())
                 await self.failure
             finally:
                 self.stopping, self.running = True, False
