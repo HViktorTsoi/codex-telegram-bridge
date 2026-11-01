@@ -528,7 +528,7 @@ class ControlCenter:
                         await self.overview(origin, command[1:], mode='all' if len(pieces) > 1 and pieces[1] == 'all' else 'bound')
                     elif command == '/aliases':
                         entries = [e for e in self.view()[0] if e.get('target_key')]
-                        await self.panel(origin, '可用派单别名（重名时加机器名）：\n' + '\n'.join('@' + self.selector(e) + ' → ' + e['name'] for e in entries))
+                        await self.panel(origin, '本机派单别名（重名时用 /to 按钮选择）：\n' + '\n'.join('@' + self.selector(e) + ' → ' + e['name'] for e in entries))
                     elif command == '/to' and len(pieces) == 3:
                         await self.dispatch(origin, row['id'], self.resolve(pieces[1]), pieces[2])
                     else:
