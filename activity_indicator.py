@@ -1,6 +1,9 @@
 """One editable, durable status message per observed native turn and topic."""
+import html
 import json
 import time
+
+from message_format import formatting_error
 
 
 class TopicActivity:
@@ -66,7 +69,8 @@ class TopicActivity:
         text = f'{heading} · {duration}\n{hint}更新 ' + time.strftime('%H:%M:%S', time.localtime(now))
         if now < state.get('retry_at', 0):
             return
-        if phase == state.get('phase') and now - state.get('updated_at', 0) < self.INTERVAL:
+        if (phase == state.get('phase') and state.get('style_version') == 1
+                and now - state.get('updated_at', 0) < self.INTERVAL):
             return
         message_id = state.get('message_id')
         if not message_id and (terminal or state.get('delivery') in ('creating', 'uncertain', 'failed')):
@@ -84,13 +88,8 @@ class TopicActivity:
             state['delivery'] = 'creating'
             self.save(state)
         try:
-            if message_id:
-                result = await telegram.call('editMessageText', chat_id=state['route'][0],
-                                             message_id=message_id, text=text)
-            else:
-                result = await telegram.call('sendMessage', chat_id=state['route'][0],
-                                             message_thread_id=state['route'][1],
-                                             text=text, disable_notification=True)
+            result = await self.render(telegram, state, text)
+            if not message_id:
                 state['message_id'] = result['message_id']
         except Exception as error:
             code = getattr(error, 'code', None)
@@ -106,5 +105,28 @@ class TopicActivity:
                     state['delivery'] = 'uncertain'
                 self.save(state)
                 raise
-        state.update(delivery='sent', phase=phase, updated_at=now, retry_at=0, open=not terminal)
+        state.update(delivery='sent', phase=phase, updated_at=now, retry_at=0, open=not terminal, style_version=1)
         self.save(state)
+
+    async def render(self, telegram, state, text):
+        message_id = state.get('message_id')
+        route = {'chat_id': state['route'][0]}
+        if message_id:
+            route['message_id'] = message_id
+        else:
+            route.update(message_thread_id=state['route'][1], disable_notification=True)
+        if state.get('style') != 'plain' and getattr(telegram, 'rich_supported', None) is not False:
+            first, second = text.split('\n', 1)
+            rich = {'html': '<p><mark>' + html.escape(first) + '</mark><br>' + html.escape(second) + '</p>'}
+            try:
+                result = await telegram.call('editMessageText' if message_id else 'sendRichMessage',
+                                             **route, rich_message=rich)
+                state['style'] = 'marked'
+                return result
+            except Exception as error:
+                # Only definite format rejection can fall back; never resend on a lost response.
+                if not formatting_error(error):
+                    raise
+                state['style'] = 'plain'
+                self.save(state)
+        return await telegram.call('editMessageText' if message_id else 'sendMessage', **route, text=text)

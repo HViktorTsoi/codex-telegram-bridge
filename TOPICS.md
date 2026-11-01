@@ -66,6 +66,17 @@ panel on their next use, keeping the exact message/topic checks on callbacks and
 ForceReply prompts. Regular conversation output and activity indicators keep
 their original topics; already queued output retains its stored destination.
 
+Set `native_mirror: true` globally or per target to mirror new user inputs and public
+agent replies from native client turns. It defaults to off and
+establishes a fresh baseline on first enable, re-enable or topic repair, leaving
+earlier messages untouched. Active turns baseline their existing visible items
+and can continue mirroring newly completed content. It observes local native items only, starts no model
+turns, and deduplicates Telegram-origin input/output. Reconnect recovery is
+limited to the latest 30 native turns, matching the bridge's recovery window.
+Images get a text placeholder; local files, reasoning, tool logs and internal
+agent messages are not uploaded. Status cards use Rich HTML marked text on the
+first of two lines, retaining their 15-second edit interval and saved message ID.
+
 Codex replies use Rich Markdown by default. `/format rich` and `/format plain`
 persist a preference for the selected conversation; `/format` reads it without
 starting a model turn. Delivery keeps the original topic ID in both modes.

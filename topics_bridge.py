@@ -22,6 +22,7 @@ from bridge import BOT_COMMANDS, Bridge, Codex, RpcError, Store, Telegram, Teleg
 from session_picker import topic_missing_error
 from message_format import send_output
 from activity_indicator import TopicActivity
+from native_mirror import NativeMirror
 
 LOG = logging.getLogger("codex_telegram_topics")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -149,8 +150,21 @@ class TargetBridge(Bridge):
         self.target, self.sessions_text = target, sessions_text
         self.on_missing_topic = None
         self.activity = TopicActivity(self.store)
+        self.mirror = NativeMirror(self.store)
+
+    def mirror_allowed(self):
+        return (self.target.get('native_mirror', self.config.get('native_mirror', False))
+                and self.owner_allowed() and not self.target.get('topic_missing'))
+
+    async def update_native_mirror(self, turns):
+        if not self.mirror_allowed():
+            self.mirror.suspend()
+        elif turns is not None:
+            await self.mirror.update(self, turns)
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
+        if not replay and self.mirror_allowed():
+            self.mirror.record(self, turn_id, item)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
             return
         for route in self.store.turn_routes(turn_id):
@@ -247,6 +261,7 @@ class TargetBridge(Bridge):
                 try:
                     async with self.dispatch_lock:
                         turns = await self.reconcile()
+                        await self.update_native_mirror(turns)
                     if self.owner_allowed():
                         for row in self.store.db.execute(
                                 "SELECT DISTINCT message_thread_id FROM inbox WHERE state='running'"):
