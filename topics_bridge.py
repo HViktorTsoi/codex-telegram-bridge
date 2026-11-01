@@ -168,7 +168,7 @@ class TargetBridge(Bridge):
         if command in {"/help", "/start", "/sessions"}:
             reply = (self.sessions_text() + "\n\n进入对应话题即可继续原会话。\n"
                      "/sessions 查看会话并添加绑定\n"
-                     "/tasks 全局进度；/inbox 待我处理\n/to 选择会话派单；/aliases 查看 @别名\n"
+                     "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
                      "/status 查看此会话及完整 ID\n/model 查看或切换此会话模型\n"
                      "/effort 查看或修改此会话强度\n/stop 停止此会话的当前任务\n"
                      "/format rich 开启 Markdown 排版；/format plain 使用纯文本\n"
@@ -646,8 +646,7 @@ class TopicRouter:
                     self.spawn(coro)
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
-                if self.config.get('control_hub'):
-                    self.spawn(self.control.sync_loop())
+                self.spawn(self.control.sync_loop())
                 await self.failure
             finally:
                 self.stopping, self.running = True, False

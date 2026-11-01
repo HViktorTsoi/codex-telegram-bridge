@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from control_center import export_bundle, receive_bundle, questions_for, ident, write_json
 from topics_bridge import TopicRouter
@@ -67,11 +67,10 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
                                 'questions': [], 'bot_username': host + '_bot'})
             write_json(state / 'control/local.json', {'host': host, 'generated': time.time(), 'entries': entries})
         self.sequence = 100
-        async def peer(peer, action, payload=None):
-            if action == 'snapshot':
-                return export_bundle(self.nodes['B'].state_dir)
-            return receive_bundle(self.nodes['B'].state_dir, payload)
-        self.nodes['A'].control.peer = peer
+        for host, node in self.nodes.items():
+            foreign = self.nodes['B' if host == 'A' else 'A']
+            write_json(node.state_dir / 'control/global.json', {
+                'nodes': [json.loads((foreign.state_dir / 'control/local.json').read_text())]})
         await self.sync()
 
     async def asyncTearDown(self):
@@ -82,7 +81,8 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     async def sync(self):
-        await self.nodes['A'].control.synchronize()
+        for node in self.nodes.values():
+            await node.control.synchronize()
 
     def update(self, text, topic=11, sender=123, **extra):
         self.sequence += 1
@@ -110,125 +110,161 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         router.ingest({'update_id': self.sequence, 'callback_query': callback})
         await router.control.handle_one()
 
-    async def test_global_view_is_read_only_and_visible_from_either_bot(self):
+    async def test_local_views_are_read_only_and_isolated_between_bots(self):
         for host in ('A', 'B'):
             _, panel = await self.send(host, '/tasks')
-            self.assertIn('4 个已绑定', panel['text'])
-            self.assertIn('A /', panel['text']);self.assertIn('B /', panel['text'])
+            self.assertIn('2 个已绑定', panel['text'])
+            self.assertIn(host + ' /', panel['text']);self.assertNotIn(('B' if host == 'A' else 'A') + ' /', panel['text'])
             self.assertEqual(self.nodes[host].store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
             self.assertEqual(self.nodes[host].store.db.execute('SELECT COUNT(*) FROM ui_jobs').fetchone()[0], 0)
 
-    async def test_alias_requires_host_for_ambiguity_and_strips_prefix(self):
+    async def test_alias_is_local_and_foreign_qualified_alias_is_rejected(self):
         await self.send('A', '@paper 检查')
-        self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
-        notice = self.nodes['A'].store.db.execute('SELECT text FROM notices').fetchone()[0]
-        self.assertIn('重名', notice)
-        await self.send('A', '@B/paper\n检查引用')
-        request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
+        await self.send('A', '@B/paper 不应派单')
+        rows = self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0][0])['thread_id'], 'A-paper')
+        self.assertIn('只支持本机', self.nodes['A'].store.db.execute('SELECT text FROM notices').fetchone()[0])
+        await self.send('A', '@A/paper\n检查引用')
+        request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests ORDER BY updated DESC LIMIT 1').fetchone()[0])
         self.assertEqual(request['text'], '检查引用')
-        self.assertEqual((request['target_host'], request['thread_id']), ('B', 'B-paper'))
+        self.assertEqual((request['target_host'], request['thread_id']), ('A', 'A-paper'))
 
-    async def test_cross_host_dispatch_and_reply_are_durable_and_deduplicated(self):
-        await self.send('A', '@B/paper 检查引用')
+    async def test_local_dispatch_and_reply_are_durable_and_deduplicated(self):
+        await self.send('A', '@paper 检查引用')
         await self.sync();await self.sync()
-        target = self.nodes['B'].bridges['paper']
-        self.assertTrue(self.nodes['B'].control.deliver_one())
-        self.assertFalse(self.nodes['B'].control.deliver_one())
+        target = self.nodes['A'].bridges['paper']
+        self.assertTrue(self.nodes['A'].control.deliver_one())
+        self.assertFalse(self.nodes['A'].control.deliver_one())
         row = target.store.pending()
         self.assertEqual(row['text'], '检查引用')
         target.codex = type('Native', (), {'call': AsyncMock(return_value={'turn': {'id': 'actual-existing-turn'}})})()
         await target.dispatch_one(row)
         target.codex.call.assert_awaited_once()
         method, params = target.codex.call.call_args.args
-        self.assertEqual((method, params['threadId']), ('turn/start', 'B-paper'))
+        self.assertEqual((method, params['threadId']), ('turn/start', 'A-paper'))
         self.assertEqual(set(params), {'threadId', 'input', 'clientUserMessageId'})
         target.store.enqueue_at('turn:actual-existing-turn:reply', '123', '**检查完毕**', 22)
         target.store.mark(row['id'], 'done', 'actual-existing-turn')
         await self.sync();await self.sync()
         source = self.nodes['A'].store.db
-        relays = source.execute('SELECT * FROM notices WHERE label=?', ('B/论文',)).fetchall()
+        relays = source.execute('SELECT * FROM notices WHERE label=?', ('A/论文',)).fetchall()
         self.assertEqual(len(relays), 1)
         self.assertEqual((relays[0]['topic_id'], relays[0]['rich_text']), (11, '**检查完毕**'))
         self.assertEqual(target.store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 1)
         self.assertEqual(source.execute('SELECT state FROM cc_requests').fetchone()[0], 'done')
 
-    async def test_reverse_dispatch_works_without_reverse_ssh(self):
+    async def test_foreign_dispatch_does_not_reach_either_native_queue(self):
         await self.send('B', '/to A/paper 读批注')
-        await self.sync();self.nodes['A'].control.deliver_one()
-        row = self.nodes['A'].bridges['paper'].store.pending()
-        self.assertEqual((row['text'], row['message_thread_id']), ('读批注', 22))
+        await self.sync()
+        self.assertFalse(self.nodes['A'].control.deliver_one())
+        self.assertFalse(self.nodes['B'].control.deliver_one())
+        self.assertEqual(self.nodes['B'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
 
     async def test_import_crash_recovery_preserves_original_inbox_and_output_boundary(self):
-        await self.send('A', '@B/paper 测试')
-        await self.sync();self.nodes['B'].control.deliver_one()
-        db = self.nodes['B'].store.db
+        await self.send('A', '@paper 测试')
+        await self.sync();self.nodes['A'].control.deliver_one()
+        db = self.nodes['A'].store.db
         saved = dict(db.execute('SELECT * FROM cc_deliveries').fetchone())
         with db:
             db.execute("UPDATE cc_deliveries SET state='importing'")
-        self.nodes['B'].control.deliver_one()
+        self.nodes['A'].control.deliver_one()
         after = db.execute('SELECT * FROM cc_deliveries').fetchone()
         self.assertEqual((after['inbox_id'], after['after_rowid']), (saved['inbox_id'], saved['after_rowid']))
-        self.assertEqual(self.nodes['B'].bridges['paper'].store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 1)
+        self.assertEqual(self.nodes['A'].bridges['paper'].store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 1)
 
     async def test_changed_binding_never_redirects_accepted_work(self):
-        await self.send('A', '@B/paper 测试')
+        await self.send('A', '@paper 测试')
         await self.sync()
-        self.nodes['B'].targets['paper']['thread_id'] = 'another-native'
-        self.nodes['B'].control.deliver_one()
-        self.assertIsNone(self.nodes['B'].bridges['paper'].store.pending())
+        self.nodes['A'].targets['paper']['thread_id'] = 'another-native'
+        self.nodes['A'].control.deliver_one()
+        self.assertIsNone(self.nodes['A'].bridges['paper'].store.pending())
         await self.sync()
         self.assertEqual(self.nodes['A'].store.db.execute('SELECT state FROM cc_requests').fetchone()[0], 'failed')
 
     async def test_owner_checks_and_callback_context_cannot_be_bypassed(self):
-        await self.send('A', '@B/paper 偷发', sender=999)
+        await self.send('A', '@paper 偷发', sender=999)
         self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
         _, panel = await self.send('A', '/tasks')
         await self.click('A', panel, '查看', sender=999)
         await self.click('A', panel, '查看', topic=999)
         self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
         (self.nodes['A'].state_dir / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': []}))
-        await self.send('A', '@B/paper 偷发')
+        await self.send('A', '@paper 偷发')
         self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
 
     async def test_explicit_prompt_reply_retains_destination(self):
         _, panel = await self.send('A', '/to')
-        await self.click('A', panel, 'B/论文')
+        await self.click('A', panel, 'A/论文')
         prompt = self.nodes['A'].telegram.messages[self.nodes['A'].telegram.next_id]
         self.assertTrue(prompt['reply_markup']['force_reply'])
         await self.send('A', '只读批注', reply_to_message={'message_id': prompt['message_id']})
         request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
-        self.assertEqual((request['target_host'], request['thread_id'], request['text']), ('B', 'B-paper', '只读批注'))
+        self.assertEqual((request['target_host'], request['thread_id'], request['text']), ('A', 'A-paper', '只读批注'))
 
     async def test_attachments_do_not_fall_through_to_wrong_session(self):
-        await self.send('A', '', photo=[{'file_id': 'a'}], caption='@B/paper 看图')
+        await self.send('A', '', photo=[{'file_id': 'a'}], caption='@paper 看图')
         self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
         self.assertIn('附件', self.nodes['A'].store.db.execute('SELECT text FROM notices').fetchone()[0])
 
-    async def test_inbox_dismissal_syncs_and_old_questions_are_not_reopened(self):
-        path = self.nodes['B'].state_dir / 'control/local.json'
-        local = json.loads(path.read_text())
-        local['entries'][0]['questions'] = [{'id': ident('q1'), 'kind': 'question', 'question': '请确认采用哪个方案？'}]
-        write_json(path, local);await self.sync()
+    async def test_inbox_actions_remain_local(self):
+        for host, node in self.nodes.items():
+            path = node.state_dir / 'control/local.json'
+            local = json.loads(path.read_text())
+            local['entries'][0]['questions'] = [{'id': ident(host + ':q1'), 'kind': 'question', 'question': '请确认采用哪个方案？'}]
+            write_json(path, local)
         _, panel = await self.send('A', '/inbox')
         self.assertIn('1 项', panel['text'])
         await self.click('A', panel, '查看')
         detail = self.nodes['A'].telegram.messages[panel['message_id']]
         await self.click('A', detail, '已处理')
         await self.sync()
-        _, remote = await self.send('B', '/inbox')
-        self.assertIn('0 项', remote['text'])
+        _, local = await self.send('A', '/inbox')
+        _, other = await self.send('B', '/inbox')
+        self.assertIn('0 项', local['text'])
+        self.assertIn('1 项', other['text'])
 
-    async def test_stale_peers_are_labeled_and_pending_dispatch_survives(self):
-        local = json.loads((self.nodes['B'].state_dir / 'control/local.json').read_text())
-        local['generated'] = time.time() - 100
-        write_json(self.nodes['B'].state_dir / 'control/local.json', local)
-        await self.sync()
-        _, panel = await self.send('A', '/tasks')
-        self.assertIn('数据过期', panel['text'])
-        await self.send('A', '@B/paper 等恢复后执行')
-        self.nodes['A'].control.peer = AsyncMock(side_effect=ConnectionError('offline'))
-        await self.sync()
-        self.assertEqual(self.nodes['A'].store.db.execute('SELECT state FROM cc_requests').fetchone()[0], 'pending')
+    async def test_local_dispatch_does_not_need_hub_or_network(self):
+        self.nodes['A'].config['control_hub'] = False
+        await self.send('A', '@paper 本机执行')
+        with patch('asyncio.create_subprocess_exec', side_effect=AssertionError('No network allowed')):
+            await self.sync()
+        self.nodes['A'].control.deliver_one()
+        self.assertEqual(self.nodes['A'].bridges['paper'].store.pending()['text'], '本机执行')
+
+    async def test_old_foreign_cache_is_never_visible_even_with_legacy_peer_configuration(self):
+        for command in ['/tasks all', '/inbox', '/aliases']:
+            _, panel = await self.send('A', command)
+            self.assertNotIn('B/', panel['text']);self.assertNotIn('B /', panel['text'])
+        self.assertIsNone(self.nodes['A'].control.find({'host': 'B', 'thread_id': 'B-paper'}))
+        with self.assertRaises(ValueError):
+            await self.nodes['A'].control.dispatch(self.update('x')['message'], 900,
+                self.nodes['B'].control.resolve('paper'), '不应派单')
+
+    async def test_foreign_delivery_is_rejected_despite_legacy_allowlist(self):
+        await self.send('A', '@paper 本机')
+        request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
+        request['source_host'] = 'B'
+        result = receive_bundle(self.nodes['A'].state_dir, {'version': 1, 'owner': '123', 'incoming': [request]})
+        self.assertIn(request['id'], result['rejected'])
+        self.assertFalse(self.nodes['A'].control.deliver_one())
+
+    async def test_legacy_cross_machine_queue_is_cancelled_without_interrupting_running_work(self):
+        await self.send('A', '@paper 本机')
+        request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
+        db = self.nodes['A'].store.db;store = self.nodes['A'].bridges['paper'].store
+        for index, state in [(1, 'pending'), (2, 'running')]:
+            old = {**request, 'id': ident('legacy-' + str(index)), 'source_host': 'B'}
+            update = self.update('旧跨机任务', topic=22);update['update_id'] = -index
+            store.accept(update, update['message'])
+            if state == 'running':store.mark(-index, 'running', 'already-running-native')
+            with db:
+                db.execute('INSERT INTO cc_deliveries(id,payload,state,inbox_id,updated) VALUES(?,?,?,?,?)',
+                           (old['id'], json.dumps(old), 'queued', -index, time.time()))
+        self.nodes['A'].control.isolate_local()
+        self.assertEqual(store.db.execute('SELECT state FROM inbox WHERE id=-1').fetchone()[0], 'cancelled')
+        self.assertEqual(store.db.execute('SELECT state FROM inbox WHERE id=-2').fetchone()[0], 'running')
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM cc_deliveries WHERE state='cancelled'").fetchone()[0], 2)
 
     async def test_refresh_extracts_only_conversation_and_never_generates(self):
         node = self.nodes['A']
