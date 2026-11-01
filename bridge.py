@@ -376,6 +376,7 @@ class Bridge:
                     self.record_item(row["turn_id"], entry["item"], entry.get("completedAtMs"), replay=True)
             if turn and turn["status"] != "inProgress":
                 self.finish_turn(turn)
+        return list(turns.values())
 
     async def connection_loop(self, notify):
         while True:

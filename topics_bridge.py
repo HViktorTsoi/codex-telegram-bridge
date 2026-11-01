@@ -21,6 +21,7 @@ from attachments import payload_from
 from bridge import BOT_COMMANDS, Bridge, Codex, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted
 from session_picker import topic_missing_error
 from message_format import send_output
+from activity_indicator import TopicActivity
 
 LOG = logging.getLogger("codex_telegram_topics")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -146,6 +147,7 @@ class TargetBridge(Bridge):
         self.codex = ExactCodex(config["socket_path"], self.thread_id)
         self.target, self.sessions_text = target, sessions_text
         self.on_missing_topic = None
+        self.activity = TopicActivity(self.store)
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
@@ -218,12 +220,31 @@ class TargetBridge(Bridge):
                                               (time.time() + delay, row["key"]))
             await asyncio.sleep(0.4)
 
+    async def update_activity(self, turns):
+        if (not self.target.get('activity_indicator', self.config.get('activity_indicator', False))
+                or not self.owner_allowed() or self.target.get('topic_missing') or self.telegram is None):
+            return
+        connected = self.ready.is_set() and turns is not None
+        status = None
+        if connected and any(t.get('status') == 'inProgress' for t in turns):
+            try:
+                thread = (await self.codex.call('thread/read', {'threadId': self.thread_id}))['thread']
+                if thread['id'] != self.thread_id:
+                    raise RpcError('Activity snapshot thread identity mismatch')
+                status = thread.get('status')
+            except (ConnectionError, RpcError, asyncio.TimeoutError):
+                connected = False
+        await self.activity.update(self.telegram, chat_id=self.owner,
+                                   topic_id=self.target['message_thread_id'], name=self.target['name'],
+                                   turns=turns, status=status, connected=connected)
+
     async def maintenance_loop(self):
         while True:
+            turns = None
             if self.ready.is_set():
                 try:
                     async with self.dispatch_lock:
-                        await self.reconcile()
+                        turns = await self.reconcile()
                     if self.owner_allowed():
                         for row in self.store.db.execute(
                                 "SELECT DISTINCT message_thread_id FROM inbox WHERE state='running'"):
@@ -233,6 +254,10 @@ class TargetBridge(Bridge):
                             await self.telegram.call("sendChatAction", **params)
                 except (ConnectionError, RpcError, TelegramError, asyncio.TimeoutError):
                     pass
+            try:
+                await self.update_activity(turns)
+            except (ConnectionError, RpcError, TelegramError, asyncio.TimeoutError) as error:
+                LOG.warning('Topic activity update failed (%s)', getattr(error, 'code', type(error).__name__))
             await asyncio.sleep(4)
 
 
