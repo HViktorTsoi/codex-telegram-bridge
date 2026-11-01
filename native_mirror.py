@@ -18,6 +18,9 @@ class NativeMirror:
         store.db.execute('''CREATE TABLE IF NOT EXISTS native_mirror_seen(
             turn_id TEXT,item_id TEXT,topic_id INTEGER,fingerprint TEXT,sent INTEGER DEFAULT 0,
             PRIMARY KEY(turn_id,item_id,topic_id))''')
+        store.db.execute('''CREATE TABLE IF NOT EXISTS native_mirror_ready(
+            turn_id TEXT,topic_id INTEGER,fingerprint TEXT,pending INTEGER DEFAULT 1,
+            PRIMARY KEY(turn_id,topic_id,fingerprint))''')
         store.db.commit()
 
     def state(self):
@@ -32,7 +35,7 @@ class NativeMirror:
     async def update(self, bridge, turns):
         route = [bridge.thread_id, bridge.target['message_thread_id']]
         now, state = self.clock(), self.state()
-        if not state.get('enabled') or state.get('route') != route:
+        if not state.get('enabled') or state.get('route') != route or state.get('protocol') != 2:
             # Baseline existing items; an active desktop turn can still produce new ones.
             active_items = {}
             for turn in turns:
@@ -49,7 +52,7 @@ class NativeMirror:
                         if item.get('id'):
                             self.store.db.execute('INSERT OR REPLACE INTO native_mirror_seen VALUES(?,?,?,?,0)',
                                                   (turn['id'], item['id'], route[1], self.fingerprint(item)))
-            self.store.set(self.KEY, json.dumps({'enabled': True, 'route': route, 'since': int(now)}))
+            self.store.set(self.KEY, json.dumps({'enabled': True, 'route': route, 'since': int(now), 'protocol': 2}))
             return
         # Native recovery, like the existing bridge, covers the latest 30 turns.
         for turn in reversed(turns):
@@ -64,7 +67,9 @@ class NativeMirror:
             if row['topic_id'] != route[1] or row['state'] != 'watch':
                 continue
             terminal = turn.get('status') in ('completed', 'interrupted', 'failed')
-            if not terminal and row['last_scan'] and now - row['last_scan'] < self.INTERVAL:
+            dirty = self.store.db.execute('SELECT 1 FROM native_mirror_ready WHERE turn_id=? AND topic_id=? AND pending=1',
+                                         (turn['id'], route[1])).fetchone()
+            if not terminal and not dirty and row['last_scan'] and now - row['last_scan'] < self.INTERVAL:
                 continue
             # During an active turn only user inputs are complete in a history snapshot.
             # Agent text is mirrored from item/completed, or from a terminal-turn replay.
@@ -73,6 +78,21 @@ class NativeMirror:
             with self.store.db:
                 self.store.db.execute('UPDATE native_mirror_turns SET state=?,last_scan=? WHERE turn_id=?',
                                       ('closed' if terminal else 'watch', now, turn['id']))
+                self.store.db.execute('UPDATE native_mirror_ready SET pending=0 WHERE turn_id=? AND topic_id=?',
+                                      (turn['id'], route[1]))
+
+    def note_event(self, bridge, turn_id, item):
+        """Events prove completion and trigger a read; only history provides output IDs."""
+        state = self.state()
+        if (not state.get('enabled') or state.get('route') != [bridge.thread_id, bridge.target['message_thread_id']]
+                or item.get('type') not in ('userMessage', 'agentMessage')):
+            return
+        row = self.store.db.execute('SELECT state FROM native_mirror_turns WHERE turn_id=?', (turn_id,)).fetchone()
+        if row and row['state'] in ('ignored', 'closed'):
+            return
+        with self.store.db:
+            self.store.db.execute('INSERT OR REPLACE INTO native_mirror_ready VALUES(?,?,?,1)',
+                                  (turn_id, bridge.target['message_thread_id'], self.fingerprint(item)))
 
     def record(self, bridge, turn_id, item, allow_agent=True):
         state = self.state()
@@ -103,7 +123,11 @@ class NativeMirror:
             body = '\n'.join(parts).strip()
             key = 'native-user:' + turn_id + ':' + item['id']
             text = '🖥 你在 Codex 客户端说：\n' + body
-        elif kind == 'agentMessage' and allow_agent:
+        elif kind == 'agentMessage':
+            if not allow_agent and not self.store.db.execute(
+                    'SELECT 1 FROM native_mirror_ready WHERE turn_id=? AND topic_id=? AND fingerprint=?',
+                    (turn_id, row['topic_id'], fingerprint)).fetchone():
+                return
             if item.get('phase') not in (None, 'commentary', 'partial_answer', 'final_answer'):
                 return
             # Telegram-origin turns already have their durable route and output path.

@@ -67,12 +67,17 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.output(), [])
         self.bridge.record_item('active', self.user('启用后的新输入', iid='later-user'))
         self.bridge.record_item('active', self.agent('启用后的回复', iid='later-answer'))
+        self.items['active'].extend([self.user('启用后的新输入', iid='history-later-user'),
+                                     self.agent('启用后的回复', iid='history-later-answer')])
+        await self.bridge.update_native_mirror([self.turn('active', started=999)])
         self.assertEqual(len(self.output()), 2)
 
     async def test_completion_of_a_partial_item_present_at_enable_is_new_content(self):
         self.items['active'] = [self.user(), self.agent('尚未完整')]
         await self.bridge.update_native_mirror([self.turn('active', started=999)])
         self.bridge.record_item('active', self.agent('完整的新回复'))
+        self.items['active'][-1] = self.agent('完整的新回复')
+        await self.bridge.update_native_mirror([self.turn('active', started=999)])
         self.assertEqual(len(self.output()), 1)
         self.assertEqual(self.output()[0]['text'], '完整的新回复')
 
@@ -104,6 +109,45 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.update_native_mirror([self.turn(status='completed')])
         self.assertEqual(len(self.calls), count)
         self.assertEqual(len(self.output()), 2)
+
+    async def test_live_event_and_legacy_history_with_different_ids_are_copied_once(self):
+        await self.enable()
+        self.items['new'] = [self.user(iid='history-user-1684')]
+        await self.bridge.update_native_mirror([self.turn()])
+        self.bridge.record_item('new', self.user(iid='event-user-1'))
+        self.bridge.record_item('new', self.agent(iid='msg-native-id'))
+        self.items['new'].append(self.agent(iid='history-answer-1685'))
+        await self.bridge.update_native_mirror([self.turn()])
+        self.bridge.record_item('new', self.agent(iid='msg-native-id'))
+        await self.bridge.update_native_mirror([self.turn(status='completed')])
+        self.assertEqual(len(self.output()), 2)
+        self.assertTrue(all('history-' in row['key'] for row in self.output()))
+
+    async def test_upgrade_establishes_new_boundary_for_old_event_id_state(self):
+        self.bridge.store.set(NativeMirror.KEY, json.dumps({'enabled': True, 'route': ['existing-native', 42], 'since': 900}))
+        self.items['new'] = [self.user(iid='history-user'), self.agent(iid='history-agent')]
+        await self.bridge.update_native_mirror([self.turn()])
+        self.bridge.record_item('new', self.agent(iid='event-agent'))
+        await self.bridge.update_native_mirror([self.turn(status='completed')])
+        self.assertEqual(self.output(), [])
+        self.assertEqual(self.bridge.mirror.state()['protocol'], 2)
+
+    async def test_distinct_identical_messages_keep_their_history_occurrences(self):
+        await self.enable()
+        self.items['new'] = [self.user('继续', iid='u1'), self.agent('收到', iid='a1')]
+        await self.bridge.update_native_mirror([self.turn()])
+        self.bridge.record_item('new', self.agent('收到', iid='event-1'))
+        await self.bridge.update_native_mirror([self.turn()])
+        self.items['new'].extend([self.user('继续', iid='u2'), self.agent('收到', iid='a2')])
+        self.bridge.record_item('new', self.user('继续', iid='event-2'))
+        self.bridge.record_item('new', self.agent('收到', iid='event-3'))
+        await self.bridge.update_native_mirror([self.turn(status='completed')])
+        self.assertEqual(len(self.output()), 4)
+        count = len(self.calls)
+        self.bridge.mirror = NativeMirror(self.bridge.store, clock=lambda: self.now)
+        await self.bridge.update_native_mirror([self.turn(status='completed')])
+        self.assertEqual(len(self.calls), count)
+        self.assertEqual(len(self.output()), 4)
 
     async def test_partial_history_failure_can_resume_without_duplicate_user_echo(self):
         await self.enable()

@@ -164,7 +164,7 @@ class TargetBridge(Bridge):
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
         if not replay and self.mirror_allowed():
-            self.mirror.record(self, turn_id, item)
+            self.mirror.note_event(self, turn_id, item)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
             return
         for route in self.store.turn_routes(turn_id):
