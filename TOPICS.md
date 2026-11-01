@@ -74,7 +74,7 @@ and can continue mirroring newly completed content. It observes local native ite
 turns, and deduplicates Telegram-origin input/output. Reconnect recovery is
 limited to the latest 30 native turns, matching the bridge's recovery window.
 Images get a text placeholder; local files, reasoning, tool logs and internal
-agent messages are not uploaded. Status cards use Rich HTML marked text on the
+agent messages are not uploaded. Status cards use Rich HTML bold text on the
 first of two lines, retaining their 15-second edit interval and saved message ID.
 
 Codex replies use Rich Markdown by default. `/format rich` and `/format plain`

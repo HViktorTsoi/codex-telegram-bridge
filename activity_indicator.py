@@ -9,6 +9,7 @@ from message_format import formatting_error
 class TopicActivity:
     KEY = 'topic_activity_v1'
     INTERVAL = 15
+    STYLE_VERSION = 2
 
     def __init__(self, store, clock=time.time):
         self.store, self.clock = store, clock
@@ -40,9 +41,14 @@ class TopicActivity:
                      'started_at': started if isinstance(started, (int, float)) else now,
                      'delivery': 'new'}
             self.save(state)
-        if not state or not state.get('open'):
+        restyle = (not state.get('open') and state.get('message_id')
+                   and state.get('phase') in ('completed', 'failed', 'interrupted')
+                   and state.get('style_version') != self.STYLE_VERSION and state.get('delivery') != 'failed')
+        if not state or (not state.get('open') and not restyle):
             return
-        if not connected:
+        if restyle:
+            phase = state['phase']  # Styling an old card must not change its known terminal state.
+        elif not connected:
             phase = 'unknown'
         elif active and active['id'] == state['turn_id']:
             flags = (status or {}).get('activeFlags', [])
@@ -66,10 +72,11 @@ class TopicActivity:
                    'failed': '❌ 执行失败', 'interrupted': '⏹ 已停止'}[phase]
         # The topic title already identifies the session; keep the card to two lines.
         hint = '去 Codex 处理 · ' if phase == 'waiting' else ''
-        text = f'{heading} · {duration}\n{hint}更新 ' + time.strftime('%H:%M:%S', time.localtime(now))
+        display_time = state.get('updated_at', now) if restyle else now
+        text = f'{heading} · {duration}\n{hint}更新 ' + time.strftime('%H:%M:%S', time.localtime(display_time))
         if now < state.get('retry_at', 0):
             return
-        if (phase == state.get('phase') and state.get('style_version') == 1
+        if (phase == state.get('phase') and state.get('style_version') == self.STYLE_VERSION
                 and now - state.get('updated_at', 0) < self.INTERVAL):
             return
         message_id = state.get('message_id')
@@ -105,7 +112,7 @@ class TopicActivity:
                     state['delivery'] = 'uncertain'
                 self.save(state)
                 raise
-        state.update(delivery='sent', phase=phase, updated_at=now, retry_at=0, open=not terminal, style_version=1)
+        state.update(delivery='sent', phase=phase, updated_at=now, retry_at=0, open=not terminal, style_version=self.STYLE_VERSION)
         self.save(state)
 
     async def render(self, telegram, state, text):
@@ -117,11 +124,11 @@ class TopicActivity:
             route.update(message_thread_id=state['route'][1], disable_notification=True)
         if state.get('style') != 'plain' and getattr(telegram, 'rich_supported', None) is not False:
             first, second = text.split('\n', 1)
-            rich = {'html': '<p><mark>' + html.escape(first) + '</mark><br>' + html.escape(second) + '</p>'}
+            rich = {'html': '<p><b>' + html.escape(first) + '</b><br>' + html.escape(second) + '</p>'}
             try:
                 result = await telegram.call('editMessageText' if message_id else 'sendRichMessage',
                                              **route, rich_message=rich)
-                state['style'] = 'marked'
+                state['style'] = 'bold'
                 return result
             except Exception as error:
                 # Only definite format rejection can fall back; never resend on a lost response.

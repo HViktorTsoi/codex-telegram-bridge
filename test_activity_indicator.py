@@ -50,7 +50,8 @@ class ActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(params['disable_notification'])
         self.assertIn('⏳', self.rendered(params))
         self.assertEqual(len(self.rendered(params).splitlines()), 2)
-        self.assertIn('<mark>⏳ 正在工作', params['rich_message']['html'])
+        self.assertIn('<b>⏳ 正在工作', params['rich_message']['html'])
+        self.assertNotIn('<mark>', params['rich_message']['html'])
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 0)
         self.now += 4
         await self.update()
@@ -163,8 +164,24 @@ class ActivityTests(unittest.IsolatedAsyncioTestCase):
         await self.update()
         self.assertEqual(self.telegram.call.call_args.args, ('editMessageText',))
         self.assertEqual(self.telegram.call.call_args.kwargs['message_id'], 321)
-        self.assertIn('<mark>', self.telegram.call.call_args.kwargs['rich_message']['html'])
-        self.assertEqual(self.activity.load()['style'], 'marked')
+        self.assertIn('<b>', self.telegram.call.call_args.kwargs['rich_message']['html'])
+        self.assertEqual(self.activity.load()['style'], 'bold')
+
+    async def test_completed_marked_card_is_restyled_without_new_card_or_changed_status(self):
+        self.activity.save({'turn_id': 'native-turn', 'route': ['123', 42], 'open': False,
+                            'started_at': 900, 'finished_at': 960, 'delivery': 'sent',
+                            'message_id': 321, 'phase': 'completed', 'updated_at': 960,
+                            'style': 'marked', 'style_version': 1})
+        await self.update([], connected=False)
+        self.assertEqual(self.telegram.call.call_args.args, ('editMessageText',))
+        self.assertEqual(self.telegram.call.call_args.kwargs['message_id'], 321)
+        self.assertIn('已完成 · 1分0秒', self.rendered(self.telegram.call.call_args.kwargs))
+        self.assertNotIn('<mark>', self.telegram.call.call_args.kwargs['rich_message']['html'])
+        self.assertFalse(self.activity.open)
+        self.assertEqual(self.activity.load()['phase'], 'completed')
+        count = self.telegram.call.await_count
+        await self.update([])
+        self.assertEqual(self.telegram.call.await_count, count)
 
     async def test_format_rejection_falls_back_once_and_keeps_editing_same_plain_card(self):
         self.telegram.call.side_effect = [TelegramError('sendRichMessage', 400, 'invalid HTML'), {'message_id': 321}]

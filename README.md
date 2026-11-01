@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.5.2 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.5.3 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -113,7 +113,7 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 ### 回复排版
 
-默认将新的 Codex 回复通过 `sendRichMessage` 发送，使用 Telegram 的 Rich Markdown。菜单和其他控制回复使用普通文字，状态提示使用 Rich HTML 高亮。客户端需要支持 Telegram Rich Messages。
+默认将新的 Codex 回复通过 `sendRichMessage` 发送，使用 Telegram 的 Rich Markdown。菜单和其他控制回复使用普通文字，状态提示使用 Rich HTML 加粗。客户端需要支持 Telegram Rich Messages。
 
 在对应会话发送 `/format rich` 开启排版，`/format plain` 改为纯文本，`/format` 查看当前选择。选择按目标会话持久化，对之后生成的回复生效，不更改模型参数。
 
@@ -136,7 +136,7 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 状态消息包含最后更新时间；中间回复不会被当作任务完成。重启后复用已保存的消息 ID，完成后的旧任务不补发状态。删除或重建话题后，不会把旧状态消息改投到其他话题。该功能是周期采样，短于采样间隔的任务可能没有工作中提示；启动时已完成的任务不会创建新状态消息。发信结果不明时不盲目重发，避免重复；网络恢复后有已知消息 ID 的状态可继续更新。
 
-第一行使用 `<mark>` 添加高亮底纹，具体颜色由 Telegram 主题决定，不能指定整条气泡的背景色。继续约每 15 秒编辑原消息。已有的工作中提示会原地升级；明确的格式拒绝会降级为纯文本，限流、话题失效和送达结果不明不会触发重复发信。
+第一行使用加粗正文配色，配合彩色状态图标保持醒目和可读性。继续约每 15 秒编辑原消息，保留两行布局。已有的最新提示（包括已完成的提示）会原地升级，保留其状态和消息 ID；明确的格式拒绝会降级为纯文本，限流、话题失效和送达结果不明不会触发重复发信。
 
 ### Codex 客户端消息同步
 
