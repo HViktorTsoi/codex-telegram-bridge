@@ -7,13 +7,14 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.4.2 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.4.3 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
 总览、Inbox 和派单只管理本机会话，不配置任何跨机器同步或路由。
 使用独立 Bot 和私有配置目录，避免与已有实例争用同一个 Token；将访问策略设为仅允许本人 Telegram 用户 ID。
 按需引导我开启 BotFather Threaded Mode；多会话模式应创建真实 Telegram 话题并保存返回的 topic ID，替换示例里的占位值。
+在 BotFather 开启 Disallow users to create new threads，保留 Threaded Mode，让管理命令能留在主对话而不会被客户端自动建话题。
 安装依赖并运行测试，再启动对应实例；manage.py 只管理默认实例，独立状态目录需使用 bridge.py 或 topics_bridge.py 的 run --state-dir 入口，不要误操作已有实例。
 验证 /status 中的原 thread ID、Markdown 和图片输入；多会话模式还需验证 /sessions 和各话题的消息归属。
 缺少必要配置时再向我索取；Bot Token 只保存在目标机器私有凭据文件中，不提交到 GitHub。
@@ -29,6 +30,7 @@
 - 已绑定会话可通过按钮重新创建话题，恢复删除后的入口。
 - 可选话题内工作状态消息：原地更新用时、待处理、完成、停止和断连状态，覆盖从电脑端发起的任务。
 - `/tasks` 本机会话进度、`/inbox` 待处理事项、`@别名` 和 `/to` 本机派单。
+- 话题模式的管理菜单、命令回复和派单汇总统一显示在主对话，日常对话和工作状态留在原话题。
 - Codex 回复默认使用 Telegram Rich Markdown 排版，支持标题、表格、代码块和公式；可按会话切换纯文本。
 - `/model`、`/effort` 查询和修改对应会话的参数；`/status` 核对绑定；`/stop` 停止对应会话的任务。
 - 持久化收发队列、重复更新去重、按原目标恢复任务，未确认的输入不盲目重复执行。
@@ -67,12 +69,16 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 ### 多会话话题模式
 
-1. 在 BotFather 为该 Bot 开启 Threaded Mode / Topics。
+1. 在 BotFather 为该 Bot 开启 Threaded Mode / Topics，并开启 **Disallow users to create new threads**。
 2. 将原会话绑定到一个 Telegram 私聊话题，参考 [config.topics.example.json](config.topics.example.json)。
 3. 启动后发送 `/sessions`，通过按钮添加其他已有会话；新增绑定无需重启。
 4. 会话若尚未出现在列表中，先在电脑端创建并发送首条消息，再点击“重新加载”。
 
 原私聊入口继续使用 `root_target` 指定的原会话。话题模式、恢复策略和完整配置说明见 [TOPICS.md](TOPICS.md)。
+
+上述 BotFather 开关阻止 Telegram 客户端在主窗口发送 `/tasks`、`/sessions` 等消息时先自动创建话题。可用 `getMe` 验证 `has_topics_enabled=true`、`allows_users_to_create_topics=false`；此开关需要 Bot 所有者在 BotFather 设置，Bot Token 无法修改。它同时禁止用户手动新建、编辑和删除话题，桥接仍可通过 `/sessions` 创建和重建绑定话题。参见 [Telegram 官方说明](https://core.telegram.org/api/forum#bot-forums)。
+
+话题模式中，从任意话题发起的管理菜单及命令回复都发送到主对话；旧话题里的菜单按钮会在下一次操作时转到主对话。`/status`、`/model`、`/effort`、`/format`、`/stop` 仍以输入所在话题对应的原 Codex 会话为目标，只把回复位置移到主对话，并保留会话名称。未绑定话题里的会话命令会被拒绝，不改投到默认会话；普通对话、图片和状态提示仍留在原话题。已有发信队列保留原来保存的位置。
 
 ## 运行与命令
 
@@ -136,7 +142,7 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 在主对话或任意已授权的私聊话题发送 `@论文 检查最新批注`，或 `/to 论文 检查最新批注`。别名由桥接程序识别，不要求创建对应的 Telegram 用户。目标配置可增加 `"aliases": ["论文", "paper"]`；`/aliases` 只列出本机可用名称。别名重名时使用 `/to` 按钮选择具体会话。也可发送 `/to`，点击目标，再回复弹出的派单消息。回复只绑定该条指定消息，不会改变主对话原来的默认会话。
 
-派单保存明确的本机原 thread ID 和话题 ID；恢复时不按别名重新选目标。目标绑定改变时会拒绝旧任务，不自动改投。回复保留在目标话题，并带来源标签回传到本 Bot 的发起位置。派单目前支持文字，附件请直接发到对应话题。
+派单保存明确的本机原 thread ID 和话题 ID；恢复时不按别名重新选目标。目标绑定改变时会拒绝旧任务，不自动改投。回复保留在目标话题，并带来源标签汇总到本 Bot 的主对话；派单确认、按钮及回复提示也统一显示在主对话。派单目前支持文字，附件请直接发到对应话题。
 
 本机队列自动运行，无需配置 SSH、汇总主机或 peers。外机别名、旧跨机按钮和直接注入的外机任务均会被拒绝；旧全局缓存不参与展示。升级时取消尚未投递的旧跨机任务；已经开始的原 Codex 任务继续由本机管理。历史记录保留，但不会继续跨机回传。旧的 `control_hub`、`control_hosts`、`control_peers` 配置不再启用任何跨机器能力，可删除。
 

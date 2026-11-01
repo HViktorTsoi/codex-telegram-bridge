@@ -333,13 +333,13 @@ class ControlCenter:
                 token = secrets.token_urlsafe(12)
                 with self.db:
                     self.db.execute('INSERT INTO cc_buttons VALUES(?,?,?,?,?,?,?)',
-                                    (token, str(origin['chat']['id']), origin.get('message_thread_id') or None, None,
+                                    (token, str(origin['chat']['id']), None, None,
                                      action, json.dumps(data, ensure_ascii=False), time.time() + 900))
                 tokens.append(token)
                 rendered.append({'text': label[:55], 'callback_data': 'cc:' + token})
             keyboard.append(rendered)
         params = {'chat_id': str(origin['chat']['id']), 'text': text[:4000], 'reply_markup': {'inline_keyboard': keyboard}}
-        if edit:
+        if edit and not origin.get('message_thread_id'):
             params['message_id'] = origin['message_id']
             try:
                 result = await self.router.telegram.call('editMessageText', **params)
@@ -348,8 +348,6 @@ class ControlCenter:
                     raise
                 result = origin
         else:
-            if origin.get('message_thread_id'):
-                params['message_thread_id'] = origin['message_thread_id']
             result = await self.router.telegram.call('sendMessage', **params)
         with self.db:
             for token in tokens:
@@ -433,12 +431,10 @@ class ControlCenter:
             raise ValueError('请先绑定目标原会话。')
         params = {'chat_id': str(origin['chat']['id']), 'text': '请回复这条消息，给 ' + entry['host'] + '/' + entry['name'] + ' 派单或补充说明。',
                   'reply_markup': {'force_reply': True, 'selective': True}}
-        if origin.get('message_thread_id'):
-            params['message_thread_id'] = origin['message_thread_id']
         result = await self.router.telegram.call('sendMessage', **params)
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO cc_prompts VALUES(?,?,?,?,?)',
-                            (result['message_id'], str(origin['chat']['id']), origin.get('message_thread_id') or None,
+                            (result['message_id'], str(origin['chat']['id']), None,
                              json.dumps({**data, 'target_key': entry['target_key'], 'topic_id': entry['topic_id']}, ensure_ascii=False), time.time() + 900))
 
     async def dispatch(self, origin, update_id, entry, text, question=None):
@@ -452,14 +448,14 @@ class ControlCenter:
             text = '针对待确认事项：' + question + '\n我的回复：' + text
         rid = ident(self.host + ':' + str(self.router.bot_id) + ':' + str(update_id))
         request = {'id': rid, 'owner': self.router.owner, 'source_host': self.host,
-                   'source_topic': origin.get('message_thread_id') or None, 'target_host': entry['host'],
+                   'source_topic': None, 'target_host': entry['host'],
                    'target_key': entry['target_key'], 'target_name': entry['name'], 'thread_id': entry['thread_id'],
                    'topic_id': entry['topic_id'], 'text': text, 'created': time.time()}
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO cc_requests(id,payload,updated) VALUES(?,?,?)',
                             (rid, json.dumps(request, ensure_ascii=False, sort_keys=True), time.time()))
         await self.panel(origin, '已入派单队列 → ' + entry['host'] + '/' + entry['name'] +
-                         '\n保持原会话；收到的回复会回到这里。',
+                         '\n保持原会话；派单回执和回复汇总发送到主对话。',
                          [[('查看目标', 'detail', self.ref(entry)), ('本机状态', 'tasks', {})]])
 
     async def handle_one(self):
@@ -540,7 +536,7 @@ class ControlCenter:
             state = 'failed'
             with self.db:
                 put_notice(self.db, 'control-error:' + str(row['id']), self.router.owner,
-                           origin.get('message_thread_id') or None,
+                           None,
                            str(error) if isinstance(error, ValueError) else '暂时无法完成，请稍后重试 /tasks、/inbox 或 /to。')
         with self.db:
             self.db.execute('UPDATE cc_jobs SET state=? WHERE id=?', (state, row['id']))

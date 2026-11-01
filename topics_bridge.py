@@ -75,7 +75,7 @@ class ExactCodex(Codex):
 
 
 class RoutedStore(Store):
-    """Each target owns its queue; every reply also retains its Telegram topic."""
+    """Keep input origins durable; send command replies to the main chat."""
 
     def __init__(self, path, thread_id):
         super().__init__(path)
@@ -122,11 +122,12 @@ class RoutedStore(Store):
 
     def enqueue(self, key, chat_id, text):
         if key.startswith("input:"):
-            row = self.db.execute("SELECT message_thread_id FROM inbox WHERE id=?",
+            row = self.db.execute("SELECT message_thread_id,text,message_json FROM inbox WHERE id=?",
                                   (int(key.split(":", 2)[1]),)).fetchone()
             if row is None:
                 raise ValueError("Input reply has no durable topic")
-            topics = [row[0]]
+            message = {"text": row['text'], **json.loads(row['message_json'] or '{}')}
+            topics = [None if command_of(message).startswith('/') else row['message_thread_id']]
         elif key.startswith("turn:"):
             topics = [r["message_thread_id"] for r in self.turn_routes(key.split(":", 2)[1])
                       if r["chat_id"] == str(chat_id)]
@@ -314,8 +315,10 @@ class RouterStore:
     def finish(self, row):
         with self.db:
             if row["error"]:
+                message = json.loads(row['message_json'])
+                reply_topic = None if command_of(message).startswith('/') else row['topic_id']
                 self.db.execute("INSERT OR IGNORE INTO notices(id,chat_id,topic_id,text) VALUES(?,?,?,?)",
-                                (row["id"], row["chat_id"], row["topic_id"], row["error"]))
+                                (row["id"], row["chat_id"], reply_topic, row["error"]))
             self.db.execute("UPDATE jobs SET state='done' WHERE id=?", (row["id"],))
 
 
@@ -387,7 +390,10 @@ class TopicRouter:
             self.store.accept(update, None)
             return
         topic_id = topic_of(message)
-        target = self.by_topic.get(topic_id) if topic_id else self.root_target
+        if command_of(message) in {'/help', '/start'}:
+            target = self.root_target
+        else:
+            target = self.by_topic.get(topic_id) if topic_id else self.root_target
         error = None if target else "此话题尚未绑定 Codex 会话。发送 /sessions 可选择已有会话并创建绑定话题。"
         self.store.accept(update, message, target, error)
 

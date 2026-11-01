@@ -74,11 +74,11 @@ class SessionPicker:
         callback = update.get('callback_query')
         origin = callback['message'] if callback else update['message']
         chat_id = str(origin['chat']['id'])
-        topic_id = origin.get('message_thread_id') or None
+        topic_id = None  # Management menus live in the main private conversation.
         keyboard = [[self._button(chat_id, topic_id, *entry) for entry in row] for row in rows]
         tokens = [b['callback_data'][3:] for row in keyboard for b in row]
         params = {'chat_id': chat_id, 'text': text, 'reply_markup': {'inline_keyboard': keyboard}}
-        if callback:
+        if callback and not origin.get('message_thread_id'):
             params['message_id'] = origin['message_id']
             try:
                 result = await self.router.telegram.call('editMessageText', **params)
@@ -316,7 +316,7 @@ class SessionPicker:
                 self.db.execute("UPDATE ui_jobs SET state='failed',error=? WHERE id=?", (type(error).__name__, job['id']))
                 origin = callback['message'] if callback else update['message']
                 self.db.execute('INSERT OR IGNORE INTO notices(id,chat_id,topic_id,text) VALUES(?,?,?,?)',
-                                (job['id'], str(origin['chat']['id']), origin.get('message_thread_id') or None, detail))
+                                (job['id'], str(origin['chat']['id']), None, detail))
         return True
 
     async def loop(self):

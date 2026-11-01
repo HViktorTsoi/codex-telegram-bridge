@@ -106,6 +106,43 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notice['topic_id'], 999)
         self.assertIn('尚未绑定', notice['text'])
 
+    async def test_session_command_keeps_native_target_and_replies_in_main_chat(self):
+        self.accept(self.message(100, 22, text='/status'))
+        child = self.router.bridges['instagram']
+        child.codex = type('Native', (), {'settings': AsyncMock(return_value={
+            'thread': {'id': 'native-instagram', 'name': 'Instagram 短片'}, 'model': 'test-model'})})()
+        await child.dispatch_one(child.store.pending())
+        child.codex.settings.assert_awaited_once()
+        self.assertEqual(child.store.db.execute('SELECT message_thread_id FROM inbox').fetchone()[0], 22)
+        output = child.store.db.execute('SELECT * FROM outbox').fetchone()
+        self.assertIsNone(output['message_thread_id'])
+        self.assertIn('native-instagram', output['text'])
+        self.assertIn('test-model', output['text'])
+        self.assertIsNone(self.router.bridges['meeting'].store.pending())
+
+    async def test_global_help_from_unknown_topic_is_answered_in_main_without_generation(self):
+        self.accept(self.message(100, 999, text='/help'))
+        child = self.router.bridges['meeting']
+        child.codex = type('NoNativeCalls', (), {'call': AsyncMock(side_effect=AssertionError('No generation'))})()
+        await child.dispatch_one(child.store.pending())
+        child.codex.call.assert_not_awaited()
+        output = child.store.db.execute('SELECT * FROM outbox').fetchone()
+        self.assertIsNone(output['message_thread_id'])
+        self.assertIn('/sessions', output['text'])
+
+    def test_unknown_topic_session_command_fails_in_main_without_retargeting(self):
+        self.accept(self.message(100, 999, text='/model test'))
+        self.assertTrue(all(b.store.pending() is None for b in self.router.bridges.values()))
+        notice = self.router.store.db.execute('SELECT * FROM notices').fetchone()
+        self.assertIsNone(notice['topic_id'])
+        self.assertIn('尚未绑定', notice['text'])
+
+    def test_command_like_attachment_caption_retains_normal_reply_topic(self):
+        self.accept(self.message(100, 22, text='', caption='/status', document={'file_id': 'a'}))
+        child = self.router.bridges['instagram']
+        child.store.enqueue('input:100:reply', '123', '附件处理失败')
+        self.assertEqual(child.store.db.execute('SELECT message_thread_id FROM outbox').fetchone()[0], 22)
+
     def test_unauthorized_senders_groups_and_topic_service_messages_are_not_forwarded(self):
         for update in [self.message(100, 11, **{'from': {'id': 999}}),
                        self.message(101, 11, chat={'id': -456, 'type': 'supergroup'}),
@@ -242,7 +279,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         replies = '\n'.join(r['text'] for r in child.store.db.execute('SELECT * FROM outbox'))
         self.assertIn('native-instagram', replies)
         self.assertEqual(calls, [('turn/interrupt', {'threadId': 'native-instagram', 'turnId': 'in-progress'})])
-        self.assertTrue(all(r[0] == 22 for r in child.store.db.execute('SELECT message_thread_id FROM outbox')))
+        self.assertTrue(all(r[0] is None for r in child.store.db.execute('SELECT message_thread_id FROM outbox')))
 
 
 if __name__ == '__main__':

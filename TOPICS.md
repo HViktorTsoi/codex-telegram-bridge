@@ -8,6 +8,12 @@ forks a Codex conversation.
 Enable Threaded Mode for the existing Bot in BotFather. Verify
 `getMe.has_topics_enabled`, create private topics with `createForumTopic`, and
 verify each existing native conversation using `thread/read` and `thread/resume`.
+Also enable **Disallow users to create new threads** in BotFather while keeping
+Threaded Mode enabled. Verify `getMe.allows_users_to_create_topics=false`.
+Otherwise Telegram clients create a new topic before sending messages from the
+main chat, even for `/tasks` and `/sessions`. This owner-only setting also disables
+manual user topic editing/deletion; the bot can still create and repair topics.
+See [Telegram's bot forum rules](https://core.telegram.org/api/forum#bot-forums).
 Back up and stop the old collector before switching modes. Bind only explicit
 existing IDs; an unrecognized or missing target is not a reason to create a new
 conversation.
@@ -39,7 +45,8 @@ Use the usual `/usr/bin/python3 manage.py start|stop|status` on zbox. `manage.py
 selects the entry point from `config.json`; configurations without `mode: topics`
 continue using `bridge.py`. Topic mode does not use `--notify`.
 
-Inside any private topic, `/sessions` opens the session menu. Choose **添加会话**,
+From the main chat or any private topic, `/sessions` opens the session menu in
+the main chat. Choose **添加会话**,
 page through native conversations, select one, check its name and full ID, and
 choose **确认绑定到新话题**. The new topic becomes available without restarting
 the collector. Bindings are written atomically to `config.json`, with previous
@@ -51,6 +58,13 @@ Codex conversation on the computer first, then refresh the picker.
 native conversation's complete ID, model and effort. `/model`, `/effort` and
 `/stop` affect that topic's conversation. Unknown topics are rejected. User-made
 topics are not automatically bound or converted into new Codex conversations.
+
+Management panels, command replies (including errors) and new dispatch summaries
+are sent to the main chat. Session commands still act on the conversation bound
+to the topic where they were entered. Old topic menus migrate to a new main-chat
+panel on their next use, keeping the exact message/topic checks on callbacks and
+ForceReply prompts. Regular conversation output and activity indicators keep
+their original topics; already queued output retains its stored destination.
 
 Codex replies use Rich Markdown by default. `/format rich` and `/format plain`
 persist a preference for the selected conversation; `/format` reads it without

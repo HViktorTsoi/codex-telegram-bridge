@@ -150,7 +150,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         source = self.nodes['A'].store.db
         relays = source.execute('SELECT * FROM notices WHERE label=?', ('A/论文',)).fetchall()
         self.assertEqual(len(relays), 1)
-        self.assertEqual((relays[0]['topic_id'], relays[0]['rich_text']), (11, '**检查完毕**'))
+        self.assertEqual((relays[0]['topic_id'], relays[0]['rich_text']), (None, '**检查完毕**'))
         self.assertEqual(target.store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 1)
         self.assertEqual(source.execute('SELECT state FROM cc_requests').fetchone()[0], 'done')
 
@@ -198,9 +198,45 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         await self.click('A', panel, 'A/论文')
         prompt = self.nodes['A'].telegram.messages[self.nodes['A'].telegram.next_id]
         self.assertTrue(prompt['reply_markup']['force_reply'])
-        await self.send('A', '只读批注', reply_to_message={'message_id': prompt['message_id']})
+        self.assertNotIn('message_thread_id', prompt)
+        await self.send('A', '只读批注', topic=None, reply_to_message={'message_id': prompt['message_id']})
         request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
         self.assertEqual((request['target_host'], request['thread_id'], request['text']), ('A', 'A-paper', '只读批注'))
+
+    async def test_management_commands_from_any_topic_open_main_chat_panels(self):
+        for topic in (11, 999, None):
+            for command in ('/tasks', '/tasks all', '/inbox', '/aliases', '/to'):
+                _, panel = await self.send('A', command, topic=topic)
+                self.assertNotIn('message_thread_id', panel)
+                if command.startswith('/tasks'):
+                    await self.click('A', panel, '刷新')
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+        self.assertFalse(any(method == 'createForumTopic' for _, method, _ in self.calls))
+
+    async def test_prompt_reply_in_wrong_topic_is_rejected_without_native_fallback(self):
+        _, panel = await self.send('A', '/to', topic=22)
+        await self.click('A', panel, 'A/论文')
+        prompt = self.nodes['A'].telegram.messages[self.nodes['A'].telegram.next_id]
+        await self.send('A', '不应执行', topic=22, reply_to_message={'message_id': prompt['message_id']})
+        db = self.nodes['A'].store.db
+        self.assertEqual(db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
+        self.assertEqual(db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+        notice = db.execute('SELECT topic_id,text FROM notices').fetchone()
+        self.assertIsNone(notice['topic_id'])
+        self.assertIn('派单回复已过期', notice['text'])
+
+    async def test_legacy_topic_button_moves_next_panel_to_main_chat(self):
+        _, panel = await self.send('A', '/tasks')
+        panel['message_thread_id'] = 11
+        self.nodes['A'].store.db.execute('UPDATE cc_buttons SET topic_id=11')
+        self.nodes['A'].store.db.commit()
+        await self.click('A', panel, '刷新')
+        migrated = self.nodes['A'].telegram.messages[self.nodes['A'].telegram.next_id]
+        self.assertNotEqual(migrated['message_id'], panel['message_id'])
+        self.assertNotIn('message_thread_id', migrated)
+        self.assertFalse(any(method == 'editMessageText' for _, method, _ in self.calls))
+        await self.click('A', migrated, '刷新')
+        self.assertEqual(self.calls[-1][1], 'editMessageText')
 
     async def test_attachments_do_not_fall_through_to_wrong_session(self):
         await self.send('A', '', photo=[{'file_id': 'a'}], caption='@paper 看图')
