@@ -57,16 +57,13 @@ class TopicActivity:
             state['finished_at'] = turn.get('completedAt') or now
         elapsed = max(0, int((state.get('finished_at') if terminal else now) - state['started_at']))
         minutes, seconds = divmod(elapsed, 60)
-        duration = f'{minutes} 分 {seconds} 秒' if minutes else f'{seconds} 秒'
-        heading = {'working': '⏳ Codex 正在工作', 'waiting': '🙋 Codex 需要你处理',
-                   'unknown': '⚠️ 连接或会话状态待确认', 'completed': '✅ 本轮已完成',
-                   'failed': '❌ 本轮执行失败', 'interrupted': '⏹ 本轮已停止'}[phase]
-        text = f'{heading}\n会话：{str(name)[:128]}\n' + ('用时：' if terminal else '已用时：') + duration
-        if phase == 'waiting':
-            text += '\n请到原 Codex 会话查看待处理问题或审批。'
-        elif phase == 'unknown':
-            text += '\n尚未确认任务结束，正在等待恢复状态。'
-        text += '\n状态更新：' + time.strftime('%H:%M:%S', time.localtime(now))
+        duration = f'{minutes}分{seconds}秒' if minutes else f'{seconds}秒'
+        heading = {'working': '⏳ 正在工作', 'waiting': '🙋 需要你处理',
+                   'unknown': '⚠️ 状态待确认', 'completed': '✅ 已完成',
+                   'failed': '❌ 执行失败', 'interrupted': '⏹ 已停止'}[phase]
+        # The topic title already identifies the session; keep the card to two lines.
+        hint = '去 Codex 处理 · ' if phase == 'waiting' else ''
+        text = f'{heading} · {duration}\n{hint}更新 ' + time.strftime('%H:%M:%S', time.localtime(now))
         if now < state.get('retry_at', 0):
             return
         if phase == state.get('phase') and now - state.get('updated_at', 0) < self.INTERVAL:
