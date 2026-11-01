@@ -2,6 +2,7 @@
   "setup_required": true,
   "output_format": "rich",
   "mode": "topics",
+  "native_mirror": false,
   "host_id": "YOUR_HOST_NAME",
   "owner_id": "YOUR_TELEGRAM_USER_ID",
   "thread_id": "EXISTING_CODEX_THREAD_ID",
