@@ -1,4 +1,4 @@
-"""Owner-only global overview, actionable inbox and durable existing-thread dispatch."""
+"""Owner-only local overview, actionable inbox and durable existing-thread dispatch."""
 import asyncio
 import hashlib
 import json
@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shlex
 import sqlite3
 import time
 
@@ -15,7 +14,7 @@ from bridge import RpcError, TelegramError, permitted
 from message_format import message_parts
 
 LOG = logging.getLogger('codex_telegram_control')
-COMMANDS = [{'command': 'tasks', 'description': '两台机器的全局会话与进度'},
+COMMANDS = [{'command': 'tasks', 'description': '本机会话与进度'},
             {'command': 'inbox', 'description': '待我处理的问题与审批'},
             {'command': 'to', 'description': '选择原会话派单，或 /to 别名 任务'},
             {'command': 'aliases', 'description': '查看可用的 @会话别名'}]
@@ -96,13 +95,17 @@ def export_bundle(state):
     db = connection(state)
     try:
         snapshot = read_json(state / 'control/local.json', {'host': config.get('host_id'), 'generated': 0, 'entries': []})
-        requests = [dict(r) for r in db.execute("SELECT * FROM cc_requests WHERE state IN ('pending','queued','running','uncertain') OR updated>?", (time.time() - 86400,))]
+        requests = [dict(r) for r in db.execute("SELECT * FROM cc_requests WHERE state IN ('pending','queued','running','uncertain') OR updated>?", (time.time() - 86400,))
+                    if json.loads(r['payload']).get('source_host') == config['host_id']
+                    and json.loads(r['payload']).get('target_host') == config['host_id']]
         dismissals = [dict(r) for r in db.execute('SELECT * FROM cc_dismissals')]
         deliveries, relays = [], []
         targets = {t['key']: t for t in config.get('targets', [])}
         for row in db.execute("SELECT * FROM cc_deliveries WHERE state IN ('pending','importing','queued','running') OR updated>?", (time.time() - 86400,)).fetchall():
             receipt = {'id': row['id'], 'state': row['state'], 'detail': row['detail']}
             request = json.loads(row['payload'])
+            if request.get('source_host') != config['host_id'] or request.get('target_host') != config['host_id']:
+                continue
             receipt['source_host'] = request['source_host']
             target = targets.get(request['target_key'])
             if row['inbox_id'] is not None and target and target['thread_id'] == request['thread_id']:
@@ -145,7 +148,6 @@ def receive_bundle(state, payload):
     host, owner = config['host_id'], str(config['owner_id'])
     if payload.get('version') != 1 or str(payload.get('owner')) != owner:
         raise ValueError('Control owner/protocol mismatch')
-    hosts = set(config.get('control_hosts', [host]))
     db = connection(state)
     rejected = {}
     try:
@@ -153,7 +155,7 @@ def receive_bundle(state, payload):
             for request in payload.get('incoming', []):
                 rid = request.get('id', '')
                 if (not re.fullmatch('[0-9a-f]{64}', rid) or request.get('target_host') != host
-                        or request.get('source_host') not in hosts or str(request.get('owner')) != owner
+                        or request.get('source_host') != host or str(request.get('owner')) != owner
                         or not re.fullmatch(r'[a-z0-9_-]{1,40}', str(request.get('target_key', '')))
                         or not isinstance(request.get('thread_id'), str) or not 0 < len(request['thread_id']) <= 128
                         or not isinstance(request.get('topic_id'), int) or request['topic_id'] <= 0
@@ -180,6 +182,8 @@ def receive_bundle(state, payload):
                 if not row or receipt.get('state') not in ('pending', 'queued', 'running', 'done', 'failed', 'uncertain'):
                     continue
                 request = json.loads(row['payload'])
+                if request.get('source_host') != host or request.get('target_host') != host:
+                    continue
                 if row['state'] != receipt['state'] or row['detail'] != receipt.get('detail'):
                     db.execute('UPDATE cc_requests SET state=?,detail=?,updated=? WHERE id=?',
                                (receipt['state'], receipt.get('detail'), time.time(), receipt['id']))
@@ -192,10 +196,10 @@ def receive_bundle(state, payload):
                 if not row:
                     continue
                 request = json.loads(row['payload'])
+                if request.get('source_host') != host or request.get('target_host') != host:
+                    continue
                 put_notice(db, 'relay:' + relay['id'], owner, request.get('source_topic'), relay['text'],
                            label=request['target_host'] + '/' + request['target_name'], rich=True)
-        if 'global' in payload:
-            write_json(state / 'control/global.json', payload['global'])
         return {'rejected': rejected}
     finally:
         db.close()
@@ -241,6 +245,27 @@ class ControlCenter:
         self.router, self.db = router, router.store.db
         self.host = router.config.get('host_id', '本机')
         tables(self.db)
+        self.isolate_local()
+
+    def isolate_local(self):
+        """Retire old cross-host queues without interrupting accepted native work."""
+        with self.db:
+            for table in ('cc_requests', 'cc_deliveries'):
+                for row in self.db.execute('SELECT * FROM ' + table + " WHERE state IN ('pending','importing','queued','running','uncertain')").fetchall():
+                    request = json.loads(row['payload'])
+                    if request.get('source_host') == self.host and request.get('target_host') == self.host:
+                        continue
+                    if table == 'cc_deliveries' and row['inbox_id'] is not None:
+                        bridge = self.router.bridges.get(request.get('target_key'))
+                        if bridge:
+                            with bridge.store.db:
+                                bridge.store.db.execute("UPDATE inbox SET state='cancelled' WHERE id=? AND state='pending' AND client_id=?",
+                                                        (row['inbox_id'], 'telegram-' + str(row['inbox_id'])))
+                    self.db.execute('UPDATE ' + table + " SET state='cancelled',detail=?,updated=? WHERE id=?",
+                                    ('已切换为本机管理，跨机派单已关闭。', time.time(), row['id']))
+            for row in self.db.execute('SELECT id,label FROM notices WHERE message_id IS NULL AND label IS NOT NULL').fetchall():
+                if '/' in row['label'] and row['label'].split('/', 1)[0] != self.host:
+                    self.db.execute('UPDATE notices SET message_id=-1 WHERE id=?', (row['id'],))
 
     def ingest(self, update):
         callback, message = update.get('callback_query'), update.get('message', {})
@@ -271,13 +296,13 @@ class ControlCenter:
         return True
 
     def view(self):
-        data = read_json(self.router.state_dir / 'control/global.json', {'nodes': []})
         local = read_json(self.router.state_dir / 'control/local.json', {'host': self.host, 'generated': 0, 'entries': []})
-        nodes = {n['host']: n for n in data.get('nodes', [])}
-        nodes[self.host] = local
+        nodes = {self.host: local}
         entries = []
         for node in nodes.values():
             for raw in node.get('entries', []):
+                if raw.get('host') != self.host:
+                    continue
                 entry = dict(raw)
                 entry['stale'] = time.time() - node.get('generated', 0) > 60
                 entries.append(entry)
@@ -285,17 +310,19 @@ class ControlCenter:
 
     @staticmethod
     def selector(entry):
-        return entry['host'] + '/' + entry['aliases'][0]
+        return entry['aliases'][0]
 
     def resolve(self, selector):
         entries, _ = self.view()
         host, name = selector.split('/', 1) if '/' in selector else (None, selector)
+        if host is not None and alias(host) != alias(self.host):
+            raise ValueError('只支持本机会话，请切换到对应机器的 Telegram Bot。')
         matches = [e for e in entries if e.get('target_key') and (host is None or alias(e['host']) == alias(host))
                    and alias(name) in [alias(a) for a in e['aliases']]]
         if not matches:
             raise ValueError('未找到已绑定会话，发送 /aliases 查看可用别名。')
         if len(matches) > 1:
-            raise ValueError('别名重名，请指定机器：' + '、'.join('@' + self.selector(e) for e in matches))
+            raise ValueError('本机别名重名，请使用 /to 按钮选择具体会话。')
         return matches[0]
 
     async def panel(self, origin, text, buttons=(), edit=False):
@@ -348,7 +375,7 @@ class ControlCenter:
                 entries = [e for e in entries if e.get('target_key')]
             entries.sort(key=lambda e: (e['stale'], not bool(e.get('status', {}).get('activeFlags')),
                                        e.get('status', {}).get('type') != 'active', -e.get('updated', 0)))
-            heading = '全局会话 · ' + str(len(entries)) + (' 个已绑定' if mode == 'bound' else ' 个可见会话')
+            heading = '本机会话 · ' + str(len(entries)) + (' 个已绑定' if mode == 'bound' else ' 个可见会话')
         page = max(0, min(page, max(0, (len(entries) - 1) // self.PAGE)))
         start = page * self.PAGE
         lines, rows = [heading], []
@@ -369,8 +396,8 @@ class ControlCenter:
             lines.append('\n暂无待处理事项。' if kind == 'inbox' else '\n正在同步会话，请稍后刷新。')
         rows.append([('上一页', kind, {'page': page - 1, 'mode': mode}), ('刷新', kind, {'page': page, 'mode': mode}),
                      ('下一页', kind, {'page': page + 1, 'mode': mode})])
-        rows.append([('全局', 'tasks', {}), ('待我处理', 'inbox', {}), ('全部会话' if mode == 'bound' else '已绑定', 'tasks', {'mode': 'all' if mode == 'bound' else 'bound'})])
-        for host in self.router.config.get('control_hosts', [self.host]):
+        rows.append([('总览', 'tasks', {}), ('待我处理', 'inbox', {}), ('全部会话' if mode == 'bound' else '已绑定', 'tasks', {'mode': 'all' if mode == 'bound' else 'bound'})])
+        for host in [self.host]:
             node = nodes.get(host)
             age = max(0, int(time.time() - node['generated'])) if node and node.get('generated') else None
             lines.append('\n' + host + '：' + (f'{age} 秒前同步' if age is not None else '等待同步'))
@@ -397,7 +424,7 @@ class ControlCenter:
             if item['kind'] != 'native' and entry.get('target_key'):
                 rows.append([('回复此问题', 'prompt', ref), ('已处理', 'dismiss', {**ref, 'seconds': 31536000})])
             rows.append([('稍后 1 小时', 'dismiss', {**ref, 'seconds': 3600})])
-        rows.append([('返回全局', 'tasks', {}), ('待我处理', 'inbox', {})])
+        rows.append([('返回总览', 'tasks', {}), ('待我处理', 'inbox', {})])
         await self.panel(origin, text, rows, edit)
 
     async def prompt(self, origin, data):
@@ -415,6 +442,8 @@ class ControlCenter:
                              json.dumps({**data, 'target_key': entry['target_key'], 'topic_id': entry['topic_id']}, ensure_ascii=False), time.time() + 900))
 
     async def dispatch(self, origin, update_id, entry, text, question=None):
+        if entry.get('host') != self.host:
+            raise ValueError('只支持本机会话，请切换到对应机器的 Telegram Bot。')
         if not text.strip():
             raise ValueError('请提供任务正文，例如 @论文 检查最新批注。')
         if entry.get('topic_missing') or not entry.get('target_key'):
@@ -430,8 +459,8 @@ class ControlCenter:
             self.db.execute('INSERT OR IGNORE INTO cc_requests(id,payload,updated) VALUES(?,?,?)',
                             (rid, json.dumps(request, ensure_ascii=False, sort_keys=True), time.time()))
         await self.panel(origin, '已入派单队列 → ' + entry['host'] + '/' + entry['name'] +
-                         '\n保持原会话；收到的回复会回到这里。跨机器等待下一次同步，通常约 10～20 秒。',
-                         [[('查看目标', 'detail', self.ref(entry)), ('全局状态', 'tasks', {})]])
+                         '\n保持原会话；收到的回复会回到这里。',
+                         [[('查看目标', 'detail', self.ref(entry)), ('本机状态', 'tasks', {})]])
 
     async def handle_one(self):
         row = self.db.execute("SELECT * FROM cc_jobs WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
@@ -530,7 +559,8 @@ class ControlCenter:
             return False
         request = json.loads(row['payload'])
         target = self.router.targets.get(request['target_key'])
-        if (not self.router.owner_allowed() or not target or target['thread_id'] != request['thread_id']
+        if (request.get('source_host') != self.host or request.get('target_host') != self.host
+                or not self.router.owner_allowed() or not target or target['thread_id'] != request['thread_id']
                 or target['message_thread_id'] != request['topic_id'] or target.get('topic_missing')):
             with self.db:
                 self.db.execute("UPDATE cc_deliveries SET state='failed',detail=?,updated=? WHERE id=?",
@@ -613,74 +643,24 @@ class ControlCenter:
                 LOG.warning('Control snapshot temporarily unavailable')
             await asyncio.sleep(15)
 
-    async def peer(self, peer, action, payload=None):
-        host = peer['ssh_host']
-        if not re.fullmatch(r'[A-Za-z0-9_@.:][A-Za-z0-9_@.:-]*', host):
-            raise ValueError('Invalid SSH peer')
-        command = shlex.join([peer.get('python', '/usr/bin/python3'), str(Path(peer['code_dir']) / 'control_peer.py'),
-                              action, '--state-dir', peer['state_dir']])
-        process = await asyncio.create_subprocess_exec('ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-                                                       '-o', 'ConnectTimeout=5', host, command,
-                                                       stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        try:
-            output, _ = await asyncio.wait_for(process.communicate(json.dumps(payload, ensure_ascii=False).encode() if payload else None), 15)
-        except BaseException:
-            process.kill();await process.wait();raise
-        if process.returncode or len(output) > 4 * 1024 * 1024:
-            raise ConnectionError('Peer control unavailable')
-        return json.loads(output)
-
     async def synchronize(self):
-        bundles = {self.host: export_bundle(self.router.state_dir)}
-        peers = {p['host_id']: p for p in self.router.config.get('control_peers', [])}
-        for host, peer in peers.items():
-            path = self.router.state_dir / 'control' / ('peer-' + ident(host)[:16] + '.json')
-            try:
-                bundle = await self.peer(peer, 'snapshot')
-                if bundle.get('owner') != self.router.owner or bundle.get('snapshot', {}).get('host') != host:
-                    raise ValueError('Peer identity mismatch')
-                write_json(path, bundle)
-            except (OSError, ConnectionError, ValueError, asyncio.TimeoutError):
-                bundle = read_json(path, {})
-            if bundle:
-                bundles[host] = bundle
-        dismissals = {}
-        for bundle in bundles.values():
-            for item in bundle.get('dismissals', []):
-                if item['updated'] >= dismissals.get(item['id'], {}).get('updated', 0):
-                    dismissals[item['id']] = item
-        global_view = {'generated': time.time(), 'nodes': [b['snapshot'] for b in bundles.values()]}
-        receipts = [r for b in bundles.values() for r in b.get('deliveries', [])]
-        relays = [r for b in bundles.values() for r in b.get('relays', [])]
-        requests = [json.loads(r['payload']) for b in bundles.values() for r in b.get('requests', [])
-                    if r['state'] in ('pending', 'queued', 'running', 'uncertain')]
+        bundle = export_bundle(self.router.state_dir)
+        requests = [json.loads(row['payload']) for row in bundle['requests']
+                    if row['state'] in ('pending', 'queued', 'running', 'uncertain')]
         requests.sort(key=lambda r: (r.get('created', 0), r['id']))
-        for host in [self.host, *peers]:
-            payload = {'version': 1, 'owner': self.router.owner, 'global': global_view,
-                       'incoming': [r for r in requests if r['target_host'] == host],
-                       'dismissals': list(dismissals.values()),
-                       'receipts': [r for r in receipts if r['source_host'] == host],
-                       'relays': [r for r in relays if r['source_host'] == host]}
-            try:
-                result = receive_bundle(self.router.state_dir, payload) if host == self.host else await self.peer(peers[host], 'sync', payload)
-                if result.get('rejected'):
-                    LOG.warning('Control peer rejected a conflicting dispatch')
-                    for rid, detail in result['rejected'].items():
-                        original = next((r for r in requests if r['id'] == rid), None)
-                        if original:
-                            failure = {'version': 1, 'owner': self.router.owner,
-                                       'receipts': [{'id': rid, 'state': 'failed', 'detail': detail}]}
-                            if original['source_host'] == self.host:
-                                receive_bundle(self.router.state_dir, failure)
-                            elif original['source_host'] in peers:
-                                await self.peer(peers[original['source_host']], 'sync', failure)
-            except (OSError, ValueError, ConnectionError, asyncio.TimeoutError):
-                LOG.warning('Control peer sync temporarily unavailable')
+        result = receive_bundle(self.router.state_dir, {
+            'version': 1, 'owner': self.router.owner, 'incoming': requests,
+            'receipts': bundle['deliveries'], 'relays': bundle['relays']})
+        if result['rejected']:
+            receive_bundle(self.router.state_dir, {
+                'version': 1, 'owner': self.router.owner,
+                'receipts': [{'id': rid, 'state': 'failed', 'detail': reason}
+                             for rid, reason in result['rejected'].items()]})
 
     async def sync_loop(self):
         while True:
             try:
                 await self.synchronize()
             except (OSError, ValueError, sqlite3.Error):
-                LOG.warning('Control synchronization temporarily unavailable')
-            await asyncio.sleep(10)
+                LOG.warning('Local control queue temporarily unavailable')
+            await asyncio.sleep(1)
