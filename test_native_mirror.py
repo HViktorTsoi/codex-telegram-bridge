@@ -121,7 +121,7 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.record_item('new', self.agent(iid='msg-native-id'))
         await self.bridge.update_native_mirror([self.turn(status='completed')])
         self.assertEqual(len(self.output()), 2)
-        self.assertTrue(all('history-' in row['key'] for row in self.output()))
+        self.assertTrue(all('native-content-' in row['key'] for row in self.output()))
 
     async def test_upgrade_establishes_new_boundary_for_old_event_id_state(self):
         self.bridge.store.set(NativeMirror.KEY, json.dumps({'enabled': True, 'route': ['existing-native', 42], 'since': 900}))
@@ -130,7 +130,25 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.record_item('new', self.agent(iid='event-agent'))
         await self.bridge.update_native_mirror([self.turn(status='completed')])
         self.assertEqual(self.output(), [])
-        self.assertEqual(self.bridge.mirror.state()['protocol'], 2)
+        self.assertEqual(self.bridge.mirror.state()['protocol'], 3)
+
+    async def test_history_itself_can_renumber_items_after_turn_persistence(self):
+        await self.enable()
+        self.items['new'] = [self.user(iid='item-1')]
+        await self.bridge.update_native_mirror([self.turn()])
+        self.items['new'] = [self.user(iid='item-1686'), self.agent(iid='item-1687')]
+        await self.bridge.update_native_mirror([self.turn(status='completed')])
+        self.assertEqual(len(self.output()), 2)
+
+    async def test_agent_ids_and_optional_phase_can_change_without_duplicate_output(self):
+        await self.enable()
+        self.items['new'] = [self.user(), self.agent(iid='live', phase='commentary')]
+        await self.bridge.update_native_mirror([self.turn()])
+        self.bridge.record_item('new', self.agent(iid='live', phase='commentary'))
+        await self.bridge.update_native_mirror([self.turn()])
+        self.items['new'] = [self.user(iid='different-user'), self.agent(iid='persisted', phase=None)]
+        await self.bridge.update_native_mirror([self.turn(status='completed')])
+        self.assertEqual(len(self.output()), 2)
 
     async def test_distinct_identical_messages_keep_their_history_occurrences(self):
         await self.enable()
@@ -186,6 +204,14 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
         self.items['new'] = [self.user(client_id='telegram-999'), self.agent()]
         await self.bridge.update_native_mirror([self.turn(status='completed')])
         self.bridge.record_item('new', self.agent())
+        self.assertEqual(self.output(), [])
+
+    async def test_telegram_input_is_not_echoed_when_persisted_metadata_loses_client_id(self):
+        await self.enable()
+        self.items['new'] = [self.user(client_id='telegram-999', iid='active')]
+        await self.bridge.update_native_mirror([self.turn()])
+        self.items['new'] = [self.user(iid='persisted'), self.agent()]
+        await self.bridge.update_native_mirror([self.turn(status='completed')])
         self.assertEqual(self.output(), [])
 
     async def test_reasoning_tools_and_internal_agent_messages_are_excluded(self):

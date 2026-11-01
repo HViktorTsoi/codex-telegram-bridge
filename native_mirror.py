@@ -2,6 +2,7 @@
 import hashlib
 import json
 import time
+from collections import Counter
 
 
 class NativeMirror:
@@ -35,7 +36,7 @@ class NativeMirror:
     async def update(self, bridge, turns):
         route = [bridge.thread_id, bridge.target['message_thread_id']]
         now, state = self.clock(), self.state()
-        if not state.get('enabled') or state.get('route') != route or state.get('protocol') != 2:
+        if not state.get('enabled') or state.get('route') != route or state.get('protocol') != 3:
             # Baseline existing items; an active desktop turn can still produce new ones.
             active_items = {}
             for turn in turns:
@@ -48,11 +49,10 @@ class NativeMirror:
                     telegram_input = any(str(item.get('clientId', '')).startswith('telegram-') for item in items or [])
                     self.store.db.execute('INSERT OR REPLACE INTO native_mirror_turns VALUES(?,?,?,?,?)',
                                           (turn['id'], route[1], 'watch' if items is not None else 'ignored', now, telegram_input))
-                    for item in items or []:
-                        if item.get('id'):
-                            self.store.db.execute('INSERT OR REPLACE INTO native_mirror_seen VALUES(?,?,?,?,0)',
-                                                  (turn['id'], item['id'], route[1], self.fingerprint(item)))
-            self.store.set(self.KEY, json.dumps({'enabled': True, 'route': route, 'since': int(now), 'protocol': 2}))
+                    for item, identity, fingerprint in self.identities(items or []):
+                        self.store.db.execute('INSERT OR REPLACE INTO native_mirror_seen VALUES(?,?,?,?,0)',
+                                              (turn['id'], identity, route[1], fingerprint))
+            self.store.set(self.KEY, json.dumps({'enabled': True, 'route': route, 'since': int(now), 'protocol': 3}))
             return
         # Native recovery, like the existing bridge, covers the latest 30 turns.
         for turn in reversed(turns):
@@ -73,8 +73,14 @@ class NativeMirror:
                 continue
             # During an active turn only user inputs are complete in a history snapshot.
             # Agent text is mirrored from item/completed, or from a terminal-turn replay.
+            occurrences = Counter()
             async for entry in bridge.codex.items(turn['id']):
-                self.record(bridge, turn['id'], entry['item'], allow_agent=terminal)
+                item = entry['item']
+                fingerprint = self.fingerprint(item)
+                if fingerprint:
+                    occurrences[fingerprint] += 1
+                    identity = 'native-content-' + fingerprint + '-' + str(occurrences[fingerprint])
+                    self.record(bridge, turn['id'], item, identity, allow_agent=terminal)
             with self.store.db:
                 self.store.db.execute('UPDATE native_mirror_turns SET state=?,last_scan=? WHERE turn_id=?',
                                       ('closed' if terminal else 'watch', now, turn['id']))
@@ -82,7 +88,7 @@ class NativeMirror:
                                       (turn['id'], route[1]))
 
     def note_event(self, bridge, turn_id, item):
-        """Events prove completion and trigger a read; only history provides output IDs."""
+        """Events prove completion and trigger a read; their unstable IDs are ignored."""
         state = self.state()
         if (not state.get('enabled') or state.get('route') != [bridge.thread_id, bridge.target['message_thread_id']]
                 or item.get('type') not in ('userMessage', 'agentMessage')):
@@ -90,20 +96,23 @@ class NativeMirror:
         row = self.store.db.execute('SELECT state FROM native_mirror_turns WHERE turn_id=?', (turn_id,)).fetchone()
         if row and row['state'] in ('ignored', 'closed'):
             return
+        fingerprint = self.fingerprint(item)
+        if not fingerprint:
+            return
         with self.store.db:
             self.store.db.execute('INSERT OR REPLACE INTO native_mirror_ready VALUES(?,?,?,1)',
-                                  (turn_id, bridge.target['message_thread_id'], self.fingerprint(item)))
+                                  (turn_id, bridge.target['message_thread_id'], fingerprint))
 
-    def record(self, bridge, turn_id, item, allow_agent=True):
+    def record(self, bridge, turn_id, item, identity, allow_agent=True):
         state = self.state()
         if not state.get('enabled') or state.get('route') != [bridge.thread_id, bridge.target['message_thread_id']]:
             return
         row = self.store.db.execute('SELECT * FROM native_mirror_turns WHERE turn_id=?', (turn_id,)).fetchone()
-        if not row or row['state'] == 'ignored' or row['topic_id'] != bridge.target['message_thread_id'] or not item.get('id'):
+        if not row or row['state'] == 'ignored' or row['topic_id'] != bridge.target['message_thread_id']:
             return
         fingerprint = self.fingerprint(item)
         seen = self.store.db.execute('SELECT * FROM native_mirror_seen WHERE turn_id=? AND item_id=? AND topic_id=?',
-                                     (turn_id, item['id'], row['topic_id'])).fetchone()
+                                     (turn_id, identity, row['topic_id'])).fetchone()
         if seen and (seen['sent'] or seen['fingerprint'] == fingerprint):
             return
         kind = item.get('type')
@@ -113,6 +122,8 @@ class NativeMirror:
                     'SELECT 1 FROM inbox WHERE client_id=?', (client_id,)).fetchone()):
                 with self.store.db:
                     self.store.db.execute('UPDATE native_mirror_turns SET telegram_input=1 WHERE turn_id=?', (turn_id,))
+                    self.store.db.execute('INSERT OR REPLACE INTO native_mirror_seen VALUES(?,?,?,?,1)',
+                                          (turn_id, identity, row['topic_id'], fingerprint))
                 return
             parts = []
             for content in item.get('content', []):
@@ -121,7 +132,7 @@ class NativeMirror:
                 elif content.get('type') in ('image', 'localImage'):
                     parts.append('[图片附件，未自动上传]')
             body = '\n'.join(parts).strip()
-            key = 'native-user:' + turn_id + ':' + item['id']
+            key = 'native-user:' + turn_id + ':' + identity
             text = '🖥 你在 Codex 客户端说：\n' + body
         elif kind == 'agentMessage':
             if not allow_agent and not self.store.db.execute(
@@ -136,16 +147,36 @@ class NativeMirror:
             body = item.get('text', '').strip()
             if '[external_agent_tool' in body:
                 return
-            key, text = 'turn:' + turn_id + ':' + item['id'], body
+            key, text = 'turn:' + turn_id + ':' + identity, body
         else:
             return
         if body:
             self.store.enqueue_at(key, bridge.owner, text, row['topic_id'])
             with self.store.db:
                 self.store.db.execute('INSERT OR REPLACE INTO native_mirror_seen VALUES(?,?,?,?,1)',
-                                      (turn_id, item['id'], row['topic_id'], fingerprint))
+                                      (turn_id, identity, row['topic_id'], fingerprint))
 
     @staticmethod
     def fingerprint(item):
-        visible = {key: item.get(key) for key in ('type', 'content', 'text', 'phase')}
+        kind = item.get('type')
+        if kind == 'userMessage':
+            body = '\n'.join(c.get('text', '') if c.get('type') == 'text' else '[图片附件，未自动上传]'
+                             for c in item.get('content', []) if c.get('type') in ('text', 'image', 'localImage')).strip()
+        elif kind == 'agentMessage' and item.get('phase') in (None, 'commentary', 'partial_answer', 'final_answer'):
+            body = item.get('text', '').strip()
+            if '[external_agent_tool' in body:
+                return None
+        else:
+            return None
+        if not body:
+            return None
+        visible = {'type': kind, 'text': body}
         return hashlib.sha256(json.dumps(visible, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def identities(self, items):
+        occurrences = Counter()
+        for item in items:
+            fingerprint = self.fingerprint(item)
+            if fingerprint:
+                occurrences[fingerprint] += 1
+                yield item, 'native-content-' + fingerprint + '-' + str(occurrences[fingerprint]), fingerprint
