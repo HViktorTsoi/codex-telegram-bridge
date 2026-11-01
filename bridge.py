@@ -110,7 +110,7 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO kv VALUES('offset',?)", (str(offset),))
 
     def pending(self):
-        row = self.db.execute("SELECT * FROM inbox WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
+        row = self.db.execute("SELECT * FROM inbox WHERE state='pending' ORDER BY received_ms,id LIMIT 1").fetchone()
         if row and row["media_group_id"]:
             last = self.db.execute("SELECT MAX(received_ms) FROM inbox WHERE media_group_id=? AND state='pending'",
                                    (row["media_group_id"],)).fetchone()[0]

@@ -1,0 +1,278 @@
+import asyncio
+import json
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import AsyncMock
+
+from control_center import export_bundle, receive_bundle, questions_for, ident, write_json
+from topics_bridge import TopicRouter
+
+
+class ControlTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.calls = []
+        self.nodes = {}
+        for host in ('A', 'B'):
+            state = self.root / host
+            state.mkdir()
+            (state / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': ['123']}))
+            config = {'owner_id': '123', 'host_id': host, 'mode': 'topics', 'thread_id': host + '-native',
+                      'socket_path': '/unused', 'telegram_state_dir': str(state), 'expected_bot_username': host + '_bot',
+                      'root_target': 'manager', 'control_hosts': ['A', 'B'], 'targets': [
+                          {'key': 'manager', 'name': 'Manager', 'thread_id': host + '-native', 'message_thread_id': 11,
+                           'aliases': ['manager', host.lower()]},
+                          {'key': 'paper', 'name': '论文', 'thread_id': host + '-paper', 'message_thread_id': 22,
+                           'aliases': ['paper', '论文']}], 'control_hub': host == 'A'}
+            if host == 'A':
+                config['control_peers'] = [{'host_id': 'B', 'ssh_host': 'unused', 'code_dir': '/unused', 'state_dir': str(self.root / 'B')}]
+            (state / 'config.json').write_text(json.dumps(config))
+            router = TopicRouter(config, state)
+            router.bot_id = 100 if host == 'A' else 200
+            router.username = host + '_bot'
+            test = self
+
+            class Telegram:
+                def __init__(self, host):
+                    self.next_id, self.messages = 1000, {}
+                    self.host = host
+
+                async def call(self, method, **params):
+                    test.calls.append((self.host, method, params))
+                    if method == 'answerCallbackQuery':
+                        return True
+                    if method == 'sendMessage':
+                        self.next_id += 1
+                        msg = {**params, 'message_id': self.next_id, 'chat': {'id': 123, 'type': 'private'},
+                               'from': {'id': 100 if self.host == 'A' else 200}, 'date': 1}
+                        self.messages[msg['message_id']] = msg
+                        return msg
+                    if method == 'editMessageText':
+                        msg = {**self.messages[params['message_id']], **params}
+                        self.messages[msg['message_id']] = msg
+                        return msg
+                    raise AssertionError(method)
+
+            router.telegram = Telegram(host)
+            self.nodes[host] = router
+            entries = []
+            for target in config['targets']:
+                entries.append({'host': host, 'thread_id': target['thread_id'], 'name': target['name'],
+                                'target_key': target['key'], 'topic_id': target['message_thread_id'],
+                                'aliases': target['aliases'], 'updated': time.time(), 'status': {'type': 'idle'},
+                                'last_status': 'completed', 'latest_input': '请检查论文', 'latest_reply': '已完成检查。',
+                                'questions': [], 'bot_username': host + '_bot'})
+            write_json(state / 'control/local.json', {'host': host, 'generated': time.time(), 'entries': entries})
+        self.sequence = 100
+        async def peer(peer, action, payload=None):
+            if action == 'snapshot':
+                return export_bundle(self.nodes['B'].state_dir)
+            return receive_bundle(self.nodes['B'].state_dir, payload)
+        self.nodes['A'].control.peer = peer
+        await self.sync()
+
+    async def asyncTearDown(self):
+        for node in self.nodes.values():
+            for bridge in node.bridges.values():
+                bridge.store.db.close()
+            node.store.db.close()
+        self.tmp.cleanup()
+
+    async def sync(self):
+        await self.nodes['A'].control.synchronize()
+
+    def update(self, text, topic=11, sender=123, **extra):
+        self.sequence += 1
+        message = {'message_id': self.sequence, 'date': 1, 'from': {'id': sender},
+                   'chat': {'id': 123, 'type': 'private'}, 'text': text, **extra}
+        if topic:
+            message['message_thread_id'] = topic
+        return {'update_id': self.sequence, 'message': message}
+
+    async def send(self, host, text, **extra):
+        update = self.update(text, **extra)
+        router = self.nodes[host]
+        router.ingest(update)
+        await router.control.handle_one()
+        return update, router.telegram.messages.get(router.telegram.next_id)
+
+    async def click(self, host, message, label, sender=123, topic=None):
+        button = next(b for row in message['reply_markup']['inline_keyboard'] for b in row if label in b['text'])
+        self.sequence += 1
+        origin = dict(message)
+        if topic is not None:
+            origin['message_thread_id'] = topic
+        callback = {'id': str(self.sequence), 'from': {'id': sender}, 'message': origin, 'data': button['callback_data']}
+        router = self.nodes[host]
+        router.ingest({'update_id': self.sequence, 'callback_query': callback})
+        await router.control.handle_one()
+
+    async def test_global_view_is_read_only_and_visible_from_either_bot(self):
+        for host in ('A', 'B'):
+            _, panel = await self.send(host, '/tasks')
+            self.assertIn('4 个已绑定', panel['text'])
+            self.assertIn('A /', panel['text']);self.assertIn('B /', panel['text'])
+            self.assertEqual(self.nodes[host].store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+            self.assertEqual(self.nodes[host].store.db.execute('SELECT COUNT(*) FROM ui_jobs').fetchone()[0], 0)
+
+    async def test_alias_requires_host_for_ambiguity_and_strips_prefix(self):
+        await self.send('A', '@paper 检查')
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
+        notice = self.nodes['A'].store.db.execute('SELECT text FROM notices').fetchone()[0]
+        self.assertIn('重名', notice)
+        await self.send('A', '@B/paper\n检查引用')
+        request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
+        self.assertEqual(request['text'], '检查引用')
+        self.assertEqual((request['target_host'], request['thread_id']), ('B', 'B-paper'))
+
+    async def test_cross_host_dispatch_and_reply_are_durable_and_deduplicated(self):
+        await self.send('A', '@B/paper 检查引用')
+        await self.sync();await self.sync()
+        target = self.nodes['B'].bridges['paper']
+        self.assertTrue(self.nodes['B'].control.deliver_one())
+        self.assertFalse(self.nodes['B'].control.deliver_one())
+        row = target.store.pending()
+        self.assertEqual(row['text'], '检查引用')
+        target.codex = type('Native', (), {'call': AsyncMock(return_value={'turn': {'id': 'actual-existing-turn'}})})()
+        await target.dispatch_one(row)
+        target.codex.call.assert_awaited_once()
+        method, params = target.codex.call.call_args.args
+        self.assertEqual((method, params['threadId']), ('turn/start', 'B-paper'))
+        self.assertEqual(set(params), {'threadId', 'input', 'clientUserMessageId'})
+        target.store.enqueue_at('turn:actual-existing-turn:reply', '123', '**检查完毕**', 22)
+        target.store.mark(row['id'], 'done', 'actual-existing-turn')
+        await self.sync();await self.sync()
+        source = self.nodes['A'].store.db
+        relays = source.execute('SELECT * FROM notices WHERE label=?', ('B/论文',)).fetchall()
+        self.assertEqual(len(relays), 1)
+        self.assertEqual((relays[0]['topic_id'], relays[0]['rich_text']), (11, '**检查完毕**'))
+        self.assertEqual(target.store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 1)
+        self.assertEqual(source.execute('SELECT state FROM cc_requests').fetchone()[0], 'done')
+
+    async def test_reverse_dispatch_works_without_reverse_ssh(self):
+        await self.send('B', '/to A/paper 读批注')
+        await self.sync();self.nodes['A'].control.deliver_one()
+        row = self.nodes['A'].bridges['paper'].store.pending()
+        self.assertEqual((row['text'], row['message_thread_id']), ('读批注', 22))
+
+    async def test_import_crash_recovery_preserves_original_inbox_and_output_boundary(self):
+        await self.send('A', '@B/paper 测试')
+        await self.sync();self.nodes['B'].control.deliver_one()
+        db = self.nodes['B'].store.db
+        saved = dict(db.execute('SELECT * FROM cc_deliveries').fetchone())
+        with db:
+            db.execute("UPDATE cc_deliveries SET state='importing'")
+        self.nodes['B'].control.deliver_one()
+        after = db.execute('SELECT * FROM cc_deliveries').fetchone()
+        self.assertEqual((after['inbox_id'], after['after_rowid']), (saved['inbox_id'], saved['after_rowid']))
+        self.assertEqual(self.nodes['B'].bridges['paper'].store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 1)
+
+    async def test_changed_binding_never_redirects_accepted_work(self):
+        await self.send('A', '@B/paper 测试')
+        await self.sync()
+        self.nodes['B'].targets['paper']['thread_id'] = 'another-native'
+        self.nodes['B'].control.deliver_one()
+        self.assertIsNone(self.nodes['B'].bridges['paper'].store.pending())
+        await self.sync()
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT state FROM cc_requests').fetchone()[0], 'failed')
+
+    async def test_owner_checks_and_callback_context_cannot_be_bypassed(self):
+        await self.send('A', '@B/paper 偷发', sender=999)
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
+        _, panel = await self.send('A', '/tasks')
+        await self.click('A', panel, '查看', sender=999)
+        await self.click('A', panel, '查看', topic=999)
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
+        (self.nodes['A'].state_dir / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': []}))
+        await self.send('A', '@B/paper 偷发')
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM cc_requests').fetchone()[0], 0)
+
+    async def test_explicit_prompt_reply_retains_destination(self):
+        _, panel = await self.send('A', '/to')
+        await self.click('A', panel, 'B/论文')
+        prompt = self.nodes['A'].telegram.messages[self.nodes['A'].telegram.next_id]
+        self.assertTrue(prompt['reply_markup']['force_reply'])
+        await self.send('A', '只读批注', reply_to_message={'message_id': prompt['message_id']})
+        request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
+        self.assertEqual((request['target_host'], request['thread_id'], request['text']), ('B', 'B-paper', '只读批注'))
+
+    async def test_attachments_do_not_fall_through_to_wrong_session(self):
+        await self.send('A', '', photo=[{'file_id': 'a'}], caption='@B/paper 看图')
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+        self.assertIn('附件', self.nodes['A'].store.db.execute('SELECT text FROM notices').fetchone()[0])
+
+    async def test_inbox_dismissal_syncs_and_old_questions_are_not_reopened(self):
+        path = self.nodes['B'].state_dir / 'control/local.json'
+        local = json.loads(path.read_text())
+        local['entries'][0]['questions'] = [{'id': ident('q1'), 'kind': 'question', 'question': '请确认采用哪个方案？'}]
+        write_json(path, local);await self.sync()
+        _, panel = await self.send('A', '/inbox')
+        self.assertIn('1 项', panel['text'])
+        await self.click('A', panel, '查看')
+        detail = self.nodes['A'].telegram.messages[panel['message_id']]
+        await self.click('A', detail, '已处理')
+        await self.sync()
+        _, remote = await self.send('B', '/inbox')
+        self.assertIn('0 项', remote['text'])
+
+    async def test_stale_peers_are_labeled_and_pending_dispatch_survives(self):
+        local = json.loads((self.nodes['B'].state_dir / 'control/local.json').read_text())
+        local['generated'] = time.time() - 100
+        write_json(self.nodes['B'].state_dir / 'control/local.json', local)
+        await self.sync()
+        _, panel = await self.send('A', '/tasks')
+        self.assertIn('数据过期', panel['text'])
+        await self.send('A', '@B/paper 等恢复后执行')
+        self.nodes['A'].control.peer = AsyncMock(side_effect=ConnectionError('offline'))
+        await self.sync()
+        self.assertEqual(self.nodes['A'].store.db.execute('SELECT state FROM cc_requests').fetchone()[0], 'pending')
+
+    async def test_refresh_extracts_only_conversation_and_never_generates(self):
+        node = self.nodes['A']
+        calls = []
+        async def catalog(method, params):
+            calls.append(method)
+            if method == 'thread/list':
+                return {'data': [{'id': 'A-native', 'name': 'Manager', 'updatedAt': time.time(), 'status': {'type': 'idle'}},
+                                 {'id': 'unbound', 'name': '未绑定', 'updatedAt': time.time(), 'status': {'type': 'idle'}}]}
+            return {'data': [{'id': 'turn1', 'status': 'completed', 'items': [
+                {'type': 'userMessage', 'content': [{'type': 'text', 'text': '继续'}]},
+                {'type': 'reasoning', 'text': 'PRIVATE REASONING'},
+                {'type': 'agentMessage', 'text': '请确认你希望采用哪种方案？'}]}]}
+        node.catalog_call = catalog
+        await node.control.refresh()
+        local = json.loads((node.state_dir / 'control/local.json').read_text())
+        self.assertEqual(len(local['entries']), 2)
+        self.assertNotIn('PRIVATE REASONING', json.dumps(local))
+        self.assertEqual(local['entries'][0]['questions'][0]['kind'], 'question')
+        self.assertTrue(all(c in ('thread/list', 'thread/turns/list') for c in calls))
+
+    async def test_pending_order_uses_acceptance_time_for_negative_dispatch_ids(self):
+        store = self.nodes['A'].bridges['paper'].store
+        first = self.update('先到', topic=22);store.accept(first, first['message'])
+        second = self.update('后到', topic=22);second['update_id'] = -100
+        store.accept(second, second['message'])
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=received_ms+1 WHERE id=-100')
+        self.assertEqual(store.pending()['text'], '先到')
+
+
+class QuestionTests(unittest.TestCase):
+    def entry(self, flags=None):
+        return {'host': 'A', 'thread_id': 'native', 'status': {'type': 'active', 'activeFlags': flags or []}}
+
+    def turn(self, text, tid='t'):
+        return {'id': tid, 'status': 'completed', 'items': [{'type': 'agentMessage', 'text': text}]}
+
+    def test_only_latest_turn_questions_and_no_ordinary_recommendations(self):
+        self.assertEqual(questions_for(self.entry(), [self.turn('已提交成功。'), self.turn('请提供手机号？', 'old')]), [])
+        self.assertEqual(questions_for(self.entry(), [self.turn('建议下一步看看视频。')]), [])
+        self.assertEqual(questions_for(self.entry(), [self.turn('是否有误差是实验需要回答的问题？')]), [])
+
+    def test_native_approval_is_not_presented_as_a_regular_answerable_question(self):
+        result = questions_for(self.entry(['waitingOnApproval']), [self.turn('请确认方案？')])
+        self.assertEqual(result[0]['kind'], 'native')
+        self.assertIn('原会话', result[0]['question'])

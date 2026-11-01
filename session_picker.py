@@ -41,6 +41,8 @@ class SessionPicker:
         callback = update.get('callback_query')
         message = update.get('message', {})
         if callback is not None:
+            if not callback.get('data', '').startswith('ui:'):
+                return False
             message = callback.get('message', {})
             identity = {'from': callback.get('from', {}), 'chat': message.get('chat', {})}
             valid = (permitted(identity, self.router.access(), self.router.owner)
