@@ -140,19 +140,18 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 return {'message_id': 1}
         return StubTelegram()
 
-    async def test_rich_delivery_keeps_topic_and_escapes_only_label(self):
+    async def test_rich_delivery_keeps_topic_and_body_without_legacy_title(self):
         tg = self.telegram()
         await send_output(tg, chat_id='123', topic_id=42, text='**body**', rich_text='**body**', label='[A]_B')
         method, params = tg.calls[0]
         self.assertEqual(method, 'sendRichMessage')
         self.assertEqual((params['chat_id'], params['message_thread_id']), ('123', 42))
-        self.assertIn(r'\[A\]\_B', params['rich_message']['markdown'])
-        self.assertTrue(params['rich_message']['markdown'].endswith('**body**'))
+        self.assertEqual(params['rich_message']['markdown'], '**body**')
 
     async def test_parse_error_falls_back_to_verbatim_source_in_same_topic(self):
         tg = self.telegram(TelegramError('sendRichMessage', 400, "Bad Request: can't parse markdown"))
         with self.assertLogs('codex_telegram_format', level='WARNING'):
-            await send_output(tg, chat_id='123', topic_id=42, text='raw **broken', rich_text='raw **broken')
+            await send_output(tg, chat_id='123', topic_id=42, text='raw **broken', rich_text='raw **broken', label='旧会话标题')
         self.assertEqual([m for m, _ in tg.calls], ['sendRichMessage', 'sendMessage'])
         self.assertEqual(tg.calls[1][1], {'chat_id': '123', 'message_thread_id': 42, 'text': 'raw **broken'})
 
@@ -195,8 +194,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await send_output(tg, chat_id='123', topic_id=42, text='source', rich_text='source')
                 self.assertEqual(len(tg.calls), 1)
 
-    async def test_plain_payload_limit_includes_long_unicode_label(self):
+    async def test_plain_delivery_keeps_body_verbatim_without_legacy_title(self):
         tg = self.telegram()
         await send_output(tg, chat_id='123', text='😀' * 1900, label='😀' * 300)
         self.assertEqual(tg.calls[0][0], 'sendMessage')
+        self.assertEqual(tg.calls[0][1]['text'], '😀' * 1900)
         self.assertLessEqual(utf16_size(tg.calls[0][1]['text']), 4096)

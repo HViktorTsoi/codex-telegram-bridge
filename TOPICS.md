@@ -77,7 +77,8 @@ Images get a text placeholder; local files, reasoning, tool logs and internal
 agent messages are not uploaded. Status cards use Rich HTML bold text on the
 first of two lines, retaining their 15-second edit interval and saved message ID.
 
-Codex replies use Rich Markdown by default. `/format rich` and `/format plain`
+Codex replies use Rich Markdown by default and contain only the body, without an
+automatically added topic-title prefix. `/format rich` and `/format plain`
 persist a preference for the selected conversation; `/format` reads it without
 starting a model turn. Delivery keeps the original topic ID in both modes.
 `rich_text` is an additive outbox column. Existing queued chunks remain plain,
