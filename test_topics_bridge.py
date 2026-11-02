@@ -181,7 +181,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         await child.dispatch_one(child.store.pending())
         method, params = child.codex.call.call_args.args
         self.assertEqual((method, params['threadId']), ('turn/start', 'native-instagram'))
-        self.assertTrue(params['input'][0]['text'].startswith('修改这里\n\n以下是用户引用的内容'))
+        self.assertTrue(params['input'][0]['text'].startswith('修改这里\n\n［引用内容］'))
         self.assertIn('> 另一个话题的被引用内容', params['input'][0]['text'])
         context = json.loads(child.store.db.execute('SELECT reply_json FROM inbox').fetchone()[0])
         self.assertEqual((context['reply_to_message_id'], context['reply_to_thread_id']), (80, 11))

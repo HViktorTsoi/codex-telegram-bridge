@@ -67,7 +67,7 @@ class ReadableContextTests(unittest.TestCase):
     def test_body_is_readable_and_technical_ids_remain_internal(self):
         self.assertEqual(render({'source': 'reply_to_message', 'chat_id': 123456, 'reply_to_message_id': 789,
                                  'text': '第一段\n\n```python\nprint(1)\n```'}),
-                         '以下是用户引用的内容，请结合上面的本次要求处理：\n\n'
+                         '［引用内容］\n\n'
                          '> 第一段\n> \n> ```python\n> print(1)\n> ```')
 
     def test_selected_passage_precedes_supporting_body_and_is_not_duplicated(self):
@@ -126,7 +126,7 @@ class ReplyInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((method, params['threadId']), ('turn/start', 'original-session'))
         self.assertEqual(len(params['input']), 1)
         text = params['input'][0]['text']
-        self.assertTrue(text.startswith('改一下这里\n\n以下是用户引用的内容'))
+        self.assertTrue(text.startswith('改一下这里\n\n［引用内容］'))
         self.assertIn('> /stop 是被引用文字', text)
         self.assertIn('用户选中的片段（优先关注）：\n> 被引用文字', text)
         self.assertNotIn('reply_to_message_id', text)
@@ -169,7 +169,7 @@ class ReplyInputTests(unittest.IsolatedAsyncioTestCase):
         with patch('attachments.download', AsyncMock(return_value=photo)):
             await self.bridge.dispatch_one(self.bridge.store.pending())
         values = self.codex.call.call_args.args[1]['input']
-        self.assertEqual(values[0]['text'].count('以下是用户引用的内容'), 1)
+        self.assertEqual(values[0]['text'].count('［引用内容］'), 1)
         self.assertEqual(len([v for v in values if v['type'] == 'localImage']), 2)
         self.assertIn('比较图片', values[0]['text'])
 
