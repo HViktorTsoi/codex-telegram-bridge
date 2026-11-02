@@ -55,8 +55,7 @@ def snapshot(message):
     if not any(isinstance(value, dict) and value for value in (parent, external, quote)):
         return None
     # Some clients include the topic's creation message as an implicit root reply.
-    if (isinstance(parent, dict) and 'forum_topic_created' in parent
-            and parent.get('message_id') == message.get('message_thread_id') and not quote and not external):
+    if isinstance(parent, dict) and 'forum_topic_created' in parent and not quote and not external:
         return None
     context = {}
     if isinstance(parent, dict) and parent:

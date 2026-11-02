@@ -13,7 +13,10 @@ class SnapshotTests(unittest.TestCase):
     def test_unquoted_and_implicit_topic_root_messages_add_no_context(self):
         for message in ({'text': '普通文字'}, {'text': '/model'}, {'photo': [{'file_id': 'x'}]},
                         {'text': '普通文字', 'message_thread_id': 42,
-                         'reply_to_message': {'message_id': 42, 'forum_topic_created': {'name': 'topic'}}}):
+                         'reply_to_message': {'message_id': 42, 'forum_topic_created': {'name': 'topic'}}},
+                        {'text': '普通话题消息', 'message_thread_id': 6425, 'is_topic_message': True,
+                         'reply_to_message': {'message_id': 256, 'message_thread_id': 6425,
+                                              'forum_topic_created': {'name': 'topic'}}}):
             self.assertIsNone(snapshot(message))
         self.assertEqual(payload_from({'text': '/status', 'reply_to_message': {'text': 'quoted'}}), {})
 
