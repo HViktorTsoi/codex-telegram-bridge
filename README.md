@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.6.3 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.6.4 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -78,6 +78,8 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 4. 会话若尚未出现在列表中，先在电脑端创建并发送首条消息，再点击“重新加载”。
 
 `/sessions` 首页及“添加会话”列表会逐项显示会话名称和 Codex 提供的工作目录，编号与选择按钮对应；同名会话可通过目录和 ID 区分。长路径保留首尾并用省略号缩略，进入会话详情可核对更长的路径。未提供目录或原生服务暂时不可用时会明确提示。此操作只读取本机会话元数据，不调用模型生成。
+
+“添加会话”的按钮列表在每个名称下单独显示一行 `📁 路径`；点击名称或路径都选择该会话。每页及翻页后的列表使用同样布局，较长目录也会在上方正文中提供。
 
 原私聊入口继续使用 `root_target` 指定的原会话。话题模式、恢复策略和完整配置说明见 [TOPICS.md](TOPICS.md)。
 

@@ -156,6 +156,7 @@ class SessionPicker:
             label = f'{len(details) + 1}. {label}'
             details.append(label + '\n目录：' + directory_text(thread))
             rows.append([(label, 'select', {'thread_id': thread['id']})])
+            rows.append([('📁 ' + directory_text(thread, 50), 'select', {'thread_id': thread['id']})])
         navigation = []
         if history:
             navigation.append(('上一页', 'catalog', {'cursor': history[-1], 'history': history[:-1]}))
