@@ -105,9 +105,13 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         await self.router.picker.handle_one()
         return self.telegram.messages[message['message_id']]
 
+    async def open_catalog(self, menu):
+        directories = await self.click(menu, '添加会话')
+        return await self.click(directories, '1. 📁 ')
+
     async def confirmation(self):
         menu = await self.menu()
-        catalog = await self.click(menu, '添加会话')
+        catalog = await self.open_catalog(menu)
         return await self.click(catalog, '新会话')
 
     async def test_menu_and_pagination_are_control_events_without_native_turns(self):
@@ -117,7 +121,13 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('目录：/work/meeting-native', menu['text'])
         self.assertIn('目录：/work/instagram-native', menu['text'])
         self.assertIsNone(self.router.bridges['meeting'].store.pending())
-        catalog = await self.click(menu, '添加会话')
+        directories = await self.click(menu, '添加会话')
+        self.assertIn('请选择目录', directories['text'])
+        self.assertIn('3 个目录，4 个会话', directories['text'])
+        self.assertNotIn('新会话', str(directories['reply_markup']))
+        self.assertIn('📁 /work/新项目 · 2个', str(directories['reply_markup']))
+        self.assertIn('📁 /work/meeting-native · 1个', str(directories['reply_markup']))
+        catalog = await self.click(directories, '1. 📁 ')
         self.assertIn('新会话', str(catalog['reply_markup']))
         self.assertEqual(catalog['text'].count('/work/新项目'), 1)
         self.assertIn('目录 1/3', catalog['text'])
@@ -151,7 +161,7 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
                 return {'thread': next(t for t in threads if t['id'] == params['threadId'])}
             raise AssertionError(method)
         self.router.catalog_call = AsyncMock(side_effect=metadata)
-        catalog = await self.click(menu, '添加会话')
+        catalog = await self.open_catalog(menu)
         self.assertEqual(catalog['text'].count('/work/shared'), 1)
         self.assertIn('会话第 1/2 页', catalog['text'])
         self.assertNotIn('项目13', str(catalog['reply_markup']))
@@ -169,7 +179,7 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_directory_snapshot_and_buttons_survive_restart_without_refetch(self):
         menu = await self.menu()
-        catalog = await self.click(menu, '添加会话')
+        catalog = await self.open_catalog(menu)
         original = self.router
         reloaded = TopicRouter(copy.deepcopy(self.config), self.path)
         reloaded.bot_id, reloaded.telegram = 444, self.telegram
@@ -179,6 +189,10 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
             other = await self.click(catalog, '下个目录')
             self.assertIn('/work/meeting-native', other['text'])
             self.assertIn('会议记录', str(other['reply_markup']))
+            directories = await self.click(other, '返回目录列表')
+            self.assertIn('请选择目录', directories['text'])
+            chosen = await self.click(directories, '/work/新项目')
+            self.assertIn('新会话', str(chosen['reply_markup']))
             reloaded.catalog_call.assert_not_awaited()
         finally:
             for bridge in reloaded.bridges.values():
@@ -186,10 +200,33 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
             reloaded.store.db.close()
             self.router = original
 
+    async def test_directory_chooser_pagination_and_return_keep_directory_page(self):
+        menu = await self.menu()
+        threads = [{'id': f'dir-{i}', 'name': f'会话{i}', 'cwd': f'/work/project-{i}'} for i in range(1, 14)]
+        async def metadata(method, params):
+            if method == 'thread/list':
+                return {'data': threads}
+            if method == 'thread/read':
+                return {'thread': next(t for t in threads if t['id'] == params['threadId'])}
+            raise AssertionError(method)
+        self.router.catalog_call = AsyncMock(side_effect=metadata)
+        directories = await self.click(menu, '添加会话')
+        self.assertIn('目录列表第 1/2 页', directories['text'])
+        self.assertNotIn('/work/project-13', str(directories['reply_markup']))
+        second = await self.click(directories, '下一页目录')
+        self.assertIn('/work/project-13', str(second['reply_markup']))
+        sessions = await self.click(second, '/work/project-13')
+        self.assertIn('会话13', str(sessions['reply_markup']))
+        self.assertNotIn('会话12', str(sessions['reply_markup']))
+        returned = await self.click(sessions, '返回目录列表')
+        self.assertIn('目录列表第 2/2 页', returned['text'])
+        self.assertIn('/work/project-13', str(returned['reply_markup']))
+        self.assertEqual(sum(call.args[0] == 'thread/list' for call in self.router.catalog_call.call_args_list), 1)
+
     async def test_unknown_topic_sessions_menu_is_sent_to_main_chat(self):
         menu = await self.menu(topic_id=999)
         self.assertNotIn('message_thread_id', menu)
-        catalog = await self.click(menu, '添加会话')
+        catalog = await self.open_catalog(menu)
         self.assertEqual(catalog['message_id'], menu['message_id'])
         self.assertNotIn('message_thread_id', catalog)
         self.assertEqual(self.telegram.created, [])
@@ -211,7 +248,7 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmation_binds_exact_id_atomically_and_activates_without_restart(self):
         menu = await self.menu()
-        catalog = await self.click(menu, '添加会话')
+        catalog = await self.open_catalog(menu)
         confirmation = await self.click(catalog, '新会话')
         self.assertIn('new-native', confirmation['text'])
         self.assertEqual(self.telegram.created, [])
@@ -243,7 +280,7 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         await self.router.picker.handle_one()
         self.assertEqual(len(self.telegram.created), 1)
         menu = await self.menu()
-        catalog = await self.click(menu, '添加会话')
+        catalog = await self.open_catalog(menu)
         catalog = await self.click(catalog, '下个目录')
         result = await self.click(catalog, '已绑定 会议记录')
         self.assertIn('已经绑定', result['text'])
@@ -322,7 +359,7 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         original_store = original_bridge.store
         original_store.accept({'update_id': 1}, {'chat': {'id': 123}, 'message_thread_id': 11, 'text': 'old request'})
         menu = await self.menu()
-        catalog = await self.click(menu, '添加会话')
+        catalog = await self.open_catalog(menu)
         catalog = await self.click(catalog, '下个目录')
         bound = await self.click(catalog, '已绑定 会议记录')
         confirm = await self.click(bound, '重新创建话题')

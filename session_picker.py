@@ -190,6 +190,8 @@ class SessionPicker:
         if not groups:
             return await self.panel(update, f'{host} · 添加会话\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。',
                                     [[('重新加载', 'catalog', {}), ('返回', 'home', {})]])
+        if 'group' not in data and 'directory' not in data:
+            return await self.directory_index(update, catalog_id, groups, data.get('dir_page', 0))
         group = groups[group_index]
         threads = group['threads']
         page_count = (len(threads) + 11) // 12
@@ -216,12 +218,35 @@ class SessionPicker:
             directories.append(('下个目录 ▶', 'catalog', {**position, 'group': group_index + 1, 'page': 0}))
         if directories:
             rows.append(directories)
-        rows.append([('重新加载', 'catalog', {'directory': group['cwd']}), ('返回', 'home', {})])
+        rows.append([('返回目录列表', 'catalog', {'catalog_id': catalog_id, 'dir_page': group_index // 12}),
+                     ('重新加载', 'catalog', {'directory': group['cwd']})])
         text = (f'{host} · 添加会话\n目录 {group_index + 1}/{len(groups)}\n'
                 f"📁 {directory_text(group, 1200)}\n\n本目录 {len(threads)} 个会话，按最近更新排序。")
         if page_count > 1:
             text += f'\n会话第 {page + 1}/{page_count} 页。'
         text += '\n请选择要接入的原会话：'
+        await self.panel(update, text, rows)
+
+    async def directory_index(self, update, catalog_id, groups, page=0):
+        page_count = (len(groups) + 11) // 12
+        page = max(0, min(int(page), page_count - 1))
+        rows = []
+        for index, group in enumerate(groups[page * 12:(page + 1) * 12], page * 12):
+            label = f"{index + 1}. 📁 {directory_text(group, 36)} · {len(group['threads'])}个"
+            rows.append([(label, 'catalog', {'catalog_id': catalog_id, 'group': index, 'page': 0})])
+        navigation = []
+        if page:
+            navigation.append(('上一页目录', 'catalog', {'catalog_id': catalog_id, 'dir_page': page - 1}))
+        if page + 1 < page_count:
+            navigation.append(('下一页目录', 'catalog', {'catalog_id': catalog_id, 'dir_page': page + 1}))
+        if navigation:
+            rows.append(navigation)
+        rows.append([('重新加载', 'catalog', {'dir_page': page}), ('返回', 'home', {})])
+        host = self.router.config.get('host_id', '本机')
+        text = (f'{host} · 添加会话\n本机会话目录\n\n'
+                f"共 {len(groups)} 个目录，{sum(len(g['threads']) for g in groups)} 个会话。\n请选择目录，查看该目录的会话。")
+        if page_count > 1:
+            text += f'\n目录列表第 {page + 1}/{page_count} 页。'
         await self.panel(update, text, rows)
 
     async def selected(self, update, thread_id, catalog=None):

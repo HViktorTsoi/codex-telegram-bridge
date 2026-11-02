@@ -58,8 +58,12 @@ continue using `bridge.py`. Topic mode does not use `--notify`.
 
 From the main chat or any private topic, `/sessions` opens the session menu in
 the main chat. The home panel lists the working directory of each bound
-conversation. **添加会话** groups the full native catalog by working directory,
-showing one path at the top and only that directory's conversation buttons below.
+conversation. **添加会话** first lists all working directories represented in
+the native catalog, with a conversation count on each directory button. Select
+a directory to show its sessions. Directory lists with more than 12 entries
+have pages; **返回目录列表** returns to the directory list page containing the
+selected directory. A session page shows one path at the top and only that
+directory's conversation buttons below.
 Use **上个目录／下个目录** to switch directories. Groups with more than 12
 conversations have internal pages; returning from a selection keeps the same
 directory and page. A private SQLite catalog snapshot keeps navigation stable
