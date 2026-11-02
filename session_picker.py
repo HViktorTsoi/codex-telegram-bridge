@@ -46,6 +46,8 @@ class SessionPicker:
                 action TEXT,data TEXT,expires_at REAL,state TEXT DEFAULT 'active');
             CREATE TABLE IF NOT EXISTS binding_ops(
                 thread_id TEXT PRIMARY KEY,target_json TEXT,status TEXT,error TEXT,updated_at REAL);
+            CREATE TABLE IF NOT EXISTS ui_catalogs(
+                id TEXT PRIMARY KEY,payload TEXT,expires_at REAL);
         ''')
 
     def ingest(self, update):
@@ -139,46 +141,95 @@ class SessionPicker:
         except (RpcError, ConnectionError, asyncio.TimeoutError):
             return '暂时无法读取'
 
+    async def new_catalog(self):
+        groups, seen, cursors, cursor = {}, set(), set(), None
+        for _ in range(100):
+            params = {'limit': 100, 'sortKey': 'updated_at', 'sortDirection': 'desc', 'archived': False}
+            if cursor:
+                params['cursor'] = cursor
+            result = await self.router.catalog_call('thread/list', params)
+            for thread in result.get('data', []):
+                if (thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False
+                        or thread['id'] in seen):
+                    continue
+                seen.add(thread['id'])
+                cwd = thread.get('cwd')
+                cwd = cwd if isinstance(cwd, str) and cwd else None
+                groups.setdefault(cwd, []).append({'id': thread['id'], 'name': thread.get('name')})
+            cursor = result.get('nextCursor')
+            if not cursor:
+                break
+            if cursor in cursors:
+                raise BindingError('原生会话列表分页异常，请重新加载。')
+            cursors.add(cursor)
+        else:
+            raise BindingError('原生会话列表过大，暂时无法完整分组，请稍后重试。')
+        catalog_id = secrets.token_urlsafe(12)
+        payload = [{'cwd': cwd, 'threads': threads} for cwd, threads in groups.items()]
+        with self.db:
+            self.db.execute('DELETE FROM ui_catalogs WHERE expires_at<=?', (time.time(),))
+            self.db.execute('INSERT INTO ui_catalogs VALUES(?,?,?)',
+                            (catalog_id, json.dumps(payload, ensure_ascii=False), time.time() + 900))
+        return catalog_id, payload
+
     async def catalog(self, update, data):
-        params = {'limit': 6, 'sortKey': 'updated_at', 'sortDirection': 'desc', 'archived': False}
-        cursor, history = data.get('cursor'), data.get('history', [])
-        if cursor:
-            params['cursor'] = cursor
-        result = await self.router.catalog_call('thread/list', params)
+        catalog_id = data.get('catalog_id')
+        if catalog_id:
+            saved = self.db.execute('SELECT payload FROM ui_catalogs WHERE id=? AND expires_at>?',
+                                    (catalog_id, time.time())).fetchone()
+            if not saved:
+                raise BindingError('这个目录列表已过期，请点击“重新加载”或重新打开 /sessions。')
+            groups = json.loads(saved['payload'])
+            with self.db:
+                self.db.execute('UPDATE ui_catalogs SET expires_at=? WHERE id=?', (time.time() + 900, catalog_id))
+            group_index = max(0, min(int(data.get('group', 0)), len(groups) - 1))
+        else:
+            catalog_id, groups = await self.new_catalog()
+            group_index = next((i for i, g in enumerate(groups) if 'directory' in data and g['cwd'] == data['directory']), 0)
+        host = self.router.config.get('host_id', '本机')
+        if not groups:
+            return await self.panel(update, f'{host} · 添加会话\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。',
+                                    [[('重新加载', 'catalog', {}), ('返回', 'home', {})]])
+        group = groups[group_index]
+        threads = group['threads']
+        page_count = (len(threads) + 11) // 12
+        page = max(0, min(int(data.get('page', 0)), page_count - 1))
+        position = {'catalog_id': catalog_id, 'group': group_index, 'page': page}
         bound = {t['thread_id']: t for t in self.router.targets.values()}
-        rows, details = [], []
-        for thread in result.get('data', []):
-            if thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
-                continue
+        rows = []
+        for number, thread in enumerate(threads[page * 12:(page + 1) * 12], page * 12 + 1):
             label = clean_name(thread.get('name') or '未命名会话', 32) + ' · ' + thread['id'][-6:]
             if thread['id'] in bound:
                 label = ('⚠ 话题失效 ' if bound[thread['id']].get('topic_missing') else '✓ 已绑定 ') + label
-            label = f'{len(details) + 1}. {label}'
-            details.append(label + '\n目录：' + directory_text(thread))
-            rows.append([(label, 'select', {'thread_id': thread['id']})])
-            rows.append([('📁 ' + directory_text(thread, 50), 'select', {'thread_id': thread['id']})])
+            rows.append([(f'{number}. {label}', 'select', {'thread_id': thread['id'], 'catalog': position})])
         navigation = []
-        if history:
-            navigation.append(('上一页', 'catalog', {'cursor': history[-1], 'history': history[:-1]}))
-        if result.get('nextCursor'):
-            navigation.append(('下一页', 'catalog', {'cursor': result['nextCursor'], 'history': history + [cursor]}))
+        if page:
+            navigation.append(('上一页', 'catalog', {**position, 'page': page - 1}))
+        if page + 1 < page_count:
+            navigation.append(('下一页', 'catalog', {**position, 'page': page + 1}))
         if navigation:
             rows.append(navigation)
-        rows.append([('重新加载', 'catalog', {}), ('返回', 'home', {})])
-        host = self.router.config.get('host_id', '本机')
-        text = f'{host} 上的 Codex 会话\n按最近更新排序。请选择要接入的原会话：'
-        if details:
-            text += '\n\n' + '\n\n'.join(details)
-        else:
-            text += '\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。'
+        directories = []
+        if group_index:
+            directories.append(('◀ 上个目录', 'catalog', {**position, 'group': group_index - 1, 'page': 0}))
+        if group_index + 1 < len(groups):
+            directories.append(('下个目录 ▶', 'catalog', {**position, 'group': group_index + 1, 'page': 0}))
+        if directories:
+            rows.append(directories)
+        rows.append([('重新加载', 'catalog', {'directory': group['cwd']}), ('返回', 'home', {})])
+        text = (f'{host} · 添加会话\n目录 {group_index + 1}/{len(groups)}\n'
+                f"📁 {directory_text(group, 1200)}\n\n本目录 {len(threads)} 个会话，按最近更新排序。")
+        if page_count > 1:
+            text += f'\n会话第 {page + 1}/{page_count} 页。'
+        text += '\n请选择要接入的原会话：'
         await self.panel(update, text, rows)
 
-    async def selected(self, update, thread_id):
+    async def selected(self, update, thread_id, catalog=None):
         existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
         if existing:
             if existing.get('topic_missing'):
                 return await self.repair_selected(update, thread_id, existing['message_thread_id'])
-            return await self.bound_panel(update, existing, already=True)
+            return await self.bound_panel(update, existing, already=True, catalog=catalog)
         result = await self.router.catalog_call('thread/read', {'threadId': thread_id})
         thread = result['thread']
         if thread['id'] != thread_id or thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
@@ -186,8 +237,8 @@ class SessionPicker:
         text = (f"确认接入这个原会话？\n\n名称：{clean_name(thread.get('name') or '未命名会话', 140)}\n"
                 f"主机：{self.router.config.get('host_id', '本机')}\nID：{thread_id}\n"
                 f"目录：{directory_text(thread)}\n\n确认后会创建新 Telegram 话题，沿用此会话的历史和设置。")
-        await self.panel(update, text, [[('确认绑定到新话题', 'confirm', {'thread_id': thread_id})],
-                                        [('返回会话列表', 'catalog', {}), ('取消', 'home', {})]])
+        await self.panel(update, text, [[('确认绑定到新话题', 'confirm', {'thread_id': thread_id, 'catalog': catalog})],
+                                        [('返回会话列表', 'catalog', catalog or {}), ('取消', 'home', {})]])
 
     def operation(self, thread_id, target, status, error=None):
         with self.db:
@@ -284,14 +335,14 @@ class SessionPicker:
         self.operation(thread_id, target, 'active')
         return target
 
-    async def bound_panel(self, update, target, already=False):
+    async def bound_panel(self, update, target, already=False, catalog=None):
         directory = await self.directory(target['thread_id'])
         text = (('此会话已经绑定。' if already else '已绑定，立即生效。') +
                 f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n目录：{directory}\n"
                 '在该话题发送 /status 可核对会话。')
         await self.panel(update, text, [
             [('重新创建话题', 'repair_select', {'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']})],
-            [('继续添加', 'catalog', {}), ('返回', 'home', {})]])
+            [('继续添加', 'catalog', catalog or {}), ('返回', 'home', {})]])
 
     async def handle_one(self):
         job = self.db.execute("SELECT * FROM ui_jobs WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
@@ -326,13 +377,13 @@ class SessionPicker:
                 elif action == 'catalog':
                     await self.catalog(update, data)
                 elif action == 'select':
-                    await self.selected(update, data['thread_id'])
+                    await self.selected(update, data['thread_id'], data.get('catalog'))
                 elif action == 'confirm':
                     allow_create = button['state'] == 'active'
                     with self.db:
                         self.db.execute("UPDATE ui_buttons SET state='consumed' WHERE token=?", (button['token'],))
                     target = await self.bind(data['thread_id'], allow_create=allow_create)
-                    await self.bound_panel(update, target)
+                    await self.bound_panel(update, target, catalog=data.get('catalog'))
                 elif action == 'repair_select':
                     await self.repair_selected(update, data['thread_id'], data['topic_id'])
                 elif action == 'repair_confirm':

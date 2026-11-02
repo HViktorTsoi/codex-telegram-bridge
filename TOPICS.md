@@ -57,13 +57,16 @@ selects the entry point from `config.json`; configurations without `mode: topics
 continue using `bridge.py`. Topic mode does not use `--notify`.
 
 From the main chat or any private topic, `/sessions` opens the session menu in
-the main chat. The home panel and **添加会话** catalog list each conversation's
-working directory with a number matching its button. Long paths retain both
-ends; details show more of the path. Missing or temporarily unavailable metadata
-is labelled explicitly. Directory lookup reads local native metadata only and
-does not start model turns. Each catalog selection has a name button followed
-by a separate directory button; either button selects the same native ID.
-This also applies after pagination. Page through native conversations, select one, check its name and full ID, and
+the main chat. The home panel lists the working directory of each bound
+conversation. **添加会话** groups the full native catalog by working directory,
+showing one path at the top and only that directory's conversation buttons below.
+Use **上个目录／下个目录** to switch directories. Groups with more than 12
+conversations have internal pages; returning from a selection keeps the same
+directory and page. A private SQLite catalog snapshot keeps navigation stable
+across native updates and restarts. **重新加载** builds a new snapshot while
+keeping the current directory when it still exists. Long paths retain both ends;
+missing directory metadata has its own group. These are local metadata reads
+and never start model turns. Select a conversation, check its name and full ID, and
 choose **确认绑定到新话题**. The new topic becomes available without restarting
 the collector. Bindings are written atomically to `config.json`, with previous
 configurations in `binding-config-backups/`. The picker restores subscriptions
