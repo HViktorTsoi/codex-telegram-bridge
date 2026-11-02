@@ -9,7 +9,7 @@ from message_format import formatting_error
 class TopicActivity:
     KEY = 'topic_activity_v1'
     INTERVAL = 15
-    STYLE_VERSION = 2
+    STYLE_VERSION = 3
 
     def __init__(self, store, clock=time.time):
         self.store, self.clock = store, clock
@@ -71,9 +71,10 @@ class TopicActivity:
                    'unknown': '⚠️ 状态待确认', 'completed': '✅ 已完成',
                    'failed': '❌ 执行失败', 'interrupted': '⏹ 已停止'}[phase]
         # The topic title already identifies the session; keep the card to two lines.
-        hint = '去 Codex 处理 · ' if phase == 'waiting' else ''
+        hint = ' · 去Codex' if phase == 'waiting' else ''
+        update_label = '' if phase == 'waiting' else '更新 '
         display_time = state.get('updated_at', now) if restyle else now
-        text = f'{heading} · {duration}\n{hint}更新 ' + time.strftime('%H:%M:%S', time.localtime(display_time))
+        text = f'━━━━ {heading} ━━━━\n{duration} · {update_label}' + time.strftime('%H:%M:%S', time.localtime(display_time)) + hint
         if now < state.get('retry_at', 0):
             return
         if (phase == state.get('phase') and state.get('style_version') == self.STYLE_VERSION
