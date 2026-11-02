@@ -8,6 +8,7 @@ import re
 import shutil
 
 import aiohttp
+from reply_context import inputs as reply_inputs
 
 MAX_BYTES = 20_000_000
 RESERVE_BYTES = 256 * 1024 * 1024
@@ -150,4 +151,5 @@ async def inputs_for(rows, telegram, inbox_dir):
         text += "\n\nTelegram附加信息（JSON）：\n" + json.dumps(structured, ensure_ascii=False)
     result = [{"type": "text", "text": text or "收到了暂未支持的 Telegram 消息类型。"}]
     result.extend(images)
+    result.extend(reply_inputs(rows))
     return result
