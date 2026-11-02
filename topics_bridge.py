@@ -211,8 +211,7 @@ class TargetBridge(Bridge):
                 continue
             try:
                 sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
-                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'],
-                                         label=self.target['name'])
+                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'])
                 with self.store.db:
                     self.store.db.execute("UPDATE outbox SET message_id=? WHERE key=?",
                                           (sent["message_id"], row["key"]))
@@ -463,7 +462,7 @@ class TopicRouter:
                 continue
             try:
                 sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
-                                         rich_text=row['rich_text'], topic_id=row['topic_id'], label=row['label'])
+                                         rich_text=row['rich_text'], topic_id=row['topic_id'])
                 with self.store.db:
                     self.store.db.execute("UPDATE notices SET message_id=? WHERE id=?", (sent["message_id"], row["id"]))
             except (TelegramError, ConnectionError) as error:

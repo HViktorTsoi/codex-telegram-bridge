@@ -1,7 +1,6 @@
 """Rich Markdown delivery with bounded chunks and conservative plain fallback."""
 import logging
 import re
-import string
 
 LOG = logging.getLogger('codex_telegram_format')
 PLAIN_LIMIT = 3800
@@ -86,10 +85,6 @@ def formatting_error(error):
         "can't parse", 'cannot parse', 'failed to parse', 'invalid markdown', 'invalid html',
         'rich_message', 'rich message is too', 'too many blocks', 'too many columns',
         'unsupported start tag', 'entity offset', 'url host is empty'))
-
-
-def escape_label(label):
-    return ''.join('\\' + char if char in string.punctuation else char for char in label)
 
 
 def code_text(text):
@@ -182,13 +177,12 @@ def formatting_reason(error):
 
 
 async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None, label=None):
-    label = str(label)[:128] if label else None
+    """Send the body only; legacy label metadata is accepted without rendering it."""
     route = {'chat_id': chat_id}
     if topic_id:
         route['message_thread_id'] = topic_id
-    plain = (f'〔{label}〕\n' if label else '') + text
     if rich_text is not None and getattr(telegram, 'rich_supported', None) is not False:
-        markdown = (f'〔{escape_label(label)}〕\n\n' if label else '') + normalize_local_links(rich_text)
+        markdown = normalize_local_links(rich_text)
         try:
             result = await telegram.call('sendRichMessage', **route, rich_message={'markdown': markdown})
             telegram.rich_supported = True
@@ -201,4 +195,4 @@ async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None,
                 telegram.rich_supported = False
             LOG.warning('Rich Markdown rejected (%s, %s); sending this source chunk as plain text',
                         getattr(error, 'code', None), formatting_reason(error))
-    return await telegram.call('sendMessage', **route, text=plain)
+    return await telegram.call('sendMessage', **route, text=text)
