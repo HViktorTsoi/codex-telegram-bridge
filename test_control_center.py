@@ -203,6 +203,17 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         request = json.loads(self.nodes['A'].store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
         self.assertEqual((request['target_host'], request['thread_id'], request['text']), ('A', 'A-paper', '只读批注'))
 
+    async def test_quoted_alias_dispatch_keeps_context_separate_from_task_and_destination(self):
+        await self.send('A', '@paper 修改这里', reply_to_message={'message_id': 77, 'text': '引用原文'},
+                        quote={'text': '原文', 'position': 2})
+        await self.sync()
+        self.assertTrue(self.nodes['A'].control.deliver_one())
+        row = self.nodes['A'].bridges['paper'].store.pending()
+        self.assertEqual((row['text'], row['message_thread_id']), ('修改这里', 22))
+        self.assertEqual(json.loads(row['reply_json'])['reply_to_message_id'], 77)
+        self.assertEqual(json.loads(row['reply_json'])['quote'], '原文')
+        self.assertFalse(self.nodes['A'].control.deliver_one())
+
     async def test_management_commands_from_any_topic_open_main_chat_panels(self):
         for topic in (11, 999, None):
             for command in ('/tasks', '/tasks all', '/inbox', '/aliases', '/to'):

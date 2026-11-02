@@ -23,6 +23,7 @@ from session_picker import topic_missing_error
 from message_format import send_output
 from activity_indicator import TopicActivity
 from native_mirror import NativeMirror
+from reply_context import serialized as reply_serialized
 
 LOG = logging.getLogger("codex_telegram_topics")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -92,17 +93,17 @@ class RoutedStore(Store):
             raise ValueError("Target queue is bound to another native thread")
         self.set("bound_thread_id", thread_id)
 
-    def accept(self, update, message=None):
+    def accept(self, update, message=None, *, reply_context=None):
         with self.db:
             if message is not None:
                 self.db.execute(
                     "INSERT OR IGNORE INTO inbox(id,chat_id,text,received_ms,client_id,message_json,"
-                    "media_group_id,message_thread_id,source_message_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "media_group_id,message_thread_id,source_message_id,reply_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (update["update_id"], str(message["chat"]["id"]),
                      message.get("text") or message.get("caption", ""), now_ms(),
                      "telegram-" + str(update["update_id"]), json.dumps(payload_from(message), ensure_ascii=False),
                      str(message["media_group_id"]) if message.get("media_group_id") else None,
-                     topic_of(message), message.get("message_id")),
+                     topic_of(message), message.get("message_id"), reply_serialized(message, reply_context)),
                 )
             self.db.execute("INSERT OR REPLACE INTO kv VALUES('offset',?)",
                             (str(max(int(self.get("offset", 0)), update["update_id"] + 1)),))

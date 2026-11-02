@@ -173,6 +173,18 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         row = self.router.bridges['instagram'].store.db.execute('SELECT * FROM inbox').fetchone()
         self.assertEqual((row['state'], row['turn_id'], row['message_thread_id']), ('running', 'already-accepted-turn', 22))
 
+    async def test_reply_context_uses_original_input_topic_without_retargeting_parent_topic(self):
+        self.accept(self.message(100, 22, text='修改这里', reply_to_message={
+            'message_id': 80, 'message_thread_id': 11, 'text': '另一个话题的被引用内容'}))
+        child = self.router.bridges['instagram']
+        child.codex = type('Native', (), {'call': AsyncMock(return_value={'turn': {'id': 'quoted-turn'}})})()
+        await child.dispatch_one(child.store.pending())
+        method, params = child.codex.call.call_args.args
+        self.assertEqual((method, params['threadId']), ('turn/start', 'native-instagram'))
+        context = json.loads(params['input'][-1]['text'].split('\n', 1)[1])
+        self.assertEqual((context['reply_to_message_id'], context['reply_to_thread_id']), (80, 11))
+        self.assertIsNone(self.router.bridges['meeting'].store.pending())
+
     def test_changed_native_binding_blocks_accepted_work(self):
         self.router.ingest(self.message(100, 22))
         self.router.bridges['instagram'].thread_id = 'other-thread'

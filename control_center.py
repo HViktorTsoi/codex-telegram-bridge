@@ -12,6 +12,7 @@ import time
 
 from bridge import RpcError, TelegramError, permitted
 from message_format import message_parts
+from reply_context import snapshot as reply_snapshot, serialized as reply_serialized
 
 LOG = logging.getLogger('codex_telegram_control')
 COMMANDS = [{'command': 'tasks', 'description': '本机会话与进度'},
@@ -437,7 +438,7 @@ class ControlCenter:
                             (result['message_id'], str(origin['chat']['id']), None,
                              json.dumps({**data, 'target_key': entry['target_key'], 'topic_id': entry['topic_id']}, ensure_ascii=False), time.time() + 900))
 
-    async def dispatch(self, origin, update_id, entry, text, question=None):
+    async def dispatch(self, origin, update_id, entry, text, question=None, reply_context=None):
         if entry.get('host') != self.host:
             raise ValueError('只支持本机会话，请切换到对应机器的 Telegram Bot。')
         if not text.strip():
@@ -451,6 +452,8 @@ class ControlCenter:
                    'source_topic': None, 'target_host': entry['host'],
                    'target_key': entry['target_key'], 'target_name': entry['name'], 'thread_id': entry['thread_id'],
                    'topic_id': entry['topic_id'], 'text': text, 'created': time.time()}
+        if reply_context:
+            request['reply_context'] = reply_context
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO cc_requests(id,payload,updated) VALUES(?,?,?)',
                             (rid, json.dumps(request, ensure_ascii=False, sort_keys=True), time.time()))
@@ -517,7 +520,7 @@ class ControlCenter:
                 elif text.startswith('@'):
                     parts = text[1:].split(maxsplit=1)
                     selector, body = parts[0], parts[1] if len(parts) > 1 else ''
-                    await self.dispatch(origin, row['id'], self.resolve(selector), body)
+                    await self.dispatch(origin, row['id'], self.resolve(selector), body, reply_context=reply_snapshot(origin))
                 else:
                     pieces = text.split(maxsplit=2);command = pieces[0].split('@')[0].lower()
                     if command in ('/tasks', '/inbox'):
@@ -526,7 +529,7 @@ class ControlCenter:
                         entries = [e for e in self.view()[0] if e.get('target_key')]
                         await self.panel(origin, '本机派单别名（重名时用 /to 按钮选择）：\n' + '\n'.join('@' + self.selector(e) + ' → ' + e['name'] for e in entries))
                     elif command == '/to' and len(pieces) == 3:
-                        await self.dispatch(origin, row['id'], self.resolve(pieces[1]), pieces[2])
+                        await self.dispatch(origin, row['id'], self.resolve(pieces[1]), pieces[2], reply_context=reply_snapshot(origin))
                     else:
                         entries = [e for e in self.view()[0] if e.get('target_key')]
                         await self.panel(origin, '选择目标，再回复弹出的派单消息；也可发送 @别名 任务内容。',
@@ -568,14 +571,15 @@ class ControlCenter:
         with self.db:
             self.db.execute("UPDATE cc_deliveries SET state='importing',inbox_id=?,after_rowid=?,updated=? WHERE id=?",
                             (inbox_id, after, time.time(), row['id']))
-        existing = store.db.execute('SELECT text,message_thread_id FROM inbox WHERE id=?', (inbox_id,)).fetchone()
-        if existing and tuple(existing) != (request['text'], target['message_thread_id']):
+        existing = store.db.execute('SELECT text,message_thread_id,reply_json FROM inbox WHERE id=?', (inbox_id,)).fetchone()
+        expected_context = reply_serialized({}, request.get('reply_context'))
+        if existing and tuple(existing) != (request['text'], target['message_thread_id'], expected_context):
             with self.db:
                 self.db.execute("UPDATE cc_deliveries SET state='failed',detail=? WHERE id=?", ('派单标识冲突，未覆盖旧任务。', row['id']))
             return True
         message = {'from': {'id': int(self.router.owner)}, 'chat': {'id': int(self.router.owner), 'type': 'private'},
                    'message_thread_id': target['message_thread_id'], 'text': request['text']}
-        store.accept({'update_id': inbox_id}, message)
+        store.accept({'update_id': inbox_id}, message, reply_context=request.get('reply_context'))
         with self.db:
             self.db.execute("UPDATE cc_deliveries SET state='queued',updated=? WHERE id=?", (time.time(), row['id']))
         return True

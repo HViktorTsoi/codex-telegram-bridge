@@ -19,6 +19,7 @@ import time
 import aiohttp
 from attachments import AttachmentError, inputs_for, payload_from
 from message_format import message_parts, send_output
+from reply_context import serialized as reply_serialized
 
 LOG = logging.getLogger("codex_telegram")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -80,7 +81,7 @@ class Store:
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(inbox)")}
         with self.db:
-            for name in ["message_json", "media_group_id"]:
+            for name in ["message_json", "media_group_id", "reply_json"]:
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE inbox ADD COLUMN {name} TEXT")
             if 'rich_text' not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
@@ -94,17 +95,18 @@ class Store:
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", (key, str(value)))
 
-    def accept(self, update, message=None):
+    def accept(self, update, message=None, *, reply_context=None):
         """Persist input and the next poll offset in one transaction."""
         with self.db:
             if message is not None:
                 self.db.execute(
-                    "INSERT OR IGNORE INTO inbox(id,chat_id,text,received_ms,client_id,message_json,media_group_id) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO inbox(id,chat_id,text,received_ms,client_id,message_json,media_group_id,reply_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
                     (update["update_id"], str(message["chat"]["id"]),
                      message.get("text") or message.get("caption", ""), now_ms(),
                      "telegram-" + str(update["update_id"]), json.dumps(payload_from(message), ensure_ascii=False),
-                     str(message["media_group_id"]) if message.get("media_group_id") else None),
+                     str(message["media_group_id"]) if message.get("media_group_id") else None,
+                     reply_serialized(message, reply_context)),
                 )
             offset = max(int(self.get("offset", 0)), update["update_id"] + 1)
             self.db.execute("INSERT OR REPLACE INTO kv VALUES('offset',?)", (str(offset),))
