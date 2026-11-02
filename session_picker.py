@@ -16,6 +16,17 @@ def clean_name(value, limit=90):
     return ' '.join(str(value).split())[:limit]
 
 
+def directory_text(thread, limit=220):
+    value = thread.get('cwd')
+    if not isinstance(value, str) or not value:
+        return '未提供'
+    value = value.replace('\r', '\\r').replace('\n', '\\n').replace('\t', '\\t')
+    if len(value) > limit:
+        head = (limit - 1) // 2
+        value = value[:head] + '…' + value[-(limit - head - 1):]
+    return value
+
+
 def topic_missing_error(error):
     if not isinstance(error, TelegramError) or error.code != 400:
         return False
@@ -103,12 +114,30 @@ class SessionPicker:
                                 (message_id, token))
 
     async def home(self, update):
-        text = self.router.sessions_text() + '\n\n点击“添加会话”，选择本机已有的 Codex 会话并绑定到新话题。'
+        targets = list(self.router.targets.values())[:12]
+        directories = await asyncio.gather(*(self.directory(t['thread_id'], 90) for t in targets))
+        lines = ['已绑定的原 Codex 会话：']
+        for number, (target, directory) in enumerate(zip(targets, directories), 1):
+            ready = self.router.bridges[target['key']].ready.is_set()
+            status = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
+            lines.append(f"{number}. {clean_name(target['name'], 40)}（{status}）\n目录：{directory}")
+        if len(self.router.targets) > len(targets):
+            lines.append('更多会话请点击“添加会话”查看。')
+        lines.append('原私聊入口继续连接「' + clean_name(self.router.root_target['name'], 40) + '」。')
+        text = '\n\n'.join(lines) + '\n\n点击“添加会话”，选择本机已有的 Codex 会话并绑定到新话题。'
         text += '\n点击已绑定会话可管理或重新创建其话题入口。'
-        rows = [[(clean_name(t['name'], 40), 'select', {'thread_id': t['thread_id']})]
-                for t in list(self.router.targets.values())[:12]]
+        rows = [[(f"{number}. {clean_name(t['name'], 40)}", 'select', {'thread_id': t['thread_id']})]
+                for number, t in enumerate(targets, 1)]
         rows.extend([[('➕ 添加会话', 'catalog', {})], [('刷新', 'home', {})]])
         await self.panel(update, text, rows)
+
+    async def directory(self, thread_id, limit=220):
+        try:
+            result = await asyncio.wait_for(self.router.catalog_call('thread/read', {'threadId': thread_id}), 5)
+            thread = result['thread']
+            return directory_text(thread, limit) if thread.get('id') == thread_id else '暂时无法读取'
+        except (RpcError, ConnectionError, asyncio.TimeoutError):
+            return '暂时无法读取'
 
     async def catalog(self, update, data):
         params = {'limit': 6, 'sortKey': 'updated_at', 'sortDirection': 'desc', 'archived': False}
@@ -117,13 +146,15 @@ class SessionPicker:
             params['cursor'] = cursor
         result = await self.router.catalog_call('thread/list', params)
         bound = {t['thread_id']: t for t in self.router.targets.values()}
-        rows = []
+        rows, details = [], []
         for thread in result.get('data', []):
             if thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
                 continue
             label = clean_name(thread.get('name') or '未命名会话', 32) + ' · ' + thread['id'][-6:]
             if thread['id'] in bound:
                 label = ('⚠ 话题失效 ' if bound[thread['id']].get('topic_missing') else '✓ 已绑定 ') + label
+            label = f'{len(details) + 1}. {label}'
+            details.append(label + '\n目录：' + directory_text(thread))
             rows.append([(label, 'select', {'thread_id': thread['id']})])
         navigation = []
         if history:
@@ -135,7 +166,9 @@ class SessionPicker:
         rows.append([('重新加载', 'catalog', {}), ('返回', 'home', {})])
         host = self.router.config.get('host_id', '本机')
         text = f'{host} 上的 Codex 会话\n按最近更新排序。请选择要接入的原会话：'
-        if len(rows) == 1:
+        if details:
+            text += '\n\n' + '\n\n'.join(details)
+        else:
             text += '\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。'
         await self.panel(update, text, rows)
 
@@ -151,7 +184,7 @@ class SessionPicker:
             raise BindingError('所选会话当前不可绑定，请重新选择。')
         text = (f"确认接入这个原会话？\n\n名称：{clean_name(thread.get('name') or '未命名会话', 140)}\n"
                 f"主机：{self.router.config.get('host_id', '本机')}\nID：{thread_id}\n"
-                f"目录：{clean_name(thread.get('cwd') or '默认', 220)}\n\n确认后会创建新 Telegram 话题，沿用此会话的历史和设置。")
+                f"目录：{directory_text(thread)}\n\n确认后会创建新 Telegram 话题，沿用此会话的历史和设置。")
         await self.panel(update, text, [[('确认绑定到新话题', 'confirm', {'thread_id': thread_id})],
                                         [('返回会话列表', 'catalog', {}), ('取消', 'home', {})]])
 
@@ -251,8 +284,9 @@ class SessionPicker:
         return target
 
     async def bound_panel(self, update, target, already=False):
+        directory = await self.directory(target['thread_id'])
         text = (('此会话已经绑定。' if already else '已绑定，立即生效。') +
-                f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n"
+                f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n目录：{directory}\n"
                 '在该话题发送 /status 可核对会话。')
         await self.panel(update, text, [
             [('重新创建话题', 'repair_select', {'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']})],

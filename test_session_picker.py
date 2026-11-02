@@ -37,10 +37,10 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
                 if method == 'thread/list':
                     if params.get('cursor'):
                         return {'data': [{'id': 'new-page-2', 'name': '第二页会话'}]}
-                    return {'data': [{'id': 'new-native', 'name': '新会话'},
-                                     {'id': 'meeting-native', 'name': '会议记录'}], 'nextCursor': 'second-page'}
+                    return {'data': [{'id': 'new-native', 'name': '新会话', 'cwd': '/work/新项目'},
+                                     {'id': 'meeting-native', 'name': '会议记录', 'cwd': '/work/meeting-native'}], 'nextCursor': 'second-page'}
                 if method == 'thread/read':
-                    return {'thread': {'id': params['threadId'], 'name': '新会话', 'cwd': '/work'}}
+                    return {'thread': {'id': params['threadId'], 'name': '新会话', 'cwd': '/work/' + params['threadId']}}
                 raise AssertionError('Picker must never generate/fork a conversation: ' + method)
 
         class Telegram:
@@ -112,15 +112,24 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
     async def test_menu_and_pagination_are_control_events_without_native_turns(self):
         menu = await self.menu()
         self.assertNotIn('message_thread_id', menu)
+        self.assertIn('1. 会议记录', menu['text'])
+        self.assertIn('目录：/work/meeting-native', menu['text'])
+        self.assertIn('目录：/work/instagram-native', menu['text'])
         self.assertIsNone(self.router.bridges['meeting'].store.pending())
         catalog = await self.click(menu, '添加会话')
         self.assertIn('新会话', str(catalog['reply_markup']))
+        self.assertIn('1. 新会话', catalog['text'])
+        self.assertIn('目录：/work/新项目', catalog['text'])
+        self.assertIn('目录：/work/meeting-native', catalog['text'])
         second = await self.click(catalog, '下一页')
         self.assertIn('第二页', str(second['reply_markup']))
+        self.assertIn('目录：未提供', second['text'])
         first = await self.click(second, '上一页')
         self.assertIn('新会话', str(first['reply_markup']))
-        self.assertEqual([m for m, _ in self.native_calls], ['thread/list'] * 3)
-        self.assertEqual(self.native_calls[1][1]['cursor'], 'second-page')
+        catalog_calls = [(m, p) for m, p in self.native_calls if m == 'thread/list']
+        self.assertEqual(len(catalog_calls), 3)
+        self.assertEqual(catalog_calls[1][1]['cursor'], 'second-page')
+        self.assertTrue(all(m in ('thread/list', 'thread/read') for m, _ in self.native_calls))
         self.assertTrue(all(len(b['callback_data'].encode()) <= 64 for row in first['reply_markup']['inline_keyboard'] for b in row))
         self.assertEqual(self.telegram.created, [])
 
