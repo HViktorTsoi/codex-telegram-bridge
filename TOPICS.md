@@ -57,8 +57,11 @@ selects the entry point from `config.json`; configurations without `mode: topics
 continue using `bridge.py`. Topic mode does not use `--notify`.
 
 From the main chat or any private topic, `/sessions` opens the session menu in
-the main chat. Choose **添加会话**,
-page through native conversations, select one, check its name and full ID, and
+the main chat. The home panel and **添加会话** catalog list each conversation's
+working directory with a number matching its button. Long paths retain both
+ends; details show more of the path. Missing or temporarily unavailable metadata
+is labelled explicitly. Directory lookup reads local native metadata only and
+does not start model turns. Page through native conversations, select one, check its name and full ID, and
 choose **确认绑定到新话题**. The new topic becomes available without restarting
 the collector. Bindings are written atomically to `config.json`, with previous
 configurations in `binding-config-backups/`. The picker restores subscriptions
