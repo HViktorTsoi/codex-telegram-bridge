@@ -118,7 +118,7 @@ def render(context):
     def quoted(text):
         return '\n'.join('> ' + line for line in text.split('\n'))
 
-    sections = ['以下是用户引用的内容，请结合上面的本次要求处理：']
+    sections = ['［引用内容］']
     body, quote = context.get('text'), context.get('quote')
     if quote:
         label = '用户选中的片段（优先关注）：'
