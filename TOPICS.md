@@ -61,7 +61,9 @@ the main chat. The home panel and **添加会话** catalog list each conversatio
 working directory with a number matching its button. Long paths retain both
 ends; details show more of the path. Missing or temporarily unavailable metadata
 is labelled explicitly. Directory lookup reads local native metadata only and
-does not start model turns. Page through native conversations, select one, check its name and full ID, and
+does not start model turns. Each catalog selection has a name button followed
+by a separate directory button; either button selects the same native ID.
+This also applies after pagination. Page through native conversations, select one, check its name and full ID, and
 choose **确认绑定到新话题**. The new topic becomes available without restarting
 the collector. Bindings are written atomically to `config.json`, with previous
 configurations in `binding-config-backups/`. The picker restores subscriptions

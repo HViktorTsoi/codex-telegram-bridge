@@ -121,9 +121,12 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('1. 新会话', catalog['text'])
         self.assertIn('目录：/work/新项目', catalog['text'])
         self.assertIn('目录：/work/meeting-native', catalog['text'])
+        self.assertIn('📁 /work/新项目', str(catalog['reply_markup']))
+        self.assertIn('📁 /work/meeting-native', str(catalog['reply_markup']))
         second = await self.click(catalog, '下一页')
         self.assertIn('第二页', str(second['reply_markup']))
         self.assertIn('目录：未提供', second['text'])
+        self.assertIn('📁 未提供', str(second['reply_markup']))
         first = await self.click(second, '上一页')
         self.assertIn('新会话', str(first['reply_markup']))
         catalog_calls = [(m, p) for m, p in self.native_calls if m == 'thread/list']
@@ -157,7 +160,9 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.telegram.created, [])
 
     async def test_confirmation_binds_exact_id_atomically_and_activates_without_restart(self):
-        confirmation = await self.confirmation()
+        menu = await self.menu()
+        catalog = await self.click(menu, '添加会话')
+        confirmation = await self.click(catalog, '📁 /work/新项目')
         self.assertIn('new-native', confirmation['text'])
         self.assertEqual(self.telegram.created, [])
         started = []
