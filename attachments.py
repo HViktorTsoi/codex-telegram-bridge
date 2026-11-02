@@ -150,6 +150,8 @@ async def inputs_for(rows, telegram, inbox_dir):
     if structured:
         text += "\n\nTelegram附加信息（JSON）：\n" + json.dumps(structured, ensure_ascii=False)
     result = [{"type": "text", "text": text or "收到了暂未支持的 Telegram 消息类型。"}]
+    references = reply_inputs(rows)
+    if references:
+        result[0]['text'] += '\n\n' + '\n\n'.join(item['text'] for item in references)
     result.extend(images)
-    result.extend(reply_inputs(rows))
     return result

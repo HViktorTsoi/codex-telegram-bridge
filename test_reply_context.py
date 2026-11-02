@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from attachments import inputs_for, payload_from
 from bridge import Bridge
-from reply_context import MAX_QUOTE, MAX_TEXT, snapshot
+from reply_context import MAX_QUOTE, MAX_TEXT, render, snapshot
 
 
 class SnapshotTests(unittest.TestCase):
@@ -63,6 +63,31 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(result['text_truncated'])
 
 
+class ReadableContextTests(unittest.TestCase):
+    def test_body_is_readable_and_technical_ids_remain_internal(self):
+        self.assertEqual(render({'source': 'reply_to_message', 'chat_id': 123456, 'reply_to_message_id': 789,
+                                 'text': '第一段\n\n```python\nprint(1)\n```'}),
+                         '以下是用户引用的内容，请结合上面的本次要求处理：\n\n'
+                         '> 第一段\n> \n> ```python\n> print(1)\n> ```')
+
+    def test_selected_passage_precedes_supporting_body_and_is_not_duplicated(self):
+        rendered = render({'text': '第一段，第二段', 'quote': '第二段'})
+        self.assertIn('用户选中的片段（优先关注）：\n> 第二段', rendered)
+        self.assertIn('被回复消息的正文（供理解上下文）：\n> 第一段，第二段', rendered)
+        self.assertLess(rendered.index('用户选中的片段'), rendered.index('被回复消息的正文'))
+        self.assertEqual(render({'text': '完整选中', 'quote': '完整选中'}).count('完整选中'), 1)
+
+    def test_missing_truncated_and_media_references_use_plain_descriptions(self):
+        rendered = render({'quote': '选中片段', 'quote_truncated': True, 'content_unavailable': True,
+                           'attachments': [{'kind': 'document', 'file_name': 'report.pdf'}, {'kind': 'photo'}]})
+        self.assertIn('选中片段过长，以上内容已截断', rendered)
+        self.assertIn('仅收到上述选中片段，未收到原消息正文', rendered)
+        self.assertIn('未重新下载', rendered)
+        self.assertIn('> 文件：report.pdf\n> 图片', rendered)
+        self.assertIn('未收到被回复消息的正文', render({'content_unavailable': True}))
+        self.assertIn('正文过长，以上内容已截断', render({'text': '正文', 'text_truncated': True}))
+
+
 class ReplyInputTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -99,9 +124,14 @@ class ReplyInputTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.dispatch_one(self.bridge.store.pending())
         method, params = self.codex.call.call_args.args
         self.assertEqual((method, params['threadId']), ('turn/start', 'original-session'))
-        self.assertEqual(params['input'][0], {'type': 'text', 'text': '改一下这里'})
-        self.assertEqual(len(params['input']), 2)
-        context = json.loads(params['input'][1]['text'].split('\n', 1)[1])
+        self.assertEqual(len(params['input']), 1)
+        text = params['input'][0]['text']
+        self.assertTrue(text.startswith('改一下这里\n\n以下是用户引用的内容'))
+        self.assertIn('> /stop 是被引用文字', text)
+        self.assertIn('用户选中的片段（优先关注）：\n> 被引用文字', text)
+        self.assertNotIn('reply_to_message_id', text)
+        self.assertNotIn('"source"', text)
+        context = json.loads(self.bridge.store.db.execute('SELECT reply_json FROM inbox').fetchone()[0])
         self.assertEqual((context['reply_to_message_id'], context['text']), (50, '/stop 是被引用文字'))
         self.assertEqual(context['quote'], '被引用文字')
 
@@ -124,8 +154,8 @@ class ReplyInputTests(unittest.IsolatedAsyncioTestCase):
         method, params = self.codex.call.call_args.args
         self.assertEqual(method, 'turn/start')
         self.assertEqual(params['input'][1], {'type': 'localImage', 'path': str(photo)})
-        self.assertIn('原图说明', params['input'][-1]['text'])
-        self.assertNotIn('quoted-photo', params['input'][-1]['text'])
+        self.assertIn('原图说明', params['input'][0]['text'])
+        self.assertNotIn('quoted-photo', params['input'][0]['text'])
 
     async def test_album_with_same_reply_has_one_context_and_original_caption(self):
         photo = self.path / 'photo.png'
@@ -139,7 +169,7 @@ class ReplyInputTests(unittest.IsolatedAsyncioTestCase):
         with patch('attachments.download', AsyncMock(return_value=photo)):
             await self.bridge.dispatch_one(self.bridge.store.pending())
         values = self.codex.call.call_args.args[1]['input']
-        self.assertEqual(len([v for v in values if v.get('text', '').startswith('Telegram 引用上下文')]), 1)
+        self.assertEqual(values[0]['text'].count('以下是用户引用的内容'), 1)
         self.assertEqual(len([v for v in values if v['type'] == 'localImage']), 2)
         self.assertIn('比较图片', values[0]['text'])
 

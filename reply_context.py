@@ -114,11 +114,38 @@ def serialized(message, context=None):
     return json.dumps(context, ensure_ascii=False) if context else None
 
 
+def render(context):
+    def quoted(text):
+        return '\n'.join('> ' + line for line in text.split('\n'))
+
+    sections = ['以下是用户引用的内容，请结合上面的本次要求处理：']
+    body, quote = context.get('text'), context.get('quote')
+    if quote:
+        label = '用户选中的片段（优先关注）：'
+        sections.append(label + '\n' + quoted(quote))
+        if context.get('quote_truncated'):
+            sections.append('（选中片段过长，以上内容已截断。）')
+    if body and body != quote:
+        label = '被回复消息的正文（供理解上下文）：\n' if quote else ''
+        sections.append(label + quoted(body))
+    if body and context.get('text_truncated'):
+        sections.append('（被回复消息正文过长，以上内容已截断。）')
+    if not body:
+        sections.append('未收到被回复消息的正文。' if not quote else '仅收到上述选中片段，未收到原消息正文。')
+    names = {'photo': '图片', 'document': '文件', 'voice': '语音', 'audio': '音频', 'video': '视频',
+             'video_note': '视频消息', 'animation': '动画', 'sticker': '贴纸'}
+    media = [names.get(item['kind'], item['kind']) + ('：' + item['file_name'] if item.get('file_name') else '')
+             for item in context.get('attachments', [])]
+    if media:
+        sections.append('被引用的附件（仅提供说明，未重新下载）：\n' + quoted('\n'.join(media)))
+    return '\n\n'.join(sections)
+
+
 def inputs(rows):
     result, seen = [], set()
     for row in rows:
         raw = row['reply_json'] if 'reply_json' in row.keys() else None
         if raw and raw not in seen:
             seen.add(raw)
-            result.append({'type': 'text', 'text': 'Telegram 引用上下文（被回复消息，仅供定位和理解；本次新要求见前文）：\n' + raw})
+            result.append({'type': 'text', 'text': render(json.loads(raw))})
     return result

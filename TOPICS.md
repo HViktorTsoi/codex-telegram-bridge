@@ -41,10 +41,12 @@ when creating `topics.sqlite` for the first time. Preserve the original database
 and its backups. Do not change a target key to a different native thread: each
 target database records its native ID and refuses such reuse.
 
-Explicit replies append a bounded snapshot of the parent body, selected quote
-and message/topic IDs to the native input. Rich bodies are flattened to readable
-text. Parent topic IDs are context only: routing still follows the incoming
-topic, or an explicit local alias dispatch. Quoted attachments are described,
+Explicit replies append readable quoted material after two newlines within the
+same native text input. Selected passages come first, followed by the parent
+body for context; identical passages are not repeated. Rich bodies are flattened
+to readable text. Message/topic IDs remain in private storage and are omitted
+from the model prompt. Routing still follows the incoming topic, or an explicit
+local alias dispatch. Quoted attachments are described,
 never downloaded again. A topic's implicit creation-message reference adds no
 context. Unquoted inputs and command/media classification remain unchanged.
 The additive `inbox.reply_json` column is stored atomically with each input;
