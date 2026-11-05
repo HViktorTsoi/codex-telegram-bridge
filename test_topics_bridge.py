@@ -106,7 +106,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notice['topic_id'], 999)
         self.assertIn('尚未绑定', notice['text'])
 
-    async def test_session_command_keeps_native_target_and_replies_in_main_chat(self):
+    async def test_session_command_keeps_native_target_and_replies_in_origin_topic(self):
         self.accept(self.message(100, 22, text='/status'))
         child = self.router.bridges['instagram']
         child.codex = type('Native', (), {'settings': AsyncMock(return_value={
@@ -115,7 +115,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         child.codex.settings.assert_awaited_once()
         self.assertEqual(child.store.db.execute('SELECT message_thread_id FROM inbox').fetchone()[0], 22)
         output = child.store.db.execute('SELECT * FROM outbox').fetchone()
-        self.assertIsNone(output['message_thread_id'])
+        self.assertEqual(output['message_thread_id'], 22)
         self.assertIn('native-instagram', output['text'])
         self.assertIn('test-model', output['text'])
         self.assertIsNone(self.router.bridges['meeting'].store.pending())
@@ -130,12 +130,13 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(output['message_thread_id'])
         self.assertIn('/sessions', output['text'])
 
-    def test_unknown_topic_session_command_fails_in_main_without_retargeting(self):
-        self.accept(self.message(100, 999, text='/model test'))
+    def test_unknown_topic_session_command_fails_in_origin_without_retargeting(self):
+        for i, command in enumerate(['/model test', '/effort high', '/stop', '/status', '/format rich'], 100):
+            self.accept(self.message(i, 999, text=command))
         self.assertTrue(all(b.store.pending() is None for b in self.router.bridges.values()))
-        notice = self.router.store.db.execute('SELECT * FROM notices').fetchone()
-        self.assertIsNone(notice['topic_id'])
-        self.assertIn('尚未绑定', notice['text'])
+        notices = self.router.store.db.execute('SELECT * FROM notices').fetchall()
+        self.assertEqual(len(notices), 5)
+        self.assertTrue(all(r['topic_id'] == 999 and '尚未绑定' in r['text'] for r in notices))
 
     def test_command_like_attachment_caption_retains_normal_reply_topic(self):
         self.accept(self.message(100, 22, text='', caption='/status', document={'file_id': 'a'}))
@@ -272,28 +273,54 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_and_stop_are_scoped_to_selected_topic(self):
         calls = []
+        values = {'model': 'existing-model', 'reasoningEffort': 'high'}
 
         class StubCodex:
             async def settings(self):
                 return {'thread': {'id': 'native-instagram', 'name': 'Instagram', 'status': {'type': 'active'}},
-                        'model': 'existing-model', 'reasoningEffort': 'existing-effort'}
+                        **values}
+
+            async def models(self):
+                return [{'id': model, 'model': model, 'defaultReasoningEffort': 'high',
+                         'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}
+                        for model in ('existing-model', 'alternate-model')]
 
             async def turns(self, limit=1):
                 return [{'id': 'in-progress', 'status': 'inProgress'}]
 
             async def call(self, method, params):
                 calls.append((method, params))
+                if method == 'thread/settings/update':
+                    if 'model' in params:
+                        values['model'] = params['model']
+                    if 'effort' in params:
+                        values['reasoningEffort'] = params['effort']
                 return {}
 
         child = self.router.bridges['instagram']
         child.codex = StubCodex()
-        for i, text in enumerate(['/status', '/stop'], 100):
+        commands = ['/status', '/stop', '/model', '/effort', '/format', '/model unavailable',
+                    '/effort invalid', '/format invalid', '/model alternate-model', '/effort low',
+                    '/model@test_bot', '/unknown']
+        for i, text in enumerate(commands, 100):
             self.accept(self.message(i, 22, text=text))
             await child.dispatch_one(child.store.pending())
         replies = '\n'.join(r['text'] for r in child.store.db.execute('SELECT * FROM outbox'))
         self.assertIn('native-instagram', replies)
-        self.assertEqual(calls, [('turn/interrupt', {'threadId': 'native-instagram', 'turnId': 'in-progress'})])
-        self.assertTrue(all(r[0] is None for r in child.store.db.execute('SELECT message_thread_id FROM outbox')))
+        self.assertEqual(calls, [
+            ('turn/interrupt', {'threadId': 'native-instagram', 'turnId': 'in-progress'}),
+            ('thread/settings/update', {'threadId': 'native-instagram', 'model': 'alternate-model', 'effort': 'high'}),
+            ('thread/settings/update', {'threadId': 'native-instagram', 'effort': 'low'})])
+        self.assertEqual(values, {'model': 'alternate-model', 'reasoningEffort': 'low'})
+        self.assertIn('模型不可用', replies)
+        self.assertIn('不支持 effort', replies)
+        self.assertIn('用法：/format', replies)
+        self.assertTrue(all(r[0] == 22 for r in child.store.db.execute('SELECT message_thread_id FROM outbox')))
+        self.assertEqual(self.router.bridges['meeting'].store.counts()['unsent_messages'], 0)
+        self.accept(self.message(200, None, text='/format invalid'))
+        root = self.router.bridges['meeting']
+        await root.dispatch_one(root.store.pending())
+        self.assertIsNone(root.store.db.execute('SELECT message_thread_id FROM outbox').fetchone()[0])
 
 
 if __name__ == '__main__':
