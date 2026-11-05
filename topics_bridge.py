@@ -27,6 +27,7 @@ from reply_context import serialized as reply_serialized
 
 LOG = logging.getLogger("codex_telegram_topics")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
+GLOBAL_COMMANDS = {'/start', '/help', '/sessions', '/tasks', '/inbox', '/to', '/aliases'}
 
 
 def command_of(message):
@@ -77,7 +78,7 @@ class ExactCodex(Codex):
 
 
 class RoutedStore(Store):
-    """Keep input origins durable; send command replies to the main chat."""
+    """Reply to the original topic, with global command panels in the main chat."""
 
     def __init__(self, path, thread_id):
         super().__init__(path)
@@ -129,7 +130,7 @@ class RoutedStore(Store):
             if row is None:
                 raise ValueError("Input reply has no durable topic")
             message = {"text": row['text'], **json.loads(row['message_json'] or '{}')}
-            topics = [None if command_of(message).startswith('/') else row['message_thread_id']]
+            topics = [None if command_of(message) in GLOBAL_COMMANDS else row['message_thread_id']]
         elif key.startswith("turn:"):
             topics = [r["message_thread_id"] for r in self.turn_routes(key.split(":", 2)[1])
                       if r["chat_id"] == str(chat_id)]
@@ -331,7 +332,7 @@ class RouterStore:
         with self.db:
             if row["error"]:
                 message = json.loads(row['message_json'])
-                reply_topic = None if command_of(message).startswith('/') else row['topic_id']
+                reply_topic = None if command_of(message) in GLOBAL_COMMANDS else row['topic_id']
                 self.db.execute("INSERT OR IGNORE INTO notices(id,chat_id,topic_id,text) VALUES(?,?,?,?)",
                                 (row["id"], row["chat_id"], reply_topic, row["error"]))
             self.db.execute("UPDATE jobs SET state='done' WHERE id=?", (row["id"],))

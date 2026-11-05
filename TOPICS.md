@@ -82,12 +82,16 @@ native conversation's complete ID, model and effort. `/model`, `/effort` and
 `/stop` affect that topic's conversation. Unknown topics are rejected. User-made
 topics are not automatically bound or converted into new Codex conversations.
 
-Management panels, command replies (including errors) and new dispatch summaries
-are sent to the main chat. Session commands still act on the conversation bound
-to the topic where they were entered. Old topic menus migrate to a new main-chat
-panel on their next use, keeping the exact message/topic checks on callbacks and
-ForceReply prompts. Regular conversation output and activity indicators keep
-their original topics; already queued output retains its stored destination.
+Global menus and dispatch summaries go to the main chat: `/sessions`, `/tasks`,
+`/inbox`, `/to`, `/aliases`, `/help` and `/start`. Session commands (`/status`,
+`/model`, `/effort`, `/format`, `/stop`) act on the original native conversation
+and send their results, confirmations and errors back to the input topic, or
+the main chat when entered there. Unknown commands and unbound-topic session
+errors also reply at the input location without selecting another native target.
+Old management menus migrate to a main-chat panel on their next use, keeping
+the exact message/topic checks on callbacks and ForceReply prompts. Regular
+output and activity indicators keep their original topics; already queued output
+retains its stored destination.
 
 Set `native_mirror: true` globally or per target to mirror new user inputs and public
 agent replies from native client turns. It defaults to off and
