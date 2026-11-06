@@ -49,6 +49,8 @@ class SessionPicker:
             CREATE TABLE IF NOT EXISTS ui_catalogs(
                 id TEXT PRIMARY KEY,payload TEXT,expires_at REAL);
         ''')
+        from session_creator import SessionCreator
+        self.creator = SessionCreator(self)
 
     def ingest(self, update):
         callback = update.get('callback_query')
@@ -65,7 +67,7 @@ class SessionPicker:
             text = message.get('text', '').strip().split(maxsplit=1)
             # A caption or a media message must never execute a control command.
             from attachments import payload_from
-            if not text or text[0].split('@')[0].lower() != '/sessions' or payload_from(message):
+            if not self.creator.is_reply(update) and (not text or text[0].split('@')[0].lower() != '/sessions' or payload_from(message)):
                 return False
             valid = permitted(message, self.router.access(), self.router.owner)
         with self.db:
@@ -114,6 +116,7 @@ class SessionPicker:
             for token in tokens:
                 self.db.execute('UPDATE ui_buttons SET message_id=?,state=\'active\' WHERE token=?',
                                 (message_id, token))
+        return result
 
     async def home(self, update):
         targets = list(self.router.targets.values())[:12]
@@ -130,7 +133,12 @@ class SessionPicker:
         text += '\n点击已绑定会话可管理或重新创建其话题入口。'
         rows = [[(f"{number}. {clean_name(t['name'], 40)}", 'select', {'thread_id': t['thread_id']})]
                 for number, t in enumerate(targets, 1)]
-        rows.extend([[('➕ 添加会话', 'catalog', {})], [('刷新', 'home', {})]])
+        rows.extend([[('➕ 添加会话', 'catalog', {}), ('🆕 新建会话', 'new:start', {})]])
+        for draft in self.creator.unfinished(self.router.owner):
+            rows.append([('继续处理：' + clean_name(draft['name'] or '未确认的新会话', 30),
+                          'new:resume', {'id': draft['id']})])
+        rows.append([('刷新', 'home', {})])
+        text += '\n点击“新建会话”可选择或新建工作目录，并创建全新的 Codex 会话。'
         await self.panel(update, text, rows)
 
     async def directory(self, thread_id, limit=220):
@@ -383,7 +391,10 @@ class SessionPicker:
         callback = update.get('callback_query')
         try:
             if not callback:
-                await self.home(update)
+                if self.creator.is_reply(update):
+                    await self.creator.reply(update)
+                else:
+                    await self.home(update)
             else:
                 try:
                     await self.router.telegram.call('answerCallbackQuery', callback_query_id=callback['id'])
@@ -397,7 +408,9 @@ class SessionPicker:
                         or button['topic_id'] != (origin.get('message_thread_id') or None)):
                     raise BindingError('这个按钮已失效，请发送 /sessions 重新打开。')
                 data, action = json.loads(button['data']), button['action']
-                if action == 'home':
+                if action.startswith('new:'):
+                    await self.creator.handle(update, action, data)
+                elif action == 'home':
                     await self.home(update)
                 elif action == 'catalog':
                     await self.catalog(update, data)
@@ -436,6 +449,7 @@ class SessionPicker:
                 await asyncio.sleep(0.2)
 
     async def recover(self):
+        self.creator.recover()
         with self.db:
             self.db.execute("UPDATE ui_jobs SET state='pending' WHERE state='processing'")
             # createForumTopic has no idempotency key; an interrupted call needs review.

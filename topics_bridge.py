@@ -393,6 +393,9 @@ class TopicRouter:
         return "\n".join(lines)
 
     def ingest(self, update):
+        if self.picker.creator.is_reply(update):
+            self.picker.ingest(update)
+            return
         if self.control.ingest(update):
             return
         if self.picker.ingest(update):
