@@ -1,9 +1,10 @@
-# One Bot, multiple existing Codex conversations
+# One Bot, multiple local Codex conversations
 
 `topics_bridge.py` reuses the single-thread bridge's native socket, attachment
 handling and durable recovery. One Telegram poller routes the owner's private
-topics to separate target queues and Codex subscriptions. It never creates or
-forks a Codex conversation.
+topics to separate target queues and Codex subscriptions. Binding and repairing
+existing conversations never create or fork a Codex conversation. A separate,
+explicitly confirmed new-session wizard can create a new native conversation.
 
 Enable Threaded Mode for the existing Bot in BotFather. Verify
 `getMe.has_topics_enabled`, create private topics with `createForumTopic`, and
@@ -74,8 +75,34 @@ and never start model turns. Select a conversation, check its name and full ID, 
 choose **确认绑定到新话题**. The new topic becomes available without restarting
 the collector. Bindings are written atomically to `config.json`, with previous
 configurations in `binding-config-backups/`. The picker restores subscriptions
-after a restart and never creates or forks a Codex conversation. Create any new
-Codex conversation on the computer first, then refresh the picker.
+after a restart; this existing-session binding route never creates or forks a
+Codex conversation.
+
+**新建会话** opens a local filesystem browser starting at the user's home.
+Directory buttons, ten-entry pages, parent navigation and a dot-directory toggle
+work without text entry. **输入路径** accepts absolute, home-relative and current
+directory-relative paths; symlinks resolve to their physical directory.
+**新建文件夹** accepts a single component, including Chinese and spaces, and
+uses exclusive mkdir without replacing anything. **使用当前目录** prompts for a
+name, then shows the host, full chosen directory and name for final confirmation.
+Created folders remain if the user cancels.
+
+Text entry uses owner-only ForceReply prompts tied to an exact chat, topic and
+message. Only replies to these prompts enter the wizard, ahead of alias/command
+dispatch; ordinary messages keep their normal route. Stale, cancelled and orphaned
+wizard-prompt replies are rejected without reaching a model. Reply `/cancel` to
+a prompt or use the cancel button. Prompt and editable-draft lifetimes are 15 minutes.
+
+Final confirmation calls `thread/start` with only `cwd`, inheriting native machine
+defaults for model, approvals and permissions. `thread/name/set` names the new
+thread, then the ordinary exact-ID binding route creates its topic. Creation does
+not call `turn/start`. See the [official app-server protocol](https://learn.chatgpt.com/docs/app-server).
+The private `ui_new_drafts` ledger commits intent before starting, records the
+returned ID before naming/binding, and prevents duplicate native creation. A known
+ID can be continued from the home menu after naming/binding failure. A start call
+interrupted without a known result becomes uncertain, including across restarts;
+it must be checked in the existing catalog instead of automatically retried.
+Topic-creation uncertainty retains the existing `binding_ops` protection.
 
 `/status` shows the
 native conversation's complete ID, model and effort. `/model`, `/effort` and
