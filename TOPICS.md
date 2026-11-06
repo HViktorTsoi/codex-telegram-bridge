@@ -127,8 +127,20 @@ earlier messages untouched. Active turns baseline their existing visible items
 and can continue mirroring newly completed content. It observes local native items only, starts no model
 turns, and deduplicates Telegram-origin input/output. Reconnect recovery is
 limited to the latest 30 native turns, matching the bridge's recovery window.
-Images get a text placeholder; local files, reasoning, tool logs and internal
-agent messages are not uploaded. Status cards use Rich HTML bold text on the
+Images in native user inputs get a text placeholder. Explicit local image links
+in public agent replies are snapshotted and uploaded through the normal outbox,
+including mirrored desktop replies. PNG/JPEG/WebP/GIF are supported up to 20 MB;
+large images, GIF and explicit photo-format rejections use document delivery.
+Only final replies explicitly claiming to attach/send an image can use the last
+`imageView` path from that same turn when no explicit image link is present.
+Internal image inspection alone does not upload anything. Code examples and
+other local files, reasoning, tool logs and internal agent messages are not
+uploaded. Queued `media_json` includes an immutable private snapshot, content
+digest and delivery state; saved topic IDs are retained through topic repair.
+Upload intent is committed before the HTTP request. Uncertain sends and crashes
+are not retried automatically; 429 retries reuse the saved bytes. Existing queued
+text is not rewritten or backfilled during migration.
+Status cards use Rich HTML bold text on the
 first of two lines with `━━━━` separators on either side. Duration and update
 time share the second line, retaining the 15-second edit interval and saved message ID.
 

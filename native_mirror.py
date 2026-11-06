@@ -41,7 +41,10 @@ class NativeMirror:
             active_items = {}
             for turn in turns:
                 if turn.get('status') == 'inProgress':
-                    active_items[turn['id']] = [entry['item'] async for entry in bridge.codex.items(turn['id'])
+                    entries = [entry async for entry in bridge.codex.items(turn['id'])]
+                    for entry in entries:
+                        self.store.images.observe(turn['id'], entry['item'], entry.get('completedAtMs'))
+                    active_items[turn['id']] = [entry['item'] for entry in entries
                                                if entry['item'].get('type') in ('userMessage', 'agentMessage')]
             with self.store.db:
                 for turn in turns:
@@ -76,6 +79,7 @@ class NativeMirror:
             occurrences = Counter()
             async for entry in bridge.codex.items(turn['id']):
                 item = entry['item']
+                self.store.images.observe(turn['id'], item, entry.get('completedAtMs'))
                 fingerprint = self.fingerprint(item)
                 if fingerprint:
                     occurrences[fingerprint] += 1
@@ -147,7 +151,7 @@ class NativeMirror:
             body = item.get('text', '').strip()
             if '[external_agent_tool' in body:
                 return
-            key, text = 'turn:' + turn_id + ':' + identity, body
+            key, text = 'turn:' + turn_id + ':' + identity, self.store.images.agent_text(turn_id, item)
         else:
             return
         if body:
