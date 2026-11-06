@@ -119,12 +119,13 @@ def display_destination(destination):
     return re.sub(r'\\([\\`*{}\[\]()#+.!_<> -])', r'\1', destination)
 
 
-def normalize_local_links(markdown):
+def normalize_local_links(markdown, rewrite=None):
     """Local files cannot be fetched by Telegram; retain them as literal text.
 
     Operate only on the display copy at delivery, preserving queued source and
     existing chunk boundaries. Code examples and public/Telegram links stay intact.
-    This function never reads or uploads a local file.
+    The default renderer never reads or uploads a file. An optional callback can
+    replace explicit local links before chunking, keeping code examples intact.
     """
     output, fence = [], None
     for line in markdown.splitlines(keepends=True):
@@ -156,6 +157,11 @@ def normalize_local_links(markdown):
                         destination = display_destination(line[label_end + 2:end])
                         if destination and not re.match(r'(?i)^(?:https?://|tg://|mailto:|tel:|#)', destination):
                             label = line[start + 1:label_end] or ('图片' if image else '文件')
+                            if rewrite is not None:
+                                replacement = rewrite(label, destination, image)
+                                output.append(line[pos:end + 1] if replacement is None else replacement)
+                                pos = end + 1
+                                continue
                             kind = '本机图片，尚未上传' if image else '本机文件'
                             output.append(label + '（' + kind + '：' + code_text(destination) + '）')
                         else:
@@ -176,11 +182,14 @@ def formatting_reason(error):
     return 'invalid_format'
 
 
-async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None, label=None):
+async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None, label=None, media_json=None):
     """Send the body only; legacy label metadata is accepted without rendering it."""
     route = {'chat_id': chat_id}
     if topic_id:
         route['message_thread_id'] = topic_id
+    if media_json is not None:
+        from outgoing_images import send_image
+        return await send_image(telegram, media_json, route)
     if rich_text is not None and getattr(telegram, 'rich_supported', None) is not False:
         markdown = normalize_local_links(rich_text)
         try:

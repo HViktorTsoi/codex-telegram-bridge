@@ -86,6 +86,12 @@ class Store:
                     self.db.execute(f"ALTER TABLE inbox ADD COLUMN {name} TEXT")
             if 'rich_text' not in {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}:
                 self.db.execute('ALTER TABLE outbox ADD COLUMN rich_text TEXT')
+            columns = {row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}
+            for name, kind in (('media_json', 'TEXT'), ('message_thread_id', 'INTEGER')):
+                if name not in columns:
+                    self.db.execute(f'ALTER TABLE outbox ADD COLUMN {name} {kind}')
+        from outgoing_images import OutputImages
+        self.images = OutputImages(self, Path(path).parent)
 
     def get(self, key, default=None):
         row = self.db.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
@@ -140,14 +146,23 @@ class Store:
             )
 
     def enqueue(self, key, chat_id, text):
+        self.enqueue_parts(key, chat_id, text)
+
+    def enqueue_parts(self, key, chat_id, text, topic_id=None):
         with self.db:
-            if self.db.execute('SELECT 1 FROM outbox WHERE key=?', (f'{key}:0',)).fetchone():
+            if self.db.execute('SELECT 1 FROM outbox WHERE key IN (?,?)', (f'{key}:0', f'{key}:media:0')).fetchone():
                 return  # Preserve already-queued legacy chunk boundaries during recovery.
+            images = []
+            if key.startswith('turn:'):
+                text, images = self.images.prepare(text)
             for i, (part, rich_text) in enumerate(self.output_parts(key, text)):
                 self.db.execute(
-                    "INSERT OR IGNORE INTO outbox(key,chat_id,text,rich_text) VALUES(?,?,?,?)",
-                    (f"{key}:{i}", str(chat_id), part, rich_text),
+                    "INSERT OR IGNORE INTO outbox(key,chat_id,text,rich_text,message_thread_id) VALUES(?,?,?,?,?)",
+                    (f"{key}:{i}", str(chat_id), part, rich_text, topic_id),
                 )
+            for i, media in enumerate(images):
+                self.db.execute('INSERT OR IGNORE INTO outbox(key,chat_id,text,media_json,message_thread_id) VALUES(?,?,?,?,?)',
+                                (f'{key}:media:{i}', str(chat_id), '', json.dumps(media), topic_id))
 
     def output_parts(self, key, text):
         return message_parts(text, rich=key.startswith('turn:') and self.get('output_format', 'rich') == 'rich')
@@ -288,13 +303,28 @@ class Telegram:
         self.token, self.session = token, session
 
     async def call(self, method, **params):
+        return await self._request(method, json=params)
+
+    async def upload(self, method, field, path, *, filename=None, mime_type=None, **params):
+        if (method, field) not in {('sendPhoto', 'photo'), ('sendDocument', 'document')}:
+            raise ValueError('Unsupported media upload')
+        form = aiohttp.FormData()
+        for key, value in params.items():
+            if value is not None:
+                form.add_field(key, value if isinstance(value, str) else json.dumps(value))
+        with Path(path).open('rb') as stream:
+            form.add_field(field, stream, filename=filename or Path(path).name,
+                           content_type=mime_type or 'application/octet-stream')
+            return await self._request(method, data=form)
+
+    async def _request(self, method, **body):
         try:
             async with self.session.post(
-                f"https://api.telegram.org/bot{self.token}/{method}", json=params,
+                f"https://api.telegram.org/bot{self.token}/{method}", **body,
                 timeout=aiohttp.ClientTimeout(total=45),
             ) as response:
                 data = await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
             # aiohttp exception strings can contain the token-bearing URL.
             raise ConnectionError(f"Telegram {method}: {type(error).__name__}") from None
         if not data.get("ok"):
@@ -334,6 +364,7 @@ class Bridge:
         return match[1].strip().strip("\"'")
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
+        self.store.images.observe(turn_id, item, completed_ms)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
             return
         for route in self.store.routes(turn_id):
@@ -341,7 +372,7 @@ class Bridge:
                 continue
             if replay and completed_ms is None:
                 continue  # Do not replay old output with an unknown timestamp.
-            self.store.enqueue(f"turn:{turn_id}:{item['id']}", route["chat_id"], item["text"])
+            self.store.enqueue(f"turn:{turn_id}:{item['id']}", route["chat_id"], self.store.images.agent_text(turn_id, item))
 
     def finish_turn(self, turn):
         status = turn.get("status")
@@ -608,6 +639,7 @@ class Bridge:
                             "Codex 需要在原会话中处理一个交互请求，请返回 Codex 查看。")
 
     async def sender_loop(self):
+        self.store.images.recover()
         while True:
             row = self.store.db.execute(
                 "SELECT * FROM outbox WHERE message_id IS NULL ORDER BY rowid LIMIT 1"
@@ -616,16 +648,21 @@ class Bridge:
                 await asyncio.sleep(0.5)
                 continue
             try:
-                sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'], rich_text=row['rich_text'])
-                with self.store.db:
-                    self.store.db.execute("UPDATE outbox SET message_id=? WHERE key=?", (sent["message_id"], row["key"]))
+                self.store.images.begin(row)
+                sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
+                                         rich_text=row['rich_text'], media_json=row['media_json'])
+                self.store.images.sent(row, sent['message_id'])
                 LOG.info("Sent Telegram message %s (%s)", sent["message_id"], row["key"])
             except (TelegramError, ConnectionError) as error:
                 if isinstance(error, TelegramError) and error.code in {400, 403}:
                     with self.store.db:
                         self.store.db.execute("UPDATE outbox SET message_id=-1 WHERE key=?", (row["key"],))
                     LOG.error("Telegram delivery failed: %s", error)
+                    self.store.images.failed(row)
+                elif row['media_json'] and getattr(error, 'code', None) != 429:
+                    self.store.images.failed(row, uncertain=getattr(error, 'uncertain', True))
                 else:
+                    self.store.images.retry(row)
                     delay = min(60, 2 ** min(row["attempts"] + 1, 6))
                     if isinstance(error, TelegramError):
                         delay = max(delay, error.retry_after)

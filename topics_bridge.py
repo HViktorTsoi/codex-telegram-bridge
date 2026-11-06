@@ -115,13 +115,7 @@ class RoutedStore(Store):
             "WHERE turn_id=? GROUP BY chat_id,message_thread_id", (turn_id,)).fetchall()
 
     def enqueue_at(self, key, chat_id, text, topic_id):
-        with self.db:
-            if self.db.execute('SELECT 1 FROM outbox WHERE key=?', (f'{key}:topic:{topic_id or 0}:0',)).fetchone():
-                return
-            for i, (part, rich_text) in enumerate(self.output_parts(key, text)):
-                self.db.execute(
-                    "INSERT OR IGNORE INTO outbox(key,chat_id,text,message_thread_id,rich_text) VALUES(?,?,?,?,?)",
-                    (f"{key}:topic:{topic_id or 0}:{i}", str(chat_id), part, topic_id, rich_text))
+        self.enqueue_parts(f'{key}:topic:{topic_id or 0}', chat_id, text, topic_id)
 
     def enqueue(self, key, chat_id, text):
         if key.startswith("input:"):
@@ -165,6 +159,7 @@ class TargetBridge(Bridge):
             await self.mirror.update(self, turns)
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
+        self.store.images.observe(turn_id, item, completed_ms)
         if not replay and self.mirror_allowed():
             self.mirror.note_event(self, turn_id, item)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
@@ -175,7 +170,7 @@ class TargetBridge(Bridge):
             if replay and completed_ms is None:
                 continue
             self.store.enqueue_at(f"turn:{turn_id}:{item['id']}", route["chat_id"],
-                                  item["text"], route["message_thread_id"])
+                                  self.store.images.agent_text(turn_id, item), route["message_thread_id"])
 
     async def dispatch_one(self, row):
         if not self.owner_allowed():
@@ -205,6 +200,7 @@ class TargetBridge(Bridge):
         self.store.mark_batch(self.store.batch(row), "done")
 
     async def sender_loop(self):
+        self.store.images.recover()
         while True:
             row = self.store.db.execute(
                 "SELECT * FROM outbox WHERE message_id IS NULL ORDER BY rowid LIMIT 1").fetchone()
@@ -212,11 +208,10 @@ class TargetBridge(Bridge):
                 await asyncio.sleep(0.5)
                 continue
             try:
+                self.store.images.begin(row)
                 sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
-                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'])
-                with self.store.db:
-                    self.store.db.execute("UPDATE outbox SET message_id=? WHERE key=?",
-                                          (sent["message_id"], row["key"]))
+                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'], media_json=row['media_json'])
+                self.store.images.sent(row, sent['message_id'])
                 LOG.info("Sent target %s message %s", self.target["key"], sent["message_id"])
             except (TelegramError, ConnectionError) as error:
                 if isinstance(error, TelegramError) and error.code in {400, 403}:
@@ -228,7 +223,11 @@ class TargetBridge(Bridge):
                             self.on_missing_topic(self.target['key'], row['message_thread_id'])
                         except (OSError, ValueError):
                             LOG.error('Could not persist unavailable Telegram topic')
+                    self.store.images.failed(row)
+                elif row['media_json'] and getattr(error, 'code', None) != 429:
+                    self.store.images.failed(row, uncertain=getattr(error, 'uncertain', True))
                 else:
+                    self.store.images.retry(row)
                     delay = min(60, 2 ** min(row["attempts"] + 1, 6))
                     if isinstance(error, TelegramError):
                         delay = max(delay, error.retry_after)
