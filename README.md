@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.2 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.3 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -193,6 +193,8 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 ### 仅任务结束时通知
 
 在话题模式的 `config.json` 顶层设置 `"notification_mode": "completion"`，重启对应实例后启用；也可在单个 `targets` 项上设置，该目标的配置优先。省略配置或使用 `"notification_mode": "all"` 保留逐条发送的原有行为。此选项不改变单会话模式。
+
+普通任务消息写入本机接收队列后，独立预览流程会立即尝试显示“已收到，正在准备”，无需等待附件处理、Codex 启动请求返回、首条回复或历史读取。连接未就绪时显示等待连接，投递结果尚不明确时显示正在核对；实际可见时间仍取决于 Telegram 和网络。此流程覆盖话题内消息、确认后的 All 消息及已投递的派单；系统指令、空消息、无权限输入和未确认的 All 消息不触发。向正在执行的任务补充消息时保留已有累计正文，取得真实任务 ID 后继续使用同一预览。
 
 任务执行期间，中间回复与两行状态合并为同一条临时草稿，每约 15 秒用累计内容更新，不新建或移动普通状态卡。预览保留截至当前的文本；超过 3800 个 UTF-16 单元时，明确标注只显示最近部分，完整文本和图片仍保存在持久化队列中。草稿暂时失败或不受支持时，内容继续暂存到任务结束，不改发普通进度消息。草稿本身是临时显示，停止刷新约 30 秒后会消失，参见 [Telegram 草稿接口](https://core.telegram.org/bots/api#sendmessagedraft)。
 
