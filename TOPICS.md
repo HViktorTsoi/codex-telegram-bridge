@@ -169,6 +169,14 @@ never falls back to the root session. Creator and dispatch ForceReply inputs,
 plain-text explicit aliases and slash commands retain their existing paths.
 Main-chat media captions cannot run slash or alias commands.
 
+Confirmation also queues the original text or media caption in the selected
+Telegram topic, prefixed with `📩 你在 All 说：` and followed by the saved readable
+reply context. This plain-text copy uses a durable, deduplicated outbox key;
+recovery can complete it after input import without importing the native input
+again or starting another model turn. It copies text only, leaving attachment
+delivery to Codex on the existing path. Unconfirmed/cancelled drafts do not send
+copies, and previously completed records are not backfilled.
+
 The receiver validates guarded input's frozen native thread, target key and topic
 before dispatch and again after attachment preparation. A changed/missing binding
 fails closed. Confirmed import intent is persisted before handoff; original update

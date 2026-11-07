@@ -7,7 +7,7 @@ import time
 from attachments import payload_from
 from bridge import permitted
 from message_format import plain_chunks, utf16_size
-from reply_context import snapshot as reply_snapshot, serialized as reply_serialized
+from reply_context import snapshot as reply_snapshot, serialized as reply_serialized, render as render_reply
 from session_picker import BindingError, clean_name
 
 
@@ -233,7 +233,7 @@ class MainChatGuard:
         if draft['state'] == 'queued':
             selected = json.loads(draft['selection_json'])
             target = self.router.targets.get(selected['key'], {})
-            text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n回复会出现在该会话的话题中。'
+            text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n原文与回复会出现在该会话的话题中。'
         else:
             text = '已取消，这条消息不会交给 Codex。'
         return await self._panel(update, text, [[('待发送', 'main:list', {}), ('返回会话管理', 'home', {})]], draft)
@@ -265,8 +265,18 @@ class MainChatGuard:
                 if (tuple(existing)[:6] != expected or json.loads(existing['main_guard_json'] or 'null') != binding
                         or existing['state'] in ('denied', 'cancelled', 'blocked', 'failed')):
                     raise BindingError('原投递标识已存在或已被拒绝，未覆盖旧任务；请核对后取消并重新发送。')
-                continue
-            bridge.store.accept({'update_id': row['update_id']}, message, reply_context=context, guard_binding=binding)
+            else:
+                bridge.store.accept({'update_id': row['update_id']}, message, reply_context=context, guard_binding=binding)
+            # Mirror the confirmed user's text into the same Telegram topic,
+            # including on recovery after input import but before outbox commit.
+            # This distinct key stays plain text and never becomes model input.
+            body = message.get('text') or message.get('caption', '')
+            if body:
+                text = '📩 你在 All 说：\n' + body
+                if context:
+                    text += '\n\n' + render_reply(context)
+                bridge.store.enqueue_at(f"main-guard-input:{draft['id']}:{row['update_id']}",
+                                        draft['chat_id'], text, selected['message_thread_id'])
         self.router.recent.record(target['thread_id'], 'main-guard:' + draft['id'],
                                   accessed_at=draft['confirmed_at'] if draft['confirmed_at'] is not None else draft['last_at'])
         self._save(draft['id'], state='queued', error=None)
@@ -300,7 +310,7 @@ class MainChatGuard:
                        selected_revision=draft['revision'], expires_at=self.clock() + self.TTL)
             draft = self._draft(draft['id'])
             text = (f"确认发送到「{clean_name(target['name'])}」？\n主机：{self.router.config.get('host_id', '本机')}\n"
-                    f"会话：{target['thread_id']}\n\n" + self._preview(draft) + '\n\n确认后才会交给该会话，回复保留在对应话题。')
+                    f"会话：{target['thread_id']}\n\n" + self._preview(draft) + '\n\n确认后才会交给该会话，原文与回复显示在对应话题。')
             base = {'id': draft['id'], 'revision': draft['revision'], 'target': selected}
             return await self._panel(update, text, [[('确认发送', 'main:confirm', base)],
                                                    [('重新选择', 'main:choose', {'id': draft['id']}),
