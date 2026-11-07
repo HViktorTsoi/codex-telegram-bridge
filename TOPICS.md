@@ -142,7 +142,22 @@ are not retried automatically; 429 retries reuse the saved bytes. Existing queue
 text is not rewritten or backfilled during migration.
 Status cards use Rich HTML bold text on the
 first of two lines with `━━━━` separators on either side. Duration and update
-time share the second line, retaining the 15-second edit interval and saved message ID.
+time share the second line, retaining the 15-second update interval. With activity
+indicators enabled, topic mode defaults to `activity_position: "bottom"`: newer
+delivered replies, photos and ordinary topic inputs cause a replacement card at
+the end of the conversation on the next eligible update (up to about 15 seconds).
+Only after the new card's returned message ID is saved does the bot delete its old
+status card. Without newer content, it edits the existing card. It does not post
+a new card every 15 seconds. A completed card can follow its own turn's late final
+reply or image; unrelated future messages do not resurrect it. Enabling the feature
+does not repost historical completed cards. Status cards are ordinary messages,
+so this follows the latest content rather than creating a fixed screen footer.
+
+Set `activity_position: "inline"` globally or on one target to retain the original
+in-place behavior. Relocation intent and old-card cleanup are durable. Uncertain
+replacement sends keep the old card and are not repeated automatically; known
+rate limits delay retry, and old-card deletion retries without sending another
+replacement. Topic repair retains destination isolation.
 
 Codex replies use Rich Markdown by default and contain only the body, without an
 automatically added topic-title prefix. `/format rich` and `/format plain`

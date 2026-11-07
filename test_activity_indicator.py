@@ -240,3 +240,196 @@ class ActivityTests(unittest.IsolatedAsyncioTestCase):
             self.telegram.call.assert_not_called()
         finally:
             bridge.store.db.close()
+
+
+class BottomActivityTests(unittest.IsolatedAsyncioTestCase):
+    asyncTearDown = ActivityTests.asyncTearDown
+    turn = ActivityTests.turn
+    update = ActivityTests.update
+    rendered = staticmethod(ActivityTests.rendered)
+
+    async def asyncSetUp(self):
+        await ActivityTests.asyncSetUp(self)
+        self.activity.position = 'bottom'
+        self.next_message = 321
+
+        async def telegram(method, **params):
+            if method in ('sendRichMessage', 'sendMessage'):
+                mid = self.next_message
+                self.next_message += 2
+                return {'message_id': mid}
+            if method == 'deleteMessage':
+                return True
+            return {'message_id': params['message_id']}
+
+        self.telegram.call.side_effect = telegram
+        self.send = telegram
+
+    def content(self, mid=322, turn='native-turn', topic=42):
+        with self.store.db:
+            self.store.db.execute('INSERT INTO outbox(key,chat_id,text,message_id,message_thread_id) VALUES(?,?,?,?,?)',
+                                  (f'turn:{turn}:content-{mid}', '123', 'actual reply', mid, topic))
+
+    def sends(self):
+        return [c for c in self.telegram.call.call_args_list if c.args[0] in ('sendRichMessage', 'sendMessage')]
+
+    async def test_new_content_moves_card_then_deletes_old_after_confirmation_with_15_second_limit(self):
+        await self.update()
+        self.content()
+        self.now += 4
+        await self.update()
+        self.assertEqual(len(self.sends()), 1)
+        self.now += 12
+        await self.update()
+        self.assertEqual([c.args[0] for c in self.telegram.call.call_args_list],
+                         ['sendRichMessage', 'sendRichMessage', 'deleteMessage'])
+        self.assertEqual(self.activity.load()['message_id'], 323)
+        self.assertEqual(self.telegram.call.call_args.kwargs, {'chat_id': '123', 'message_id': 321})
+        self.assertTrue(self.sends()[-1].kwargs['disable_notification'])
+        self.assertEqual(self.sends()[-1].kwargs['message_thread_id'], 42)
+        self.assertEqual(len(self.rendered(self.sends()[-1].kwargs).splitlines()), 2)
+        self.now += 16
+        await self.update()
+        self.assertEqual(self.telegram.call.call_args.args[0], 'editMessageText')
+        self.assertEqual(self.telegram.call.call_args.kwargs['message_id'], 323)
+        self.assertEqual(len(self.sends()), 2)
+
+    async def test_late_final_output_moves_completed_card_but_unrelated_future_messages_do_not(self):
+        await self.update()
+        self.now += 60
+        await self.update([self.turn('completed')])
+        self.assertFalse(self.activity.open)
+        self.content()
+        self.now += 16
+        await self.update([self.turn('completed')])
+        self.assertEqual(self.activity.load()['message_id'], 323)
+        self.assertIn('已完成', self.rendered(self.sends()[-1].kwargs))
+        self.assertIn('1分10秒', self.rendered(self.sends()[-1].kwargs))
+        self.assertFalse(self.activity.open)
+        count = self.telegram.call.await_count
+        self.content(mid=324, turn='unrelated')
+        self.now += 30
+        await self.update([self.turn('completed')])
+        self.assertEqual(self.telegram.call.await_count, count)
+
+    async def test_enable_does_not_repost_historical_completed_cards(self):
+        self.activity.save({'turn_id': 'native-turn', 'route': ['123', 42], 'message_id': 321,
+                            'open': False, 'delivery': 'sent', 'phase': 'completed', 'started_at': 900,
+                            'finished_at': 960, 'updated_at': 960, 'style_version': TopicActivity.STYLE_VERSION})
+        self.content()
+        await self.update([self.turn('completed')])
+        self.telegram.call.assert_not_called()
+
+    async def test_ambiguous_replacement_keeps_old_card_and_is_not_sent_again_after_restart(self):
+        await self.update()
+        self.content()
+        self.now += 16
+        self.telegram.call.side_effect = ConnectionError('replacement response lost')
+        with self.assertRaises(ConnectionError):
+            await self.update()
+        self.assertEqual(self.activity.load()['replaces']['message_id'], 321)
+        self.assertEqual(self.activity.load()['delivery'], 'uncertain')
+        self.assertFalse(any(c.args[0] == 'deleteMessage' for c in self.telegram.call.call_args_list))
+        self.now += 30
+        self.activity = TopicActivity(self.store, clock=lambda: self.now, position='bottom')
+        self.telegram.call.side_effect = self.send
+        await self.update()
+        self.assertEqual(len(self.sends()), 2)
+
+    async def test_replacement_rate_limit_retries_without_deleting_old_card_first(self):
+        await self.update()
+        self.content()
+        self.now += 16
+        self.telegram.call.side_effect = TelegramError('sendRichMessage', 429, 'rate limit', retry_after=30)
+        with self.assertRaises(TelegramError):
+            await self.update()
+        self.assertFalse(any(c.args[0] == 'deleteMessage' for c in self.telegram.call.call_args_list))
+        self.now += 16
+        await self.update()
+        self.assertEqual(len(self.sends()), 2)
+        self.now += 15
+        self.telegram.call.side_effect = self.send
+        await self.update()
+        self.assertEqual(self.activity.load()['message_id'], 323)
+        self.assertEqual(self.telegram.call.call_args.args[0], 'deleteMessage')
+        self.assertEqual(len(self.sends()), 3)
+
+    async def test_cleanup_retry_survives_restart_without_another_replacement(self):
+        await self.update()
+        self.content()
+        self.now += 16
+
+        async def throttled_delete(method, **params):
+            if method == 'deleteMessage':
+                raise TelegramError(method, 429, 'rate limit', retry_after=30)
+            return await self.send(method, **params)
+
+        self.telegram.call.side_effect = throttled_delete
+        await self.update()
+        self.assertEqual(self.activity.load()['message_id'], 323)
+        self.assertEqual(len(self.activity.load()['cleanup']), 1)
+        self.now += 31
+        self.activity = TopicActivity(self.store, clock=lambda: self.now, position='bottom')
+        self.telegram.call.side_effect = self.send
+        await self.update()
+        self.assertEqual(self.activity.load()['cleanup'], [])
+        self.assertEqual(len(self.sends()), 2)
+
+    async def test_other_topics_cannot_move_this_topic_card(self):
+        await self.update()
+        self.content(topic=99)
+        self.now += 16
+        await self.update()
+        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(self.telegram.call.call_args.args[0], 'editMessageText')
+        await self.update(topic_id=99)
+        self.assertEqual(len(self.sends()), 2)
+        self.assertEqual(self.sends()[-1].kwargs['message_thread_id'], 99)
+        self.assertFalse(any(c.args[0] == 'deleteMessage' for c in self.telegram.call.call_args_list))
+
+    async def test_incoming_topic_message_also_moves_active_card_without_dispatching_input(self):
+        from topics_bridge import RoutedStore
+        self.store.db.close()
+        self.store = RoutedStore(self.path / 'queue.sqlite', 'native')
+        self.activity = TopicActivity(self.store, clock=lambda: self.now, position='bottom')
+        await self.update()
+        self.store.accept({'update_id': 1}, {'message_id': 322, 'message_thread_id': 42,
+                                           'chat': {'id': 123}, 'text': '新的用户消息'})
+        self.now += 16
+        await self.update()
+        self.assertEqual(self.activity.load()['message_id'], 323)
+        self.assertEqual(self.store.pending()['text'], '新的用户消息')
+
+    async def test_multiple_content_chunks_trigger_one_move_and_photo_counts_as_content(self):
+        await self.update()
+        for mid in (322, 324, 326):
+            self.content(mid=mid)
+        self.next_message = 327
+        self.now += 16
+        await self.update()
+        self.assertEqual(self.activity.load()['message_id'], 327)
+        self.assertEqual(len(self.sends()), 2)
+        self.content(mid=328)
+        with self.store.db:
+            self.store.db.execute('UPDATE outbox SET media_json=? WHERE message_id=328', ('{}',))
+        self.next_message = 329
+        self.now += 16
+        await self.update()
+        self.assertEqual(self.activity.load()['message_id'], 329)
+        self.assertEqual(len(self.sends()), 3)
+
+    async def test_following_turn_keeps_pending_cleanup_record(self):
+        await self.update()
+        self.content()
+        self.now += 16
+
+        async def throttled_delete(method, **params):
+            if method == 'deleteMessage':
+                raise TelegramError(method, 429, 'rate limit', retry_after=30)
+            return await self.send(method, **params)
+
+        self.telegram.call.side_effect = throttled_delete
+        await self.update()
+        await self.update([self.turn(tid='next'), self.turn('completed')])
+        self.assertEqual(self.activity.load()['turn_id'], 'next')
+        self.assertEqual(len(self.activity.load()['cleanup']), 1)
