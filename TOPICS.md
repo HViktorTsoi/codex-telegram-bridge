@@ -81,6 +81,39 @@ configurations in `binding-config-backups/`. The picker restores subscriptions
 after a restart; this existing-session binding route never creates or forks a
 Codex conversation.
 
+Bound-session menus, the All target chooser, `/to` and `/rename` target menus
+put the most recently used conversations first. The add-existing catalog orders
+sessions by recorded use and directories by their most recently used session;
+native updated-at order remains the stable fallback for sessions without a use
+record. Catalog pages retain their saved ordering until explicitly reloaded.
+The private `session_access_events` and `session_recent_access` tables record
+accepted Telegram topic input and session commands, confirmed All deliveries,
+delivered dispatches and completed renames under the original native ID.
+Original event times and IDs prevent replays from changing the order. Bot API
+does not report merely opening a topic; menu rendering, cancelled choices, bot
+output and status updates do not count as access. Desktop-only use is not
+recorded as Telegram access.
+
+For a bound conversation, choose **修改名称** in its `/sessions` detail panel,
+reply to the exact name prompt, and select **确认改名**. `/rename` in a bound
+topic selects that conversation; `/rename <new name>` goes directly to review.
+In All, either form first asks for a target without choosing a default. Rename
+prompts and management panels appear in All. Only owner replies to the exact
+ForceReply prompt supply a name; `/cancel` or the cancel button exits. Names
+must be visible, single-line, at most 90 UTF-16 units and unique among other
+bound conversations on this host.
+
+Confirmation updates `thread/name/set`, verifies the same native ID, calls
+`editForumTopic` on the existing topic ID, then saves local metadata. It never
+starts a model turn or changes the IDs, history, active work, model, permissions,
+explicit aliases or target key. The `ui_renames` and `ui_rename_prompts` ledgers
+preserve exact bindings and progress through native, topic and local-save stages.
+If a stage fails after a partial update, **继续同步名称** on the home panel or
+the bound conversation's rename entry continues that operation. Repeated
+confirmation does not create another conversation or topic. A changed binding
+or a conflicting external rename stops synchronization for review; a missing
+topic must be repaired before starting a new rename.
+
 **新建会话** opens a local filesystem browser starting at the user's home.
 Directory buttons, ten-entry pages, parent navigation and a dot-directory toggle
 work without text entry. **输入路径** accepts absolute, home-relative and current

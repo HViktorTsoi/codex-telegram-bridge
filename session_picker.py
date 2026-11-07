@@ -53,6 +53,8 @@ class SessionPicker:
         self.creator = SessionCreator(self)
         from main_guard import MainChatGuard
         self.guard = MainChatGuard(self)
+        from session_renamer import SessionRenamer
+        self.renamer = SessionRenamer(self)
 
     def ingest(self, update):
         callback = update.get('callback_query')
@@ -69,7 +71,8 @@ class SessionPicker:
             text = message.get('text', '').strip().split(maxsplit=1)
             # A caption or a media message must never execute a control command.
             from attachments import payload_from
-            if not self.creator.is_reply(update) and (not text or text[0].split('@')[0].lower() != '/sessions' or payload_from(message)):
+            if (not self.creator.is_reply(update) and not self.renamer.is_reply(update)
+                    and (not text or text[0].split('@')[0].lower() not in ('/sessions', '/rename') or payload_from(message))):
                 return False
             valid = permitted(message, self.router.access(), self.router.owner)
         with self.db:
@@ -121,9 +124,9 @@ class SessionPicker:
         return result
 
     async def home(self, update):
-        targets = list(self.router.targets.values())[:12]
+        targets = self.router.recent.ordered(self.router.targets.values())[:12]
         directories = await asyncio.gather(*(self.directory(t['thread_id'], 90) for t in targets))
-        lines = ['已绑定的原 Codex 会话：']
+        lines = ['已绑定的原 Codex 会话（最近使用在前）：']
         for number, (target, directory) in enumerate(zip(targets, directories), 1):
             ready = self.router.bridges[target['key']].ready.is_set()
             status = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
@@ -142,6 +145,9 @@ class SessionPicker:
         for draft in self.creator.unfinished(self.router.owner):
             rows.append([('继续处理：' + clean_name(draft['name'] or '未确认的新会话', 30),
                           'new:resume', {'id': draft['id']})])
+        for rename in self.renamer.unfinished():
+            rows.append([('继续同步名称：' + clean_name(rename['new_name'] or '待确认', 25),
+                          'rename:resume', {'id': rename['id']})])
         rows.append([('刷新', 'home', {})])
         text += '\n点击“新建会话”可选择或新建工作目录，并创建全新的 Codex 会话。'
         await self.panel(update, text, rows)
@@ -155,7 +161,7 @@ class SessionPicker:
             return '暂时无法读取'
 
     async def new_catalog(self):
-        groups, seen, cursors, cursor = {}, set(), set(), None
+        threads, seen, cursors, cursor = [], set(), set(), None
         for _ in range(100):
             params = {'limit': 100, 'sortKey': 'updated_at', 'sortDirection': 'desc', 'archived': False}
             if cursor:
@@ -168,7 +174,7 @@ class SessionPicker:
                 seen.add(thread['id'])
                 cwd = thread.get('cwd')
                 cwd = cwd if isinstance(cwd, str) and cwd else None
-                groups.setdefault(cwd, []).append({'id': thread['id'], 'name': thread.get('name')})
+                threads.append({'id': thread['id'], 'name': thread.get('name'), 'cwd': cwd})
             cursor = result.get('nextCursor')
             if not cursor:
                 break
@@ -177,6 +183,12 @@ class SessionPicker:
             cursors.add(cursor)
         else:
             raise BindingError('原生会话列表过大，暂时无法完整分组，请稍后重试。')
+        # Sort the complete native result before grouping, so each directory's
+        # first session also determines its position. Unknown access times keep
+        # the native updated-at order as a stable fallback within this snapshot.
+        groups = {}
+        for thread in self.router.recent.ordered(threads):
+            groups.setdefault(thread['cwd'], []).append({'id': thread['id'], 'name': thread['name']})
         catalog_id = secrets.token_urlsafe(12)
         payload = [{'cwd': cwd, 'threads': threads} for cwd, threads in groups.items()]
         with self.db:
@@ -234,7 +246,7 @@ class SessionPicker:
         rows.append([('返回目录列表', 'catalog', {'catalog_id': catalog_id, 'dir_page': group_index // 12}),
                      ('重新加载', 'catalog', {'directory': group['cwd']})])
         text = (f'{host} · 添加会话\n目录 {group_index + 1}/{len(groups)}\n'
-                f"📁 {directory_text(group, 1200)}\n\n本目录 {len(threads)} 个会话，按最近更新排序。")
+                f"📁 {directory_text(group, 1200)}\n\n本目录 {len(threads)} 个会话，最近使用在前；未使用的按原生更新时间排序。")
         if page_count > 1:
             text += f'\n会话第 {page + 1}/{page_count} 页。'
         text += '\n请选择要接入的原会话：'
@@ -379,6 +391,7 @@ class SessionPicker:
                 f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n目录：{directory}\n"
                 '在该话题发送 /status 可核对会话。')
         await self.panel(update, text, [
+            [('修改名称', 'rename:start', {'thread_id': target['thread_id']})],
             [('重新创建话题', 'repair_select', {'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']})],
             [('继续添加', 'catalog', catalog or {}), ('返回', 'home', {})]])
 
@@ -397,12 +410,17 @@ class SessionPicker:
             self.db.execute("UPDATE ui_jobs SET state='processing' WHERE id=?", (job['id'],))
         update = json.loads(job['payload'])
         callback = update.get('callback_query')
+        words = update.get('message', {}).get('text', '').strip().split(maxsplit=1)
         try:
             if not callback:
                 if self.creator.is_reply(update):
                     await self.creator.reply(update)
+                elif self.renamer.is_reply(update):
+                    await self.renamer.reply(update)
                 elif self.guard.is_message(update):
                     await self.guard.present(update)
+                elif words and words[0].split('@')[0].lower() == '/rename':
+                    await self.renamer.command(update)
                 else:
                     await self.home(update)
             else:
@@ -420,6 +438,8 @@ class SessionPicker:
                 data, action = json.loads(button['data']), button['action']
                 if action.startswith('new:'):
                     await self.creator.handle(update, action, data)
+                elif action.startswith('rename:'):
+                    await self.renamer.handle(update, action, data)
                 elif action.startswith('main:'):
                     await self.guard.handle(update, action, data)
                 elif action == 'home':
@@ -463,6 +483,7 @@ class SessionPicker:
     async def recover(self):
         self.creator.recover()
         self.guard.recover()
+        self.renamer.recover()
         with self.db:
             self.db.execute("UPDATE ui_jobs SET state='pending' WHERE state='processing'")
             # createForumTopic has no idempotency key; an interrupted call needs review.
