@@ -211,9 +211,11 @@ behavior. This option is specific to topic mode and leaves single-chat instances
 unchanged.
 
 During an active turn, one `sendMessageDraft` combines a two-line status header
-and cumulative visible text, refreshing about every 15 seconds. Ordinary status
-cards are neither created nor moved. The plain preview is bounded to 3800 UTF-16
-units; long content shows an explicit recent-tail notice while the complete
+and cumulative visible text, refreshing about every 15 seconds. Each refresh uses
+a new `draft_id` so Telegram replaces the preview without the animated typing
+effect; cumulative content and the refresh interval retain their existing rules.
+Ordinary status cards are neither created nor moved. The plain preview is bounded
+to 3800 UTF-16 units; long content shows an explicit recent-tail notice while the complete
 text and image snapshots stay in the durable outbox. An unsupported or failed
 draft never falls back to an ordinary progress message. Drafts are temporary
 and expire about 30 seconds after refresh stops; see

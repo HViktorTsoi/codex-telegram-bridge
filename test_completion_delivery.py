@@ -113,7 +113,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.delivery.seal(self.turn('completed'))
         self.assertIsNone(self.delivery.next_row())
 
-    async def test_cumulative_draft_has_status_and_all_previous_text_with_stable_id(self):
+    async def test_cumulative_draft_has_status_and_all_previous_text_without_animation(self):
         self.delivery.watch(self.turn())
         self.output('第一段保留')
         await self.delivery.update(self.telegram, turns=[self.turn()])
@@ -124,7 +124,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.now += 15
         await self.delivery.update(self.telegram, turns=[self.turn()])
         last = self.calls[-1][1]
-        self.assertEqual(first['draft_id'], last['draft_id'])
+        self.assertNotEqual(first['draft_id'], last['draft_id'])
         self.assertEqual(last['message_thread_id'], 42)
         self.assertEqual(last['chat_id'], 123)
         self.assertIn('第一段保留\n\n第二段新增', last['text'])
@@ -139,7 +139,24 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.now += 1
         await self.delivery.update(self.telegram, turns=[self.turn()])
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.calls[0][1]['draft_id'], self.calls[1][1]['draft_id'])
+        self.assertNotEqual(self.calls[0][1]['draft_id'], self.calls[1][1]['draft_id'])
+
+    async def test_instant_preview_id_rotation_survives_restart_and_wraps_to_a_nonzero_id(self):
+        await self.delivery.update(self.telegram, turns=[self.turn()])
+        first = self.calls[-1][1]['draft_id']
+        self.now += 15
+        self.delivery = CompletionDelivery(self.bridge, clock=lambda: self.now)
+        await self.delivery.update(self.telegram, turns=[self.turn()])
+        last = self.calls[-1][1]['draft_id']
+        self.assertNotEqual(first, last)
+        saved = self.store.db.execute('SELECT draft_id FROM completion_turns').fetchone()[0]
+        self.assertEqual(saved, last)
+        with self.store.db:
+            self.store.db.execute('UPDATE completion_turns SET draft_id=?', (2 ** 31 - 1,))
+        self.now += 15
+        await self.delivery.update(self.telegram, turns=[self.turn()])
+        self.assertEqual(self.calls[-1][1]['draft_id'], 1)
+        self.assertTrue(all(method == 'sendMessageDraft' for method, _ in self.calls))
 
     async def test_preview_limit_keeps_full_durable_body_and_marks_older_omission(self):
         body = '原始开头\n' + '😀过程内容' * 1800 + '\n原始结尾'
