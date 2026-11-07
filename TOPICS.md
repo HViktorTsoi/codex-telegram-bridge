@@ -26,6 +26,7 @@ Add these fields (the IDs below are placeholders):
 {
   "mode": "topics",
   "notification_mode": "completion",
+  "preview_style": "block",
   "host_id": "zbox",
   "root_target": "meeting",
   "initial_telegram_offset": 123456,
@@ -210,16 +211,30 @@ Omitting it, or setting `"all"`, preserves the original immediate-delivery
 behavior. This option is specific to topic mode and leaves single-chat instances
 unchanged.
 
-During an active turn, one `sendMessageDraft` combines a two-line status header
-and cumulative visible text, refreshing about every 15 seconds. Each refresh uses
-a new `draft_id` so Telegram replaces the preview without the animated typing
-effect; cumulative content and the refresh interval retain their existing rules.
-Ordinary status cards are neither created nor moved. The plain preview is bounded
+During an active turn, one temporary draft combines a two-line status header
+and cumulative visible text, refreshing about every 15 seconds. Ordinary status
+cards are neither created nor moved. The preview is bounded
 to 3800 UTF-16 units; long content shows an explicit recent-tail notice while the complete
 text and image snapshots stay in the durable outbox. An unsupported or failed
 draft never falls back to an ordinary progress message. Drafts are temporary
 and expire about 30 seconds after refresh stops; see
 [Telegram's draft API](https://core.telegram.org/bots/api#sendmessagedraft).
+
+`preview_style: "block"`, globally or per target, uses `sendRichMessageDraft`
+with a single `thinking` block containing the status and cumulative public
+progress text. The target setting takes precedence. An iPad trial confirmed
+whole-block text display; this is not a guarantee for every client. Older clients
+may ignore this block. Omit the setting or use `"plain"` for the compatible
+`sendMessageDraft` path, whose text animation remains client-controlled. The
+block contains the same public progress as the plain preview, not hidden model
+reasoning. See [the block definition](https://core.telegram.org/bots/api#inputrichblockthinking).
+
+Both styles retain one stable `draft_id` for the turn. Rotating the identifier
+does not reliably disable animation and may animate the entire draft again;
+the [Telegram protocol guide](https://core.telegram.org/api/bots/ai) documents
+client differences. Unsupported preview APIs keep task output buffered until
+completion and never fall back to ordinary progress messages. Changing preview
+style does not change the 15-second cadence, queue contents or notification rule.
 
 Only explicit native `completed`, `failed` or `interrupted` state plus a
 successful full history scan releases a turn. An item with `final_answer` phase,

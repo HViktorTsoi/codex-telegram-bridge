@@ -312,6 +312,8 @@ class TargetBridge(Bridge):
                      + self.settings_text(settings))
             if self.delivery.enabled:
                 reply += '\n通知：仅整轮任务结束时提醒'
+                if self.delivery.preview_style == 'block':
+                    reply += '\n预览：整块累计进度'
         if reply is None:
             result = await super().dispatch_one(row)
             if self.delivery.enabled:
@@ -672,6 +674,7 @@ class TopicRouter:
                             "message_thread_id": bridge.target['message_thread_id'],
                             "topic_missing": bool(bridge.target.get('topic_missing')),
                             "notification_mode": 'completion' if bridge.delivery.enabled else 'all',
+                            "preview_style": bridge.delivery.preview_style,
                             "connected": bridge.ready.is_set(), "last_error": bridge.last_error, **local_counts}
         pending = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state='pending'").fetchone()[0]
         counts['pending_inputs'] += pending

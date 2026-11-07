@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.1 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.2 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -21,6 +21,7 @@ All 中的普通消息默认必须选择接收会话并确认后才投递；不�
 验证 /status 中的原 thread ID、Markdown 和图片输入；多会话模式还需验证 /sessions 和各话题的消息归属。
 按需启用 native_mirror，将本机 Codex 客户端新消息和回复同步到对应话题，不补发启用前的历史。
 如需仅在任务结束时通知，在话题模式配置中设置 notification_mode: completion；中间回复和状态共同使用累计草稿，完成后发送正式内容及一次完成提醒。
+如需整块进度预览，可设置 preview_style: block；当前 iPad 已实测整段显示，其他客户端先验证，兼容性需要时使用 plain。
 缺少必要配置时再向我索取；Bot Token 只保存在目标机器私有凭据文件中，不提交到 GitHub。
 ```
 
@@ -181,7 +182,7 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 ### 回复排版
 
-默认将新的 Codex 正式回复通过 `sendRichMessage` 发送，使用 Telegram 的 Rich Markdown。菜单和其他控制回复使用普通文字；普通状态卡使用 Rich HTML 加粗，累计草稿使用纯文本。客户端需要支持 Telegram Rich Messages。
+默认将新的 Codex 正式回复通过 `sendRichMessage` 发送，使用 Telegram 的 Rich Markdown。菜单和其他控制回复使用普通文字；普通状态卡使用 Rich HTML 加粗，累计草稿可选纯文本或整块进度预览。客户端需要支持 Telegram Rich Messages。
 
 在对应会话发送 `/format rich` 开启排版，`/format plain` 改为纯文本，`/format` 查看当前选择。选择按目标会话持久化，对之后生成的回复生效，不更改模型参数。
 
@@ -193,7 +194,9 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 在话题模式的 `config.json` 顶层设置 `"notification_mode": "completion"`，重启对应实例后启用；也可在单个 `targets` 项上设置，该目标的配置优先。省略配置或使用 `"notification_mode": "all"` 保留逐条发送的原有行为。此选项不改变单会话模式。
 
-任务执行期间，中间回复与两行状态合并为同一条临时草稿，每约 15 秒用累计内容更新，不新建或移动普通状态卡。每次刷新直接替换整段预览，避免逐字出现的打字动画；累计内容和刷新间隔保持原规则。预览保留截至当前的文本；超过 3800 个 UTF-16 单元时，明确标注只显示最近部分，完整文本和图片仍保存在持久化队列中。草稿暂时失败或不受支持时，内容继续暂存到任务结束，不改发普通进度消息。草稿本身是临时显示，停止刷新约 30 秒后会消失，参见 [Telegram 草稿接口](https://core.telegram.org/bots/api#sendmessagedraft)。
+任务执行期间，中间回复与两行状态合并为同一条临时草稿，每约 15 秒用累计内容更新，不新建或移动普通状态卡。预览保留截至当前的文本；超过 3800 个 UTF-16 单元时，明确标注只显示最近部分，完整文本和图片仍保存在持久化队列中。草稿暂时失败或不受支持时，内容继续暂存到任务结束，不改发普通进度消息。草稿本身是临时显示，停止刷新约 30 秒后会消失，参见 [Telegram 草稿接口](https://core.telegram.org/bots/api#sendmessagedraft)。
+
+设置 `"preview_style": "block"` 可使用整块进度预览，状态与累计正文一起显示；本次 iPad 实测确认文字整段出现。设置位置同样支持顶层或单个目标，目标配置优先。省略该项或使用 `"plain"` 保留纯文本草稿，逐字动画由客户端控制。整块预览依赖客户端支持，旧客户端可能不显示，可切回 `plain`。两种形式都沿用同一轮固定的草稿标识；轮换标识不能可靠关闭动画，部分客户端反而会重新动画全文，参见 [Telegram 流式预览说明](https://core.telegram.org/api/bots/ai)。
 
 只有原生任务明确进入 `completed`、`failed` 或 `interrupted`，且完整历史已读取成功，才释放这一轮的正式过程、结果和图片。它们先静音发送，队列处理完毕后再发一次正常的完成、失败或停止提醒。`final_answer` 中间项、等待你输入／审批、断连或未知状态都不会被误认作整轮完成。电脑端镜像任务沿用相同规则，不补发旧的已完成历史通知；`/sessions`、`/model` 等主动系统操作仍可正常回复，不会被暂存的任务内容堵住。
 
