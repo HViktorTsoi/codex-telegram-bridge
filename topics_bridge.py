@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from collections import Counter
 import fcntl
 import json
 import logging
@@ -149,6 +150,13 @@ class TargetBridge(Bridge):
         self.on_missing_topic = None
         self.activity = TopicActivity(self.store, position=target.get('activity_position', config.get('activity_position', 'bottom')))
         self.mirror = NativeMirror(self.store)
+        from completion_delivery import CompletionDelivery
+        self.delivery = CompletionDelivery(self)
+        self.store.db.execute('''CREATE TABLE IF NOT EXISTS completion_ready_items(
+            turn_id TEXT,fingerprint TEXT,pending INTEGER DEFAULT 1,PRIMARY KEY(turn_id,fingerprint))''')
+        if 'pending' not in {r[1] for r in self.store.db.execute('PRAGMA table_info(completion_ready_items)')}:
+            self.store.db.execute('ALTER TABLE completion_ready_items ADD COLUMN pending INTEGER DEFAULT 1')
+        self.store.db.commit()
 
     def validate_destination(self, rows):
         for row in rows:
@@ -187,6 +195,16 @@ class TargetBridge(Bridge):
             self.mirror.note_event(self, turn_id, item)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
             return
+        if self.delivery.enabled:
+            # Completion events identify finished items. Readback supplies stable
+            # content identities even when native history renumbers item IDs.
+            fingerprint = NativeMirror.fingerprint(item)
+            if not replay and fingerprint:
+                with self.store.db:
+                    self.store.db.execute('INSERT INTO completion_ready_items VALUES(?,?,1) '
+                                          'ON CONFLICT(turn_id,fingerprint) DO UPDATE SET pending=1',
+                                          (turn_id, fingerprint))
+            return
         for route in self.store.turn_routes(turn_id):
             if completed_ms is not None and completed_ms < route["since_ms"]:
                 continue
@@ -194,6 +212,78 @@ class TargetBridge(Bridge):
                 continue
             self.store.enqueue_at(f"turn:{turn_id}:{item['id']}", route["chat_id"],
                                   self.store.images.agent_text(turn_id, item), route["message_thread_id"])
+
+    def finish_turn(self, turn):
+        if self.delivery.enabled:
+            if turn.get('status') not in ('completed', 'failed', 'interrupted'):
+                return
+            self.delivery.terminal(turn)
+        super().finish_turn(turn)
+
+    async def reconcile(self, replay=False):
+        turns = await super().reconcile(replay=replay)
+        if not self.delivery.enabled:
+            return turns
+        for turn in turns:
+            self.delivery.watch(turn)
+        # Desktop items must be durably copied before their turn is released.
+        await self.update_native_mirror(turns)
+        for turn in turns:
+            terminal = turn.get('status') in ('completed', 'failed', 'interrupted')
+            if terminal and not self.delivery.needs_scan(turn['id']):
+                continue
+            routes = self.store.turn_routes(turn['id'])
+            ready_rows = self.store.db.execute(
+                'SELECT fingerprint,pending FROM completion_ready_items WHERE turn_id=?', (turn['id'],)).fetchall()
+            ready = {r['fingerprint'] for r in ready_rows}
+            collect = self.delivery.collect_output(turn['id'])
+            if terminal or (routes and any(r['pending'] for r in ready_rows)):
+                occurrences = Counter()
+                legacy_sources = {}
+                prefix = 'turn:' + turn['id'] + ':'
+                for old in self.store.db.execute('SELECT * FROM outbox WHERE substr(key,1,?)=? ORDER BY rowid',
+                                                  (len(prefix), prefix)):
+                    base = old['key'].rsplit(':topic:', 1)[0]
+                    if base.startswith(prefix + 'completion-content-') or old['media_json']:
+                        continue
+                    source = (old['chat_id'], old['message_thread_id'], base)
+                    legacy_sources[source] = legacy_sources.get(source, '') + old['text']
+                legacy = Counter((chat, topic, text) for (chat, topic, _), text in legacy_sources.items())
+                history_occurrences = Counter()
+                window_since = int(self.delivery.state()['since'] * 1000)
+                # Exhausting this iterator is the proof for releasing a terminal
+                # turn; a partial/failed scan leaves every task row held.
+                async for entry in self.codex.items(turn['id']):
+                    item = entry['item']
+                    self.store.images.observe(turn['id'], item, entry.get('completedAtMs'))
+                    fingerprint = NativeMirror.fingerprint(item)
+                    if item.get('type') != 'agentMessage' or not fingerprint:
+                        continue
+                    occurrences[fingerprint] += 1
+                    if not collect:
+                        continue
+                    if not terminal and fingerprint not in ready:
+                        continue
+                    identity = 'completion-content-' + fingerprint + '-' + str(occurrences[fingerprint])
+                    body = self.store.images.agent_text(turn['id'], item)
+                    for route in routes:
+                        completed_ms = entry.get('completedAtMs')
+                        source = (route['chat_id'], route['message_thread_id'], body)
+                        history_occurrences[source] += 1
+                        cutoff = max(route['since_ms'], window_since)
+                        if completed_ms is not None and completed_ms < cutoff:
+                            continue
+                        if completed_ms is None and history_occurrences[source] <= legacy[source]:
+                            continue  # Legacy delivery already owns this history occurrence.
+                        self.store.enqueue_at(f"turn:{turn['id']}:{identity}", route['chat_id'],
+                                              body, route['message_thread_id'])
+                with self.store.db:
+                    for fingerprint in occurrences:
+                        self.store.db.execute('UPDATE completion_ready_items SET pending=0 WHERE turn_id=? AND fingerprint=?',
+                                              (turn['id'], fingerprint))
+            if terminal:
+                self.delivery.seal(turn)
+        return turns
 
     async def dispatch_one(self, row):
         if not self.owner_allowed():
@@ -220,27 +310,43 @@ class TargetBridge(Bridge):
                      f"会话：{settings['thread'].get('name') or self.target['name']}\n"
                      f"ID：{self.thread_id}\n话题：{row['message_thread_id'] or '原私聊入口'}\n"
                      + self.settings_text(settings))
+            if self.delivery.enabled:
+                reply += '\n通知：仅整轮任务结束时提醒'
         if reply is None:
-            return await super().dispatch_one(row)
+            result = await super().dispatch_one(row)
+            if self.delivery.enabled:
+                accepted = self.store.db.execute('SELECT turn_id,state FROM inbox WHERE id=?', (row['id'],)).fetchone()
+                if accepted and accepted['turn_id'] and accepted['state'] == 'running':
+                    self.delivery.watch({'id': accepted['turn_id'], 'status': 'inProgress'})
+            return result
         self.store.enqueue(f"input:{row['id']}:reply", row["chat_id"], reply)
         self.store.mark_batch(self.store.batch(row), "done")
 
     async def sender_loop(self):
         self.store.images.recover()
+        self.delivery.recover()
         while True:
-            row = self.store.db.execute(
-                "SELECT * FROM outbox WHERE message_id IS NULL ORDER BY rowid LIMIT 1").fetchone()
+            row = self.delivery.next_row()
             if row is None or row["retry_at"] > time.time() or not self.owner_allowed():
                 await asyncio.sleep(0.5)
                 continue
             try:
+                self.delivery.begin(row)
                 self.store.images.begin(row)
                 sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
-                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'], media_json=row['media_json'])
+                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'], media_json=row['media_json'],
+                                         disable_notification=self.delivery.silent(row) if self.delivery.enabled else None)
                 self.store.images.sent(row, sent['message_id'])
+                self.delivery.sent(row, sent['message_id'])
                 LOG.info("Sent target %s message %s", self.target["key"], sent["message_id"])
             except (TelegramError, ConnectionError) as error:
-                if isinstance(error, TelegramError) and error.code in {400, 403}:
+                if self.delivery.failed(row, error):
+                    if topic_missing_error(error) and row['message_thread_id'] and self.on_missing_topic:
+                        try:
+                            self.on_missing_topic(self.target['key'], row['message_thread_id'])
+                        except (OSError, ValueError):
+                            LOG.error('Could not persist unavailable Telegram topic')
+                elif isinstance(error, TelegramError) and error.code in {400, 403}:
                     with self.store.db:
                         self.store.db.execute("UPDATE outbox SET message_id=-1 WHERE key=?", (row["key"],))
                     LOG.error("Target delivery failed: %s", error)
@@ -263,6 +369,35 @@ class TargetBridge(Bridge):
             await asyncio.sleep(0.4)
 
     async def update_activity(self, turns):
+        if self.delivery.enabled:
+            if not self.owner_allowed() or self.target.get('topic_missing') or self.telegram is None:
+                return
+            previous = self.activity.load()
+            if (previous.get('open') and previous.get('message_id')
+                    and previous.get('route') == [str(self.owner), int(self.target['message_thread_id'])]
+                    and self.delivery.clock() >= previous.get('retire_retry_at', 0)):
+                try:
+                    await self.telegram.call('deleteMessage', chat_id=self.owner, message_id=previous['message_id'])
+                except (TelegramError, ConnectionError) as error:
+                    if getattr(error, 'code', None) not in (400, 403):
+                        previous['retire_retry_at'] = self.delivery.clock() + max(15, getattr(error, 'retry_after', 0))
+                    else:
+                        previous.update(open=False, delivery='retired')
+                else:
+                    previous.update(open=False, delivery='retired')
+                self.activity.save(previous)
+            connected = self.ready.is_set() and turns is not None
+            status = None
+            if connected and any(t.get('status') == 'inProgress' for t in turns):
+                try:
+                    thread = (await self.codex.call('thread/read', {'threadId': self.thread_id}))['thread']
+                    if thread['id'] != self.thread_id:
+                        raise RpcError('Draft snapshot thread identity mismatch')
+                    status = thread.get('status')
+                except (ConnectionError, RpcError, asyncio.TimeoutError):
+                    connected = False
+            await self.delivery.update(self.telegram, turns=turns, status=status, connected=connected)
+            return
         if (not self.target.get('activity_indicator', self.config.get('activity_indicator', False))
                 or not self.owner_allowed() or self.target.get('topic_missing') or self.telegram is None):
             return
@@ -536,6 +671,7 @@ class TopicRouter:
             targets[key] = {"name": bridge.target['name'], "thread_id": bridge.thread_id,
                             "message_thread_id": bridge.target['message_thread_id'],
                             "topic_missing": bool(bridge.target.get('topic_missing')),
+                            "notification_mode": 'completion' if bridge.delivery.enabled else 'all',
                             "connected": bridge.ready.is_set(), "last_error": bridge.last_error, **local_counts}
         pending = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state='pending'").fetchone()[0]
         counts['pending_inputs'] += pending

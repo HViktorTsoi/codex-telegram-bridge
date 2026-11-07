@@ -2,6 +2,7 @@
   "setup_required": true,
   "output_format": "rich",
   "mode": "topics",
+  "notification_mode": "completion",
   "native_mirror": false,
   "activity_position": "bottom",
   "host_id": "YOUR_HOST_NAME",

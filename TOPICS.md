@@ -25,6 +25,7 @@ Add these fields (the IDs below are placeholders):
 ```json
 {
   "mode": "topics",
+  "notification_mode": "completion",
   "host_id": "zbox",
   "root_target": "meeting",
   "initial_telegram_offset": 123456,
@@ -203,7 +204,42 @@ digest and delivery state; saved topic IDs are retained through topic repair.
 Upload intent is committed before the HTTP request. Uncertain sends and crashes
 are not retried automatically; 429 retries reuse the saved bytes. Existing queued
 text is not rewritten or backfilled during migration.
-Status cards use Rich HTML bold text on the
+Set `notification_mode: "completion"` globally or per target to hold task
+messages until the native turn ends; the target setting takes precedence.
+Omitting it, or setting `"all"`, preserves the original immediate-delivery
+behavior. This option is specific to topic mode and leaves single-chat instances
+unchanged.
+
+During an active turn, one `sendMessageDraft` combines a two-line status header
+and cumulative visible text, refreshing about every 15 seconds. Ordinary status
+cards are neither created nor moved. The plain preview is bounded to 3800 UTF-16
+units; long content shows an explicit recent-tail notice while the complete
+text and image snapshots stay in the durable outbox. An unsupported or failed
+draft never falls back to an ordinary progress message. Drafts are temporary
+and expire about 30 seconds after refresh stops; see
+[Telegram's draft API](https://core.telegram.org/bots/api#sendmessagedraft).
+
+Only explicit native `completed`, `failed` or `interrupted` state plus a
+successful full history scan releases a turn. An item with `final_answer` phase,
+waiting for approval/input, disconnection or an unknown state does not prove
+completion. Formal process text, results, images and the All user-text copy are
+sent silently after release; one normal completion/failure/stop notice follows
+after that turn's queued output has been handled. Desktop mirror turns follow
+the same rule. Held task output does not block explicit control replies such as
+`/sessions` or `/model`, and old completed history does not generate new notices.
+
+The private completion ledger freezes the original native/chat/topic route and
+persists notification intent. Repeated events and restarts do not generate a
+second completion notice; an uncertain notification send is not automatically
+repeated. The mode changes only presentation and delivery timing, with no model
+calls, settings changes or session replacement. Normal notifications still obey
+the user's Telegram mute and system Do Not Disturb settings. Telegram's
+`disable_notification` means no sound, not a guarantee against every OS banner;
+this mode avoids ordinary task messages while work is active, and phone draft
+behavior must still be verified. See the
+[official notification parameter](https://core.telegram.org/bots/api#sendmessage).
+
+With `notification_mode: "all"`, status cards use Rich HTML bold text on the
 first of two lines with `━━━━` separators on either side. Duration and update
 time share the second line, retaining the 15-second update interval. With activity
 indicators enabled, topic mode defaults to `activity_position: "bottom"`: newer
