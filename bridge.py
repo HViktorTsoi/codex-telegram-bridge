@@ -526,11 +526,16 @@ class Bridge:
             return "设置请求已提交，但服务回读的参数与目标不同。\n当前参数：\n" + self.settings_text(actual)
         return "已更新此会话参数，从下一轮开始生效。\n" + self.settings_text(actual) + note
 
+    def validate_destination(self, rows):
+        return True
+
     async def dispatch_one(self, row):
         update_id, text, chat_id = row["id"], row["text"], row["chat_id"]
         batch = self.store.batch(row)
         if not self.owner_allowed():
             self.store.mark_batch(batch, "denied")
+            return
+        if not self.validate_destination(batch):
             return
         payload = json.loads(row["message_json"] or "{}")
         content = bool(payload)
@@ -589,6 +594,8 @@ class Bridge:
             return
         if not self.owner_allowed():
             self.store.mark_batch(batch, "denied")
+            return
+        if not self.validate_destination(batch):
             return
         self.store.mark_batch(batch, "dispatching")
         params = {"threadId": self.thread_id,

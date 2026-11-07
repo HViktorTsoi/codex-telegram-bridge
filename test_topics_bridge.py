@@ -89,15 +89,17 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         while self.router.forward_one():
             pass
 
-    def test_owner_topic_routes_and_original_root_binding(self):
+    def test_owner_topic_routes_and_unconfirmed_main_message_is_held(self):
         for update in [self.message(100), self.message(101, 11), self.message(102, 22)]:
             self.accept(update)
         meeting = self.router.bridges['meeting'].store
         insta = self.router.bridges['instagram'].store
         self.assertEqual([(r['id'], r['message_thread_id']) for r in meeting.db.execute('SELECT * FROM inbox ORDER BY id')],
-                         [(100, None), (101, 11)])
+                         [(101, 11)])
         self.assertEqual([(r['id'], r['message_thread_id']) for r in insta.db.execute('SELECT * FROM inbox')], [(102, 22)])
         self.assertEqual(self.router.store.offset(), 103)
+        self.assertEqual(self.router.picker.guard.pending_count(), 1)
+        self.assertEqual(self.router.root_target['thread_id'], 'native-meeting')
 
     def test_unknown_topic_fails_closed_and_notifies_same_topic(self):
         self.accept(self.message(100, 999))
