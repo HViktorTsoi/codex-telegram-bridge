@@ -14,6 +14,7 @@ STATUS = {
     'failed': '❌ 本轮任务执行失败，请查看上方过程和 Codex 会话。',
     'interrupted': '⏹ 本轮任务已停止。',
 }
+ITEM_SEPARATOR = '\n\n────────────\n\n'
 
 
 class CompletionBatches:
@@ -65,7 +66,7 @@ class CompletionBatches:
         for row in rows:
             base = row['key'].rsplit(':', 1)[0]
             if row['text']:
-                parts.append(('\n\n' if parts and base != previous else '') + row['text'])
+                parts.append((ITEM_SEPARATOR if parts and base != previous else '') + row['text'])
                 previous = base
         return ''.join(parts)
 
@@ -120,7 +121,7 @@ class CompletionBatches:
                        final['retry_at'] if final_mutable and final else 0)
         text = self.body(sources)
         if not rebuild and final_mutable and final and text:
-            text = '\n\n' + text  # The immutable prefix belongs to an earlier public item.
+            text = ITEM_SEPARATOR + text  # The immutable prefix belongs to an earlier public item.
         rich = self.delivery.store.get('output_format', 'rich') == 'rich'
         footer = STATUS[group['status']] if final_mutable else ''
         limit = self.delivery.LIMIT - utf16_size('\n\n' + footer) if footer else self.delivery.LIMIT

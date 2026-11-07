@@ -154,7 +154,7 @@ class CompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.cycle()
         rows = await self.drain()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][1], '相同内容\n\n相同内容\n\n✅ 本轮任务已完成。')
+        self.assertEqual(rows[0][1], '相同内容\n\n────────────\n\n相同内容\n\n✅ 本轮任务已完成。')
         self.assertEqual(sum(not silent for _, _, silent, _ in rows), 1)
 
     async def test_live_event_waits_for_history_and_successful_scan_is_not_repeated_without_new_items(self):
