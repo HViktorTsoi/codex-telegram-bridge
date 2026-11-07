@@ -87,7 +87,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.delivery.next_row())
         self.now += 20
         first = self.delivery.next_row()
-        self.assertEqual(first['text'], '第一段等待限流重试\n\n第二段不能提前发送\n\n✅ 本轮任务已完成。')
+        self.assertEqual(first['text'], '第一段等待限流重试\n\n────────────\n\n第二段不能提前发送\n\n✅ 本轮任务已完成。')
         self.mark_sent(first)
         self.assertIsNone(self.delivery.next_row())
 

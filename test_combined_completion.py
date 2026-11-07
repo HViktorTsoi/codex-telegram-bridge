@@ -8,6 +8,7 @@ import test_completion_integration as harness
 
 PNG = harness.PNG
 UNCONFIRMED_TEXT = '⚠️ 部分正文发送结果未获确认，未自动重发；完整记录保留在 Codex，可要求重发。'
+SUBMESSAGE_SEPARATOR = '\n\n────────────\n\n'
 
 
 class CombinedCompletionTests(unittest.IsolatedAsyncioTestCase):
@@ -42,7 +43,7 @@ class CombinedCompletionTests(unittest.IsolatedAsyncioTestCase):
         await self.complete(texts)
         rows = await self.drain()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][1], '\n\n'.join(texts) + '\n\n✅ 本轮任务已完成。')
+        self.assertEqual(rows[0][1], SUBMESSAGE_SEPARATOR.join(texts) + '\n\n✅ 本轮任务已完成。')
         self.assertFalse(rows[0][2])
         self.assertEqual(len(self.formal_calls()), 1)
         self.assertEqual(self.formal_calls()[0][1]['message_thread_id'], 42)
@@ -245,7 +246,7 @@ class CombinedCompletionTests(unittest.IsolatedAsyncioTestCase):
         merged = first['text'] + ''.join(row[1] for row in remaining)
         self.assertEqual(merged.count(UNCONFIRMED_TEXT), 1)
         self.assertIn(UNCONFIRMED_TEXT, remaining[-1][1])
-        self.assertEqual(merged.replace('\n\n' + UNCONFIRMED_TEXT, ''), text + '\n\n✅ 本轮任务已完成。')
+        self.assertEqual(merged.replace(SUBMESSAGE_SEPARATOR + UNCONFIRMED_TEXT, ''), text + '\n\n✅ 本轮任务已完成。')
         self.assertEqual(sum(not row[2] for row in remaining), 1)
         self.restart_delivery()
         self.assertIsNone(self.bridge.delivery.next_row())
@@ -325,7 +326,7 @@ class CombinedCompletionTests(unittest.IsolatedAsyncioTestCase):
         merged = first['text'] + ''.join(row[1] for row in rows)
         self.assertEqual(merged.count(UNCONFIRMED_TEXT), 1)
         self.assertIn(UNCONFIRMED_TEXT, rows[-1][1])
-        self.assertEqual(merged.replace('\n\n' + UNCONFIRMED_TEXT, ''), text + '\n\n✅ 本轮任务已完成。')
+        self.assertEqual(merged.replace(SUBMESSAGE_SEPARATOR + UNCONFIRMED_TEXT, ''), text + '\n\n✅ 本轮任务已完成。')
         self.assertEqual(sum(not row[2] for row in rows), 1)
         self.restart_delivery()
         self.assertIsNone(self.bridge.delivery.next_row())
@@ -344,7 +345,7 @@ class CombinedCompletionTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.drain()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], final['key'])
-        self.assertEqual(rows[0][1], '首次完整正文\n\n限流期间补齐的正文\n\n✅ 本轮任务已完成。')
+        self.assertEqual(rows[0][1], '首次完整正文' + SUBMESSAGE_SEPARATOR + '限流期间补齐的正文\n\n✅ 本轮任务已完成。')
         self.assertFalse(rows[0][2])
         self.restart_delivery()
         self.assertIsNone(self.bridge.delivery.next_row())
@@ -360,7 +361,7 @@ class CombinedCompletionTests(unittest.IsolatedAsyncioTestCase):
         remaining = await self.drain()
         self.assertTrue(all(row[0] != first['key'] for row in remaining))
         self.assertEqual(first['text'] + ''.join(row[1] for row in remaining),
-                         text + '\n\n前段发送之后补充的新条目\n\n✅ 本轮任务已完成。')
+                         text + SUBMESSAGE_SEPARATOR + '前段发送之后补充的新条目\n\n✅ 本轮任务已完成。')
         self.assertEqual(sum(not row[2] for row in remaining), 1)
         self.restart_delivery()
         self.assertIsNone(self.bridge.delivery.next_row())
