@@ -25,14 +25,17 @@ class MainChatGuard:
             CREATE TABLE IF NOT EXISTS main_guard_drafts(
                 id TEXT PRIMARY KEY,chat_id TEXT,album_id TEXT,state TEXT,revision INTEGER,
                 selection_json TEXT,selected_revision INTEGER,panel_id INTEGER,last_at REAL,
-                expires_at REAL,presented_revision INTEGER DEFAULT 0,error TEXT);
+                expires_at REAL,presented_revision INTEGER DEFAULT 0,error TEXT,confirmed_at REAL);
             CREATE TABLE IF NOT EXISTS main_guard_messages(
                 update_id INTEGER PRIMARY KEY,draft_id TEXT,payload TEXT,reply_json TEXT,received_at REAL);
         ''')
+        if 'confirmed_at' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_drafts)')}:
+            self.db.execute('ALTER TABLE main_guard_drafts ADD COLUMN confirmed_at REAL')
+            self.db.commit()
 
     def _save(self, draft_id, **values):
         allowed = {'state', 'revision', 'selection_json', 'selected_revision', 'panel_id', 'last_at',
-                   'expires_at', 'presented_revision', 'error'}
+                   'expires_at', 'presented_revision', 'error', 'confirmed_at'}
         assert values and values.keys() <= allowed
         with self.db:
             self.db.execute('UPDATE main_guard_drafts SET ' + ','.join(k + '=?' for k in values) + ' WHERE id=?',
@@ -167,7 +170,7 @@ class MainChatGuard:
             return await self._closed(update, draft)
         if draft['state'] == 'releasing':
             raise BindingError('这条消息正在投递，请稍后查看；不要重复确认。')
-        targets = [t for t in self.router.targets.values() if not t.get('topic_missing')]
+        targets = self.router.recent.ordered(t for t in self.router.targets.values() if not t.get('topic_missing'))
         pages = max(1, (len(targets) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
         base = {'id': draft['id'], 'revision': draft['revision']}
@@ -182,7 +185,8 @@ class MainChatGuard:
             rows.append(navigation)
         rows.append([('取消', 'main:cancel', base), ('待发送', 'main:list', {})])
         text = ('All · 选择接收会话\n这条消息尚未发送给 Codex。\n\n' + self._preview(draft) +
-                f"\n\n{self.router.config.get('host_id', '本机')} · 第 {page + 1}/{pages} 页\n请选择本机目标，再确认发送。")
+                f"\n\n{self.router.config.get('host_id', '本机')} · 第 {page + 1}/{pages} 页\n"
+                '按最近访问排序。请选择本机目标，再确认发送。')
         if not targets:
             text += '\n暂无可用的已绑定会话，请先通过 /sessions 添加或修复绑定。'
         return await self._panel(update, text, rows, draft)
@@ -263,6 +267,8 @@ class MainChatGuard:
                     raise BindingError('原投递标识已存在或已被拒绝，未覆盖旧任务；请核对后取消并重新发送。')
                 continue
             bridge.store.accept({'update_id': row['update_id']}, message, reply_context=context, guard_binding=binding)
+        self.router.recent.record(target['thread_id'], 'main-guard:' + draft['id'],
+                                  accessed_at=draft['confirmed_at'] if draft['confirmed_at'] is not None else draft['last_at'])
         self._save(draft['id'], state='queued', error=None)
 
     async def handle(self, update, action, data):
@@ -305,7 +311,7 @@ class MainChatGuard:
                 or json.loads(draft['selection_json'] or 'null') != data.get('target')):
             raise BindingError('确认目标已变化，请重新选择并确认。')
         self._validate(data['target'])
-        self._save(draft['id'], state='releasing')
+        self._save(draft['id'], state='releasing', confirmed_at=self.clock())
         try:
             self._release(self._draft(draft['id']))
         except BindingError as error:

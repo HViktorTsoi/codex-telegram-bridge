@@ -531,8 +531,8 @@ class ControlCenter:
                     elif command == '/to' and len(pieces) == 3:
                         await self.dispatch(origin, row['id'], self.resolve(pieces[1]), pieces[2], reply_context=reply_snapshot(origin))
                     else:
-                        entries = [e for e in self.view()[0] if e.get('target_key')]
-                        await self.panel(origin, '选择目标，再回复弹出的派单消息；也可发送 @别名 任务内容。',
+                        entries = self.router.recent.ordered([e for e in self.view()[0] if e.get('target_key')])
+                        await self.panel(origin, '按最近访问排序。选择目标，再回复弹出的派单消息；也可发送 @别名 任务内容。',
                                          [[(e['host'] + '/' + clean(e['name'], 30), 'prompt', self.ref(e))] for e in entries[:30]])
             state = 'done'
         except (ValueError, RpcError, TelegramError, ConnectionError, OSError, asyncio.TimeoutError) as error:
@@ -580,6 +580,8 @@ class ControlCenter:
         message = {'from': {'id': int(self.router.owner)}, 'chat': {'id': int(self.router.owner), 'type': 'private'},
                    'message_thread_id': target['message_thread_id'], 'text': request['text']}
         store.accept({'update_id': inbox_id}, message, reply_context=request.get('reply_context'))
+        self.router.recent.record(target['thread_id'], 'dispatch:' + row['id'],
+                                  accessed_at=request.get('created') or row['updated'])
         with self.db:
             self.db.execute("UPDATE cc_deliveries SET state='queued',updated=? WHERE id=?", (time.time(), row['id']))
         return True

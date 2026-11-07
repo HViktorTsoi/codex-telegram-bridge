@@ -118,6 +118,16 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.nodes[host].store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
             self.assertEqual(self.nodes[host].store.db.execute('SELECT COUNT(*) FROM ui_jobs').fetchone()[0], 0)
 
+    async def test_dispatch_target_chooser_uses_recent_user_access_order(self):
+        node = self.nodes['A']
+        node.recent.record('A-native', 'use-manager', 100)
+        node.recent.record('A-paper', 'use-paper', 200)
+        _, panel = await self.send('A', '/to', topic=None)
+        labels = [b['text'] for row in panel['reply_markup']['inline_keyboard'] for b in row]
+        self.assertIn('论文', labels[0])
+        self.assertIn('Manager', labels[1])
+        self.assertEqual(node.recent.last('A-paper'), 200)
+
     async def test_alias_is_local_and_foreign_qualified_alias_is_rejected(self):
         await self.send('A', '@paper 检查')
         await self.send('A', '@B/paper 不应派单')

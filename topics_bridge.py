@@ -314,7 +314,7 @@ class RouterStore:
             CREATE TABLE IF NOT EXISTS jobs(
                 id INTEGER PRIMARY KEY,target_key TEXT,thread_id TEXT,topic_id INTEGER,
                 chat_id TEXT,message_id INTEGER,message_json TEXT,
-                error TEXT,state TEXT DEFAULT 'pending');
+                error TEXT,state TEXT DEFAULT 'pending',received_ms INTEGER);
             CREATE TABLE IF NOT EXISTS albums(
                 chat_id TEXT,media_group_id TEXT,target_key TEXT,thread_id TEXT,topic_id INTEGER,
                 PRIMARY KEY(chat_id,media_group_id));
@@ -323,6 +323,8 @@ class RouterStore:
                 message_id INTEGER,attempts INTEGER DEFAULT 0,retry_at REAL DEFAULT 0);
         """)
         with self.db:
+            if 'received_ms' not in {row[1] for row in self.db.execute('PRAGMA table_info(jobs)')}:
+                self.db.execute('ALTER TABLE jobs ADD COLUMN received_ms INTEGER')
             self.db.execute("INSERT OR IGNORE INTO kv VALUES('offset',?)", (str(initial_offset),))
 
     def offset(self):
@@ -342,11 +344,11 @@ class RouterStore:
                         self.db.execute("INSERT INTO albums VALUES(?,?,?,?,?)",
                                         (*key, target["key"], target["thread_id"], topic_id))
                 self.db.execute(
-                    "INSERT OR IGNORE INTO jobs(id,target_key,thread_id,topic_id,chat_id,message_id,message_json,error) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
+                    "INSERT OR IGNORE INTO jobs(id,target_key,thread_id,topic_id,chat_id,message_id,message_json,error,received_ms) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
                     (update["update_id"], target["key"] if target else None,
                      target["thread_id"] if target else None, topic_id, str(message["chat"]["id"]),
-                     message.get("message_id"), json.dumps(message, ensure_ascii=False), error))
+                     message.get("message_id"), json.dumps(message, ensure_ascii=False), error, now_ms()))
             self.db.execute("UPDATE kv SET value=? WHERE key='offset'",
                             (str(max(self.offset(), update["update_id"] + 1)),))
 
@@ -388,6 +390,9 @@ class TopicRouter:
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.bridges[key] = TargetBridge(config, path, target, self.sessions_text)
             self.bridges[key].on_missing_topic = self.mark_topic_missing
+        from recent_sessions import RecentSessions
+        self.recent = RecentSessions(self.store.db)
+        self.recent.bootstrap(self.bridges.values())
         self.username, self.last_poll_at, self.last_error = None, None, None
         self.telegram = None
         self.bot_id = None
@@ -419,6 +424,9 @@ class TopicRouter:
 
     def ingest(self, update):
         if self.picker.creator.is_reply(update):
+            self.picker.ingest(update)
+            return
+        if self.picker.renamer.is_reply(update):
             self.picker.ingest(update)
             return
         if self.picker.guard.ingest(update):
@@ -458,7 +466,19 @@ class TopicRouter:
                 with self.store.db:
                     self.store.db.execute("UPDATE jobs SET state='blocked' WHERE id=?", (row["id"],))
                 return True
-            target.store.accept({"update_id": row["id"]}, json.loads(row["message_json"]))
+            message = json.loads(row["message_json"])
+            target.store.accept({"update_id": row["id"]}, message)
+            command = command_of(message)
+            if not command.startswith('/') or command in {'/status', '/model', '/effort', '/format', '/stop'}:
+                received = row['received_ms']
+                if received is not None:
+                    accessed_at = received / 1000
+                else:
+                    # Old router jobs have no receipt column. Prefer their source
+                    # timestamp, then the durable child receipt, never replay-now.
+                    child = target.store.db.execute('SELECT received_ms FROM inbox WHERE id=?', (row['id'],)).fetchone()
+                    accessed_at = message.get('date') or ((child[0] or 0) / 1000 if child else 0)
+                self.recent.record(row['thread_id'], 'telegram:' + str(row['id']), accessed_at)
         self.store.finish(row)
         return True
 
@@ -626,6 +646,59 @@ class TopicRouter:
             self.root_target = updated
         self.picker.operation(target['thread_id'], updated, 'missing')
 
+    def rename_target(self, key, binding, old_name, new_name):
+        """Commit a name-only change without rebinding or restarting the session."""
+        target = self.targets.get(key)
+        bridge = self.bridges.get(key)
+        if (not target or not bridge or target.get('topic_missing')
+                or {field: target[field] for field in ('key', 'thread_id', 'message_thread_id')} != binding
+                or bridge.thread_id != binding['thread_id']
+                or target['name'] not in (old_name, new_name)):
+            raise ValueError('Session binding or name changed before metadata commit')
+        if any(t['key'] != key and t['name'].casefold() == new_name.casefold() for t in self.targets.values()):
+            raise ValueError('Another bound session already uses that name')
+        updated = {**target, 'name': new_name}
+        self.persist_targets({**self.targets, key: updated})
+        self.targets[key] = updated
+        bridge.target = updated
+        self.by_topic[updated['message_thread_id']] = updated
+        if key == self.config['root_target']:
+            self.root_target = updated
+        with self.store.db:
+            row = self.store.db.execute('SELECT target_json FROM binding_ops WHERE thread_id=?',
+                                        (updated['thread_id'],)).fetchone()
+            if row:
+                saved = json.loads(row['target_json'])
+                saved['name'] = new_name
+                self.store.db.execute('UPDATE binding_ops SET target_json=?,updated_at=? WHERE thread_id=?',
+                                      (json.dumps(saved, ensure_ascii=False), time.time(), updated['thread_id']))
+            for row in self.store.db.execute('SELECT id,payload FROM ui_catalogs').fetchall():
+                groups = json.loads(row['payload'])
+                changed = False
+                for group in groups:
+                    for thread in group['threads']:
+                        if thread['id'] == updated['thread_id']:
+                            thread['name'] = new_name
+                            changed = True
+                if changed:
+                    self.store.db.execute('UPDATE ui_catalogs SET payload=? WHERE id=?',
+                                          (json.dumps(groups, ensure_ascii=False), row['id']))
+        # Keep name-derived aliases usable immediately, without waiting for the
+        # next native snapshot or making history/model requests just to rename.
+        from control_center import alias, clean, read_json, write_json
+        path = self.state_dir / 'control/local.json'
+        snapshot = read_json(path, {'host': self.control.host, 'generated': 0, 'entries': []})
+        entry = next((e for e in snapshot.get('entries', []) if e.get('thread_id') == updated['thread_id']), None)
+        if entry is None:
+            entry = {'host': self.control.host, 'thread_id': updated['thread_id'],
+                     'target_key': key, 'topic_id': updated['message_thread_id'], 'status': {}, 'updated': 0}
+            snapshot.setdefault('entries', []).append(entry)
+        entry['name'] = clean(new_name, 50)
+        entry.update(target_key=key, topic_id=updated['message_thread_id'], topic_missing=False)
+        entry['aliases'] = list(dict.fromkeys([*(alias(a) for a in updated.get('aliases', [])),
+                                              alias(entry['name']), key]))
+        write_json(path, snapshot)
+
     async def install_target(self, target, replace_topic=False, expected_topic_id=None):
         # The recorded topic is reused after a crash; this method never creates one.
         replacing = None
@@ -686,7 +759,8 @@ class TopicRouter:
                 raise RuntimeError("Bot already has a webhook; leaving it unchanged")
             scope = {'type': 'chat', 'chat_id': int(self.owner)}
             from control_center import COMMANDS
-            commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'}, *COMMANDS]
+            commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'},
+                        {'command': 'rename', 'description': '修改会话名称，同步话题名称'}, *COMMANDS]
             if await self.telegram.call('getMyCommands', scope=scope) != commands:
                 await self.telegram.call('setMyCommands', scope=scope, commands=commands)
             self.failure = asyncio.get_running_loop().create_future()
