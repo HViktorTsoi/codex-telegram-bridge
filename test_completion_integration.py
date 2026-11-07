@@ -153,7 +153,8 @@ class CompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.finish_turn(self.turns[0])
         await self.cycle()
         rows = await self.drain()
-        self.assertEqual([text for key, text, _, _ in rows if key.startswith('turn:')], ['相同内容', '相同内容'])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], '相同内容\n\n相同内容\n\n✅ 本轮任务已完成。')
         self.assertEqual(sum(not silent for _, _, silent, _ in rows), 1)
 
     async def test_live_event_waits_for_history_and_successful_scan_is_not_repeated_without_new_items(self):
@@ -367,8 +368,9 @@ class CompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         calls = self.formal_calls()
         self.assertTrue(any(method == 'sendPhoto' for method, _ in calls))
         self.assertTrue(any(method == 'sendRichMessage' for method, _ in calls))
-        self.assertTrue(any(method == 'sendMessage' and params.get('disable_notification') for method, params in calls))
-        self.assertTrue(all(params.get('disable_notification') for method, params in calls[:-1]))
+        self.assertTrue(any(method == 'sendMessage' and not params.get('disable_notification') for method, params in calls))
+        self.assertTrue(calls[0][1].get('disable_notification'))
+        self.assertEqual([method for method, _ in calls], ['sendPhoto', 'sendRichMessage', 'sendMessage'])
         self.assertFalse(calls[-1][1].get('disable_notification', False))
         self.assertEqual(sum(not silent for _, _, silent, _ in rows), 1)
 

@@ -4,12 +4,12 @@ The caller owns native history reads: ``terminal`` only records an intent;
 ``seal`` is proof that the complete terminal history has been collected.
 """
 import asyncio
-import hashlib
 import json
 import secrets
 import time
 
 from message_format import utf16_size
+from completion_batch import CompletionBatches
 
 
 TERMINAL = ('completed', 'failed', 'interrupted')
@@ -43,6 +43,7 @@ class CompletionDelivery:
             CREATE INDEX IF NOT EXISTS completion_receipt_inbox_route
                 ON inbox(chat_id,message_thread_id,received_ms DESC,id DESC);
         ''')
+        self.batches = CompletionBatches(self)
         state = self.state()
         if self.enabled:
             if state.get('route') != self.route() or state.get('enabled') is not True:
@@ -70,14 +71,16 @@ class CompletionDelivery:
         # off. Actual active turns are re-adopted by watch(inProgress); their
         # buffered content and exact destination remain untouched.
         with self.db:
+            self.batches.suppress_notices()
             self.db.execute("UPDATE outbox SET message_id=-1 WHERE message_id IS NULL AND key IN "
                             "(SELECT notice_key FROM completion_turns WHERE notice_state IN ('queued','sending'))")
             self.db.execute("UPDATE completion_turns SET notify=0,notice_state=CASE "
                             "WHEN notice_state='queued' THEN 'suppressed' WHEN notice_state='sending' THEN 'uncertain' "
                             "ELSE notice_state END")
-        self.store.set(self.KEY, json.dumps({'route': self.route(), 'since': self.clock(), 'enabled': True,
-                                           'preview_style': self.preview_style}))
-        self.store.set(self.RECEIPT_KEY, '{}')
+            self.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)',
+                            (self.KEY, json.dumps({'route': self.route(), 'since': self.clock(), 'enabled': True,
+                                                   'preview_style': self.preview_style})))
+            self.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)', (self.RECEIPT_KEY, '{}'))
 
     def _current(self, row):
         return (not self.bridge.target.get('topic_missing')
@@ -178,6 +181,9 @@ class CompletionDelivery:
 
     def _associate(self, row):
         """Return a frozen group, False for unassigned input, or None for controls."""
+        packet_group = self.batches.group(row)
+        if packet_group is not None:
+            return packet_group
         saved = self.db.execute('SELECT * FROM completion_rows WHERE key=?', (row['key'],)).fetchone()
         if saved:
             return self._group(saved['turn_id'], saved['chat_id'], saved['topic_id'])
@@ -233,32 +239,12 @@ class CompletionDelivery:
                 self._associate(row)
 
     def _pending(self, group):
-        return bool(self.db.execute('SELECT 1 FROM outbox o JOIN completion_rows c ON c.key=o.key '
+        return self.batches.pending(group) or bool(self.db.execute('SELECT 1 FROM outbox o JOIN completion_rows c ON c.key=o.key '
                                     'WHERE c.turn_id=? AND c.chat_id=? AND c.topic_id=? AND o.message_id IS NULL LIMIT 1',
                                     (group['turn_id'], group['chat_id'], group['topic_id'])).fetchone())
 
     def _notices(self):
-        for group in self.db.execute("SELECT * FROM completion_turns WHERE stage='ready' AND notify=1 "
-                                     "AND status IN ('completed','failed','interrupted') "
-                                     "AND notice_state IN ('none','queued')").fetchall():
-            if not self._current(group):
-                with self.db:
-                    self.db.execute("UPDATE completion_turns SET notice_state='blocked' WHERE turn_id=? AND chat_id=? AND topic_id=?",
-                                    (group['turn_id'], group['chat_id'], group['topic_id']))
-                continue
-            if self._pending(group):
-                continue
-            digest = hashlib.sha256(json.dumps([group['turn_id'], group['chat_id'], group['topic_id']]).encode()).hexdigest()[:24]
-            base = 'completion-notice:' + digest
-            full = f"{base}:topic:{group['topic_id']}:0"
-            with self.db:
-                self.db.execute("UPDATE completion_turns SET notice_state='queued',notice_key=? "
-                                'WHERE turn_id=? AND chat_id=? AND topic_id=?',
-                                (full, group['turn_id'], group['chat_id'], group['topic_id']))
-            text = {'completed': '✅ 本轮任务已完成。',
-                    'failed': '❌ 本轮任务执行失败，请查看上方过程和 Codex 会话。',
-                    'interrupted': '⏹ 本轮任务已停止。'}[group['status']]
-            self.store.enqueue_at(base, group['chat_id'], text, group['topic_id'])
+        self.batches.prepare()
 
     def next_row(self):
         if not self.enabled:
@@ -288,6 +274,12 @@ class CompletionDelivery:
                     continue
                 if group['stage'] != 'ready':
                     continue
+                if group['notify']:
+                    packet = self.batches.group(row)
+                    if packet is None and row['media_json'] is None:
+                        continue  # Canonical text is delivered by its aggregate.
+                    if packet is not None and self.batches.media_pending(group):
+                        continue
             order = ((group['turn_id'], group['chat_id'], group['topic_id']) if group is not None
                      else (row['key'].rsplit(':', 1)[0], row['chat_id'], row['message_thread_id']))
             if order in blocked:
@@ -299,15 +291,17 @@ class CompletionDelivery:
         return None
 
     def silent(self, row):
-        return self.enabled and self._task_key(row['key'])
+        return self.enabled and (self._task_key(row['key']) or row['key'].startswith('completion-part:'))
 
     def begin(self, row):
         if self.enabled:
+            self.batches.begin(row)
             with self.db:
                 self.db.execute("UPDATE completion_turns SET notice_state='sending' WHERE notice_key=? AND notice_state='queued'", (row['key'],))
 
     def sent(self, row, message_id):
         if self.enabled:
+            self.batches.sent(row)
             with self.db:
                 self.db.execute("UPDATE completion_turns SET notice_state='sent' WHERE notice_key=?", (row['key'],))
 
@@ -315,6 +309,8 @@ class CompletionDelivery:
         """Handle completion-notice errors; True bypasses the sender's fallback."""
         if not self.enabled:
             return False
+        if self.batches.failed(row, error):
+            return True
         group = self.db.execute('SELECT * FROM completion_turns WHERE notice_key=?', (row['key'],)).fetchone()
         if group is None:
             return False
@@ -332,6 +328,7 @@ class CompletionDelivery:
 
     def recover(self):
         if self.enabled:
+            self.batches.recover()
             with self.db:
                 self.db.execute("UPDATE completion_turns SET notice_state='sent' WHERE notice_state='sending' AND notice_key IN "
                                 '(SELECT key FROM outbox WHERE message_id>0)')
