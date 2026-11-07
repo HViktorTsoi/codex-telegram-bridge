@@ -72,6 +72,25 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.delivery.next_row())
         self.assertEqual(len(self.all_outbox()), 2)
 
+    async def test_retry_keeps_a_turns_output_order_without_blocking_explicit_controls(self):
+        self.delivery.watch(self.turn())
+        self.output('第一段等待限流重试', 'turn:work:first')
+        self.output('第二段不能提前发送', 'turn:work:second')
+        self.output('独立的状态查询结果', 'input:7:reply')
+        self.delivery.seal(self.turn('completed'))
+        with self.store.db:
+            self.store.db.execute('UPDATE outbox SET retry_at=? WHERE key=?',
+                                  (self.now + 20, self.all_outbox()[0]['key']))
+        command = self.delivery.next_row()
+        self.assertEqual(command['text'], '独立的状态查询结果')
+        self.mark_sent(command)
+        self.assertIsNone(self.delivery.next_row())
+        self.now += 20
+        first = self.delivery.next_row()
+        self.assertEqual(first['text'], '第一段等待限流重试')
+        self.mark_sent(first)
+        self.assertEqual(self.delivery.next_row()['text'], '第二段不能提前发送')
+
     async def test_terminal_event_does_not_release_before_full_scan_seal(self):
         self.delivery.watch(self.turn())
         self.output()

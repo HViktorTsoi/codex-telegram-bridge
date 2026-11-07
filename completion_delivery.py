@@ -235,13 +235,14 @@ class CompletionDelivery:
             return self.db.execute('SELECT * FROM outbox WHERE message_id IS NULL ORDER BY rowid LIMIT 1').fetchone()
         self._sync_rows()
         self._notices()
-        for row in self.db.execute('SELECT * FROM outbox WHERE message_id IS NULL AND retry_at<=? ORDER BY rowid',
-                                   (self.clock(),)).fetchall():
+        blocked = set()
+        for row in self.db.execute('SELECT * FROM outbox WHERE message_id IS NULL ORDER BY rowid').fetchall():
             notice = self.db.execute('SELECT * FROM completion_turns WHERE notice_key=?', (row['key'],)).fetchone()
             if notice:
                 # Late terminal items and image-error notices must go first even
                 # if the completion notification was already durably queued.
-                if notice['notice_state'] == 'queued' and self._current(notice) and not self._pending(notice):
+                if (notice['notice_state'] == 'queued' and self._current(notice)
+                        and not self._pending(notice) and row['retry_at'] <= self.clock()):
                     return row
                 if not self._current(notice):
                     with self.db:
@@ -257,6 +258,13 @@ class CompletionDelivery:
                     continue
                 if group['stage'] != 'ready':
                     continue
+            order = ((group['turn_id'], group['chat_id'], group['topic_id']) if group is not None
+                     else (row['key'].rsplit(':', 1)[0], row['chat_id'], row['message_thread_id']))
+            if order in blocked:
+                continue
+            if row['retry_at'] > self.clock():
+                blocked.add(order)
+                continue
             return row
         return None
 
