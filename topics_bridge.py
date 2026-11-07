@@ -145,7 +145,7 @@ class TargetBridge(Bridge):
         self.codex = ExactCodex(config["socket_path"], self.thread_id)
         self.target, self.sessions_text = target, sessions_text
         self.on_missing_topic = None
-        self.activity = TopicActivity(self.store)
+        self.activity = TopicActivity(self.store, position=target.get('activity_position', config.get('activity_position', 'bottom')))
         self.mirror = NativeMirror(self.store)
 
     def mirror_allowed(self):
