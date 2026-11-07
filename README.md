@@ -7,12 +7,13 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.8.2 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.9.0 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
 只有我明确选择 /sessions 的“新建会话”并确认时，才调用 thread/start；新会话使用本机默认模型和权限，创建本身不调用模型生成。
 总览、Inbox 和派单只管理本机会话，不配置任何跨机器同步或路由。
+All 中的普通消息默认必须选择接收会话并确认后才投递；不要恢复为自动转给默认或最近会话。明确 @别名、/to 和系统指令沿用原流程。
 使用独立 Bot 和私有配置目录，避免与已有实例争用同一个 Token；将访问策略设为仅允许本人 Telegram 用户 ID。
 按需引导我开启 BotFather Threaded Mode；多会话模式应创建真实 Telegram 话题并保存返回的 topic ID，替换示例里的占位值。
 在 BotFather 开启 Disallow users to create new threads，保留 Threaded Mode，让管理命令能留在主对话而不会被客户端自动建话题。
@@ -30,6 +31,7 @@
 - Telegram 引用回复附带易读的原消息正文和选中片段，帮助 Codex 理解“改这里”等指代。
 - Codex 回复中的明确本机图片链接会上传为真实 Telegram 图片，支持 PNG、JPEG、WebP、GIF，适用于二维码、截图和图表；不依赖 `/format rich`。
 - 一个私聊内用不同话题连接不同 Codex 会话。
+- All 防误发：普通文字、图片、文件及相册先暂存，选择本机会话、核对并确认后才发送；未确认时不调用模型。
 - `/sessions` 按钮流程：按名称和工作目录查看本机会话 → 选择 → 核对完整 ID → 确认绑定到新话题。
 - `/sessions` →“新建会话”：按钮浏览本机文件夹、输入路径或新建文件夹，填写名称并确认后创建空 Codex 会话并连接新话题。
 - 已绑定会话可通过按钮重新创建话题，恢复删除后的入口。
@@ -92,11 +94,21 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 创建记录持久化到私有 SQLite：重复点击不会重复创建；创建成功后命名或绑定失败，可在 `/sessions` 首页点击“继续处理”沿用已记录的新会话 ID。若 `thread/start` 或 `createForumTopic` 的返回结果丢失，会提示先核对已有会话或话题，不自动重建。
 
-原私聊入口继续使用 `root_target` 指定的原会话。话题模式、恢复策略和完整配置说明见 [TOPICS.md](TOPICS.md)。
+`root_target` 继续提供原会话及主对话系统指令的上下文；All 普通内容默认先选择并确认目标，再投递到所选话题。话题模式、恢复策略和完整配置说明见 [TOPICS.md](TOPICS.md)。
 
 上述 BotFather 开关阻止 Telegram 客户端在主窗口发送 `/tasks`、`/sessions` 等消息时先自动创建话题。可用 `getMe` 验证 `has_topics_enabled=true`、`allows_users_to_create_topics=false`；此开关需要 Bot 所有者在 BotFather 设置，Bot Token 无法修改。它同时禁止用户手动新建、编辑和删除话题，桥接仍可通过 `/sessions` 创建和重建绑定话题。参见 [Telegram 官方说明](https://core.telegram.org/api/forum#bot-forums)。
 
 话题模式中，`/sessions`、`/tasks`、`/inbox`、`/to`、`/aliases`、`/help`、`/start` 等全局菜单及派单汇总发送到主对话；旧话题里的管理菜单按钮会在下一次操作时转到主对话。`/status`、`/model`、`/effort`、`/format`、`/stop` 作用于输入所在话题对应的原 Codex 会话，查询结果、确认和错误提示均发回输入所在对话；在主对话输入则回复主对话。未知命令及未绑定话题中的会话指令错误也回复原处，未绑定会话不会改投默认目标。发送层只显示正文，不自动添加 `〔会话标题〕` 前缀。普通对话、图片和状态提示继续使用原话题；已有发信队列保留原来保存的位置。
+
+### All 防误发
+
+在 All 输入普通文字或发送附件后，桥接会先展示本机已绑定会话的选择按钮；点击一个会话后，再核对会话名称和消息内容，点击“确认发送”才进入该会话的输入队列。点击“取消”不发送。每条普通消息分别确认，不会记住上次选择，也不会自动投给 Manager 或最近活跃会话。后续回复直接在所选话题显示。
+
+相册会先收齐同组附件再展示一个入口；确认前新到的附件会使旧确认失效，需要重新核对。确认后才到达的后续附件另外暂存，不会自动沿用先前目标。原文字、附件及引用上下文随消息保留；确认前不下载附件、不调用 Codex 模型。
+
+暂存和确认记录持久化，重启后仍可处理；通过 `/sessions` →“待发送”找回未发内容。目标绑定在选择、确认和实际调用模型前都会核对，绑定变化时不自动改投。已有话题内的普通聊天直接进入原会话；斜杠系统指令、明确的文字 `@别名`、`/to` 和既有指定输入提示回复沿用原流程。附件 caption 中的 `/stop`、`@别名` 等只作为附件文字，不执行指令。
+
+`All` 的位置由 Telegram 客户端控制，插件不能在它左侧插入空白标签；防误发流程使用 All 内的普通按钮，不新建空白话题。
 
 ### 图片回传
 

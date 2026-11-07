@@ -35,8 +35,11 @@ Add these fields (the IDs below are placeholders):
 }
 ```
 
-The original top-level `thread_id` must match `root_target`. Messages without a
-topic retain this original binding. `initial_telegram_offset` must come from the
+The original top-level `thread_id` must match `root_target`, which retains the
+original session and main-chat system-command context. Ordinary topic-less All
+messages are held for explicit target selection and final confirmation, rather
+than automatically using that root or the most recent session.
+`initial_telegram_offset` must come from the
 old collector's database after a clean stop with an empty queue; it is used only
 when creating `topics.sqlite` for the first time. Preserve the original database
 and its backups. Do not change a target key to a different native thread: each
@@ -119,6 +122,25 @@ Old management menus migrate to a main-chat panel on their next use, keeping
 the exact message/topic checks on callbacks and ForceReply prompts. Regular
 output and activity indicators keep their original topics; already queued output
 retains its stored destination.
+
+All's ordinary text and media use a durable held-message selector. Each text
+message is independent; an album is grouped after two seconds of quiet. Selecting
+a local bound target shows a preview; only **确认发送** imports the original
+message(s) into that exact native thread/topic queue. No attachment download or
+model request occurs before confirmation. A pre-confirmation late album member
+invalidates the preview; post-confirmation late members require a fresh choice.
+The original content and reply snapshot are retained before rewriting the
+destination topic. Replies stay in the selected topic, without main-chat relay.
+Find held content under `/sessions` → **待发送**. Cancelled, expired or stale UI
+never falls back to the root session. Creator and dispatch ForceReply inputs,
+plain-text explicit aliases and slash commands retain their existing paths.
+Main-chat media captions cannot run slash or alias commands.
+
+The receiver validates guarded input's frozen native thread, target key and topic
+before dispatch and again after attachment preparation. A changed/missing binding
+fails closed. Confirmed import intent is persisted before handoff; original update
+IDs and immutable binding metadata prevent repeat imports after a crash. This
+does not add Telegram tabs or move the client's built-in All entry.
 
 Set `native_mirror: true` globally or per target to mirror new user inputs and public
 agent replies from native client turns. It defaults to off and

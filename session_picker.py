@@ -51,6 +51,8 @@ class SessionPicker:
         ''')
         from session_creator import SessionCreator
         self.creator = SessionCreator(self)
+        from main_guard import MainChatGuard
+        self.guard = MainChatGuard(self)
 
     def ingest(self, update):
         callback = update.get('callback_query')
@@ -128,12 +130,15 @@ class SessionPicker:
             lines.append(f"{number}. {clean_name(target['name'], 40)}（{status}）\n目录：{directory}")
         if len(self.router.targets) > len(targets):
             lines.append('更多会话请点击“添加会话”查看。')
-        lines.append('原私聊入口继续连接「' + clean_name(self.router.root_target['name'], 40) + '」。')
+        lines.append('All 是管理入口；普通消息需选择并确认接收会话。')
         text = '\n\n'.join(lines) + '\n\n点击“添加会话”，选择本机已有的 Codex 会话并绑定到新话题。'
         text += '\n点击已绑定会话可管理或重新创建其话题入口。'
         rows = [[(f"{number}. {clean_name(t['name'], 40)}", 'select', {'thread_id': t['thread_id']})]
                 for number, t in enumerate(targets, 1)]
         rows.extend([[('➕ 添加会话', 'catalog', {}), ('🆕 新建会话', 'new:start', {})]])
+        count = self.guard.pending_count()
+        if count:
+            rows.append([(f'📨 待发送（{count}）', 'main:list', {})])
         for draft in self.creator.unfinished(self.router.owner):
             rows.append([('继续处理：' + clean_name(draft['name'] or '未确认的新会话', 30),
                           'new:resume', {'id': draft['id']})])
@@ -385,6 +390,9 @@ class SessionPicker:
             with self.db:
                 self.db.execute("UPDATE ui_jobs SET state='denied' WHERE id=?", (job['id'],))
             return True
+        update = json.loads(job['payload'])
+        if not update.get('callback_query') and self.guard.is_message(update) and not self.guard.ready(update):
+            return False
         with self.db:
             self.db.execute("UPDATE ui_jobs SET state='processing' WHERE id=?", (job['id'],))
         update = json.loads(job['payload'])
@@ -393,6 +401,8 @@ class SessionPicker:
             if not callback:
                 if self.creator.is_reply(update):
                     await self.creator.reply(update)
+                elif self.guard.is_message(update):
+                    await self.guard.present(update)
                 else:
                     await self.home(update)
             else:
@@ -410,6 +420,8 @@ class SessionPicker:
                 data, action = json.loads(button['data']), button['action']
                 if action.startswith('new:'):
                     await self.creator.handle(update, action, data)
+                elif action.startswith('main:'):
+                    await self.guard.handle(update, action, data)
                 elif action == 'home':
                     await self.home(update)
                 elif action == 'catalog':
@@ -450,6 +462,7 @@ class SessionPicker:
 
     async def recover(self):
         self.creator.recover()
+        self.guard.recover()
         with self.db:
             self.db.execute("UPDATE ui_jobs SET state='pending' WHERE state='processing'")
             # createForumTopic has no idempotency key; an interrupted call needs review.

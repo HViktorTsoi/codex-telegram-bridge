@@ -84,6 +84,7 @@ class RoutedStore(Store):
         super().__init__(path)
         for table, name, kind in (("inbox", "message_thread_id", "INTEGER"),
                                   ("inbox", "source_message_id", "INTEGER"),
+                                  ("inbox", "main_guard_json", "TEXT"),
                                   ("outbox", "message_thread_id", "INTEGER")):
             columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
             if name not in columns:
@@ -94,17 +95,18 @@ class RoutedStore(Store):
             raise ValueError("Target queue is bound to another native thread")
         self.set("bound_thread_id", thread_id)
 
-    def accept(self, update, message=None, *, reply_context=None):
+    def accept(self, update, message=None, *, reply_context=None, guard_binding=None):
         with self.db:
             if message is not None:
                 self.db.execute(
                     "INSERT OR IGNORE INTO inbox(id,chat_id,text,received_ms,client_id,message_json,"
-                    "media_group_id,message_thread_id,source_message_id,reply_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "media_group_id,message_thread_id,source_message_id,reply_json,main_guard_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (update["update_id"], str(message["chat"]["id"]),
                      message.get("text") or message.get("caption", ""), now_ms(),
                      "telegram-" + str(update["update_id"]), json.dumps(payload_from(message), ensure_ascii=False),
                      str(message["media_group_id"]) if message.get("media_group_id") else None,
-                     topic_of(message), message.get("message_id"), reply_serialized(message, reply_context)),
+                     topic_of(message), message.get("message_id"), reply_serialized(message, reply_context),
+                     json.dumps(guard_binding, sort_keys=True) if guard_binding else None),
                 )
             self.db.execute("INSERT OR REPLACE INTO kv VALUES('offset',?)",
                             (str(max(int(self.get("offset", 0)), update["update_id"] + 1)),))
@@ -148,6 +150,27 @@ class TargetBridge(Bridge):
         self.activity = TopicActivity(self.store, position=target.get('activity_position', config.get('activity_position', 'bottom')))
         self.mirror = NativeMirror(self.store)
 
+    def validate_destination(self, rows):
+        for row in rows:
+            if not row['main_guard_json']:
+                continue
+            try:
+                expected = json.loads(row['main_guard_json'])
+                valid = (expected['target_key'] == self.target['key']
+                         and expected['thread_id'] == self.thread_id
+                         and expected['thread_id'] == self.target['thread_id']
+                         and expected['topic_id'] == self.target['message_thread_id']
+                         and row['message_thread_id'] == expected['topic_id']
+                         and not self.target.get('topic_missing'))
+            except (ValueError, TypeError, KeyError):
+                valid = False
+            if not valid:
+                self.store.mark_batch(rows, 'failed')
+                self.store.enqueue_at(f"main-guard-rejected:{rows[0]['id']}", rows[0]['chat_id'],
+                                      '所选会话的绑定已变化，这条 All 消息尚未执行。请重新发送并选择目标会话。', None)
+                return False
+        return True
+
     def mirror_allowed(self):
         return (self.target.get('native_mirror', self.config.get('native_mirror', False))
                 and self.owner_allowed() and not self.target.get('topic_missing'))
@@ -175,10 +198,13 @@ class TargetBridge(Bridge):
     async def dispatch_one(self, row):
         if not self.owner_allowed():
             return await super().dispatch_one(row)
+        if not self.validate_destination(self.store.batch(row)):
+            return
         command = command_of({"text": row["text"], **json.loads(row["message_json"] or "{}")})
         reply = None
         if command in {"/help", "/start", "/sessions"}:
             reply = (self.sessions_text() + "\n\n进入对应话题即可继续原会话。\n"
+                     "All 普通消息先选择接收会话，再确认发送；/sessions → 待发送可找回未发内容。\n"
                      "/sessions 查看会话并添加绑定\n"
                      "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
                      "/status 查看此会话及完整 ID\n/model 查看或切换此会话模型\n"
@@ -388,12 +414,14 @@ class TopicRouter:
             ready = self.bridges.get(key) and self.bridges[key].ready.is_set()
             state = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
             lines.append(f"• {target['name']}（{state}）")
-        lines.append("原私聊入口继续连接「" + self.root_target['name'] + "」。")
+        lines.append("All 是管理入口；普通消息需选择并确认接收会话。")
         return "\n".join(lines)
 
     def ingest(self, update):
         if self.picker.creator.is_reply(update):
             self.picker.ingest(update)
+            return
+        if self.picker.guard.ingest(update):
             return
         if self.control.ingest(update):
             return
@@ -499,6 +527,7 @@ class TopicRouter:
                 "blocked_inputs": self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state='blocked'").fetchone()[0],
                 "targets": targets, "ui_pending": ui_pending,
                 "bindings_waiting_review": self.store.db.execute("SELECT COUNT(*) FROM binding_ops WHERE status='uncertain'").fetchone()[0], **counts}
+        data['main_messages_waiting_confirmation'] = self.picker.guard.pending_count()
         tmp = self.state_dir / "health.json.tmp"
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         tmp.replace(self.state_dir / "health.json")
