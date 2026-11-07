@@ -366,12 +366,15 @@ class CompletionDelivery:
         if utf16_size(text) > self.LIMIT:
             note = '\n\n（过程较长，预览仅显示最近部分；完整过程将在完成后发送。）\n\n'
             text = header + note + self._tail(body, self.LIMIT - utf16_size(header + note))
+        # Telegram animates updates that reuse a draft ID. A new ID replaces
+        # the one temporary preview immediately, including status-only refreshes.
+        draft_id = group['draft_id'] % (2 ** 31 - 1) + 1
         with self.db:
-            self.db.execute('UPDATE completion_turns SET next_preview=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
-                            (self.clock() + self.INTERVAL, group['turn_id'], group['chat_id'], group['topic_id']))
+            self.db.execute('UPDATE completion_turns SET next_preview=?,draft_id=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
+                            (self.clock() + self.INTERVAL, draft_id, group['turn_id'], group['chat_id'], group['topic_id']))
         try:
             result = await telegram.call('sendMessageDraft', chat_id=int(group['chat_id']),
-                                         message_thread_id=group['topic_id'], draft_id=group['draft_id'], text=text)
+                                         message_thread_id=group['topic_id'], draft_id=draft_id, text=text)
             if result is not True:
                 raise ConnectionError('Draft acknowledgement unavailable')
         except Exception as error:
