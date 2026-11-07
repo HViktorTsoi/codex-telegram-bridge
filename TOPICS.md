@@ -211,6 +211,22 @@ Omitting it, or setting `"all"`, preserves the original immediate-delivery
 behavior. This option is specific to topic mode and leaves single-chat instances
 unchanged.
 
+After a new task input commits to the durable inbox, a receipt event wakes a
+separate preview loop. It attempts a received/preparing draft without waiting
+for native readiness, attachment preparation, `turn/start`, a first reply or a
+history scan, and runs outside the native dispatch/reconciliation locks. The
+receipt uses the real inbox identity and exact native/chat/topic route; it does
+not create a synthetic native turn or completion record. Disconnected and
+uncertain deliveries receive accurate waiting/checking labels. Existing active
+progress remains visible when more input arrives, and the real turn takes over
+the receipt's draft identity. Receipt and ordinary preview updates share a send
+lock to prevent an older response from overwriting newer progress. Direct topic
+input, confirmed All input and imported dispatches follow this path; commands,
+empty or unauthorized input and unconfirmed All drafts do not. The first attempt
+is independent of model output, while visible latency still depends on Telegram
+and the network. Subsequent refreshes keep the 15-second cadence and existing
+completion-only notification rule.
+
 During an active turn, one temporary draft combines a two-line status header
 and cumulative visible text, refreshing about every 15 seconds. Ordinary status
 cards are neither created nor moved. The preview is bounded

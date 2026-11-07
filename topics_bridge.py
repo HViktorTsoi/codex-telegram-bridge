@@ -83,6 +83,7 @@ class RoutedStore(Store):
 
     def __init__(self, path, thread_id):
         super().__init__(path)
+        self.on_input = None
         for table, name, kind in (("inbox", "message_thread_id", "INTEGER"),
                                   ("inbox", "source_message_id", "INTEGER"),
                                   ("inbox", "main_guard_json", "TEXT"),
@@ -97,9 +98,10 @@ class RoutedStore(Store):
         self.set("bound_thread_id", thread_id)
 
     def accept(self, update, message=None, *, reply_context=None, guard_binding=None):
+        inserted = False
         with self.db:
             if message is not None:
-                self.db.execute(
+                inserted = bool(self.db.execute(
                     "INSERT OR IGNORE INTO inbox(id,chat_id,text,received_ms,client_id,message_json,"
                     "media_group_id,message_thread_id,source_message_id,reply_json,main_guard_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (update["update_id"], str(message["chat"]["id"]),
@@ -108,9 +110,11 @@ class RoutedStore(Store):
                      str(message["media_group_id"]) if message.get("media_group_id") else None,
                      topic_of(message), message.get("message_id"), reply_serialized(message, reply_context),
                      json.dumps(guard_binding, sort_keys=True) if guard_binding else None),
-                )
+                ).rowcount)
             self.db.execute("INSERT OR REPLACE INTO kv VALUES('offset',?)",
                             (str(max(int(self.get("offset", 0)), update["update_id"] + 1)),))
+        if inserted and self.on_input is not None:
+            self.on_input()
 
     def turn_routes(self, turn_id):
         return self.db.execute(
@@ -152,6 +156,8 @@ class TargetBridge(Bridge):
         self.mirror = NativeMirror(self.store)
         from completion_delivery import CompletionDelivery
         self.delivery = CompletionDelivery(self)
+        self.receipt_event = asyncio.Event()
+        self.store.on_input = self.receipt_event.set
         self.store.db.execute('''CREATE TABLE IF NOT EXISTS completion_ready_items(
             turn_id TEXT,fingerprint TEXT,pending INTEGER DEFAULT 1,PRIMARY KEY(turn_id,fingerprint))''')
         if 'pending' not in {r[1] for r in self.store.db.execute('PRAGMA table_info(completion_ready_items)')}:
@@ -320,9 +326,24 @@ class TargetBridge(Bridge):
                 accepted = self.store.db.execute('SELECT turn_id,state FROM inbox WHERE id=?', (row['id'],)).fetchone()
                 if accepted and accepted['turn_id'] and accepted['state'] == 'running':
                     self.delivery.watch({'id': accepted['turn_id'], 'status': 'inProgress'})
+                self.receipt_event.set()
             return result
         self.store.enqueue(f"input:{row['id']}:reply", row["chat_id"], reply)
         self.store.mark_batch(self.store.batch(row), "done")
+
+    async def send_one(self, row):
+        """Deliver one eligible row while the caller owns the preview lock."""
+        self.delivery.begin(row)
+        self.store.images.begin(row)
+        sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
+                                 rich_text=row['rich_text'], topic_id=row['message_thread_id'], media_json=row['media_json'],
+                                 disable_notification=self.delivery.silent(row) if self.delivery.enabled else None)
+        self.store.images.sent(row, sent['message_id'])
+        self.delivery.sent(row, sent['message_id'])
+        if self.delivery.enabled and row['key'].startswith('completion-notice:'):
+            self.delivery.reschedule_receipt()
+            self.receipt_event.set()
+        LOG.info("Sent target %s message %s", self.target["key"], sent["message_id"])
 
     async def sender_loop(self):
         self.store.images.recover()
@@ -333,14 +354,16 @@ class TargetBridge(Bridge):
                 await asyncio.sleep(0.5)
                 continue
             try:
-                self.delivery.begin(row)
-                self.store.images.begin(row)
-                sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
-                                         rich_text=row['rich_text'], topic_id=row['message_thread_id'], media_json=row['media_json'],
-                                         disable_notification=self.delivery.silent(row) if self.delivery.enabled else None)
-                self.store.images.sent(row, sent['message_id'])
-                self.delivery.sent(row, sent['message_id'])
-                LOG.info("Sent target %s message %s", self.target["key"], sent["message_id"])
+                if self.delivery.enabled:
+                    async with self.delivery.preview_lock:
+                        # An in-flight receipt must finish before a real message
+                        # clears it; late rows/permission changes may defer this row.
+                        current = self.delivery.next_row()
+                        if current is None or current['key'] != row['key'] or not self.owner_allowed():
+                            continue
+                        await self.send_one(current)
+                else:
+                    await self.send_one(row)
             except (TelegramError, ConnectionError) as error:
                 if self.delivery.failed(row, error):
                     if topic_missing_error(error) and row['message_thread_id'] and self.on_missing_topic:
@@ -416,6 +439,25 @@ class TargetBridge(Bridge):
         await self.activity.update(self.telegram, chat_id=self.owner,
                                    topic_id=self.target['message_thread_id'], name=self.target['name'],
                                    turns=turns, status=status, connected=connected)
+
+    async def preview_loop(self):
+        """Acknowledge durable input without waiting for native work or history."""
+        self.receipt_event.set()  # Recover still-pending receipts after restart.
+        while True:
+            try:
+                await asyncio.wait_for(self.receipt_event.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                self.receipt_event.clear()
+                await asyncio.sleep(0.1)  # Coalesce a burst of album/input parts.
+                self.receipt_event.clear()
+            if not self.delivery.enabled or self.telegram is None:
+                continue
+            try:
+                await self.delivery.receipt(self.telegram, connected=self.ready.is_set())
+            except (ConnectionError, TelegramError, OSError, asyncio.TimeoutError) as error:
+                LOG.warning('Receipt preview failed (%s)', getattr(error, 'code', type(error).__name__))
 
     async def maintenance_loop(self):
         while True:
@@ -734,6 +776,8 @@ class TopicRouter:
         for coro in (bridge.connection_loop(False), bridge.input_loop(), bridge.event_loop(),
                      bridge.sender_loop(), bridge.maintenance_loop()):
             self.spawn(coro)
+        if bridge.delivery.enabled:
+            self.spawn(bridge.preview_loop())
 
     def persist_targets(self, updated):
         """Compare and atomically persist additions, repairs and unavailable flags."""
