@@ -22,6 +22,9 @@ class CompletionDelivery:
     def __init__(self, bridge, clock=time.time):
         self.bridge, self.store, self.db, self.clock = bridge, bridge.store, bridge.store.db, clock
         self.enabled = bridge.target.get('notification_mode', bridge.config.get('notification_mode', 'all')) == 'completion'
+        self.preview_style = bridge.target.get('preview_style', bridge.config.get('preview_style', 'plain'))
+        if self.preview_style not in ('plain', 'block'):
+            raise ValueError('preview_style must be plain or block')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS completion_turns(
                 turn_id TEXT,chat_id TEXT,topic_id INTEGER,native_id TEXT,
@@ -36,6 +39,14 @@ class CompletionDelivery:
         if self.enabled:
             if state.get('route') != self.route() or state.get('enabled') is not True:
                 self._new_window()
+            else:
+                # A supported renderer may work even if the previous one did
+                # not. Retain the task boundary and all completion ledgers.
+                state = self.state()
+                if state.get('preview_style', 'plain') != self.preview_style:
+                    state['preview_style'] = self.preview_style
+                    state.pop('draft_unsupported', None)
+                    self.store.set(self.KEY, json.dumps(state))
         elif state:
             state['enabled'] = False
             self.store.set(self.KEY, json.dumps(state))
@@ -56,7 +67,8 @@ class CompletionDelivery:
             self.db.execute("UPDATE completion_turns SET notify=0,notice_state=CASE "
                             "WHEN notice_state='queued' THEN 'suppressed' WHEN notice_state='sending' THEN 'uncertain' "
                             "ELSE notice_state END")
-        self.store.set(self.KEY, json.dumps({'route': self.route(), 'since': self.clock(), 'enabled': True}))
+        self.store.set(self.KEY, json.dumps({'route': self.route(), 'since': self.clock(), 'enabled': True,
+                                           'preview_style': self.preview_style}))
 
     def _current(self, row):
         return (not self.bridge.target.get('topic_missing')
@@ -366,15 +378,20 @@ class CompletionDelivery:
         if utf16_size(text) > self.LIMIT:
             note = '\n\n（过程较长，预览仅显示最近部分；完整过程将在完成后发送。）\n\n'
             text = header + note + self._tail(body, self.LIMIT - utf16_size(header + note))
-        # Telegram animates updates that reuse a draft ID. A new ID replaces
-        # the one temporary preview immediately, including status-only refreshes.
-        draft_id = group['draft_id'] % (2 ** 31 - 1) + 1
+        # Keep one ID per task. Client animation is not reliably disabled by
+        # rotating IDs; on supported iPads the rich thinking block displays
+        # this public status/progress as a whole instead of revealing letters.
         with self.db:
-            self.db.execute('UPDATE completion_turns SET next_preview=?,draft_id=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
-                            (self.clock() + self.INTERVAL, draft_id, group['turn_id'], group['chat_id'], group['topic_id']))
+            self.db.execute('UPDATE completion_turns SET next_preview=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
+                            (self.clock() + self.INTERVAL, group['turn_id'], group['chat_id'], group['topic_id']))
         try:
-            result = await telegram.call('sendMessageDraft', chat_id=int(group['chat_id']),
-                                         message_thread_id=group['topic_id'], draft_id=draft_id, text=text)
+            route = {'chat_id': int(group['chat_id']), 'message_thread_id': group['topic_id'],
+                     'draft_id': group['draft_id']}
+            if self.preview_style == 'block':
+                result = await telegram.call('sendRichMessageDraft', **route,
+                                             rich_message={'blocks': [{'type': 'thinking', 'text': text}]})
+            else:
+                result = await telegram.call('sendMessageDraft', **route, text=text)
             if result is not True:
                 raise ConnectionError('Draft acknowledgement unavailable')
         except Exception as error:

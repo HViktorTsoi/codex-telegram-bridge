@@ -266,7 +266,7 @@ class CompletionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.now += 16
         await self.cycle()
         second_preview = self.drafts()[-1]
-        self.assertNotEqual(first_preview['draft_id'], second_preview['draft_id'])
+        self.assertEqual(first_preview['draft_id'], second_preview['draft_id'])
         self.assertEqual(second_preview['message_thread_id'], 42)
         self.assertIn('第一段过程', second_preview['text'])
         self.assertIn('第二段过程', second_preview['text'])
