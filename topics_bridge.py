@@ -317,9 +317,12 @@ class TargetBridge(Bridge):
                      f"ID：{self.thread_id}\n话题：{row['message_thread_id'] or '原私聊入口'}\n"
                      + self.settings_text(settings))
             if self.delivery.enabled:
-                reply += '\n通知：仅整轮任务结束时提醒'
+                reply += ('\n通知：完成后正常提醒；首次状态卡静音'
+                          if self.delivery.preview_style == 'status-card' else '\n通知：仅整轮任务结束时提醒')
                 if self.delivery.preview_style == 'block':
                     reply += '\n预览：整块累计进度'
+                elif self.delivery.preview_style == 'status-card':
+                    reply += '\n预览：独立状态消息＋累计正文草稿'
         if reply is None:
             result = await super().dispatch_one(row)
             if self.delivery.enabled:
@@ -341,6 +344,7 @@ class TargetBridge(Bridge):
         self.store.images.sent(row, sent['message_id'])
         self.delivery.sent(row, sent['message_id'])
         if self.delivery.enabled and row['key'].startswith('completion-notice:'):
+            await self.delivery.complete_status(self.telegram, row)
             self.delivery.reschedule_receipt()
             self.receipt_event.set()
         LOG.info("Sent target %s message %s", self.target["key"], sent["message_id"])

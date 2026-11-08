@@ -10,6 +10,7 @@ import time
 
 from message_format import utf16_size
 from completion_batch import CompletionBatches
+from completion_status import CompletionStatus
 
 
 TERMINAL = ('completed', 'failed', 'interrupted')
@@ -29,8 +30,8 @@ class CompletionDelivery:
         self._preview_status_turn_id = None
         self.enabled = bridge.target.get('notification_mode', bridge.config.get('notification_mode', 'all')) == 'completion'
         self.preview_style = bridge.target.get('preview_style', bridge.config.get('preview_style', 'plain'))
-        if self.preview_style not in ('plain', 'block'):
-            raise ValueError('preview_style must be plain or block')
+        if self.preview_style not in ('plain', 'block', 'status-card'):
+            raise ValueError('preview_style must be plain, block or status-card')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS completion_turns(
                 turn_id TEXT,chat_id TEXT,topic_id INTEGER,native_id TEXT,
@@ -44,6 +45,7 @@ class CompletionDelivery:
                 ON inbox(chat_id,message_thread_id,received_ms DESC,id DESC);
         ''')
         self.batches = CompletionBatches(self)
+        self.status_card = CompletionStatus(self)
         state = self.state()
         if self.enabled:
             if state.get('route') != self.route() or state.get('enabled') is not True:
@@ -442,9 +444,24 @@ class CompletionDelivery:
         if not self.bridge.owner_allowed() or not self._current(identity):
             return False
         try:
+            card_shown = False
+            if self.preview_style == 'status-card':
+                status, _, body = text.partition('\n\n')
+                card_shown = await self.status_card.update(telegram, identity, status)
+                if not self.bridge.owner_allowed() or not self._current(identity):
+                    return False
+                # Ordinary status writes precede the draft because a new
+                # ordinary message can clear a currently displayed draft.
+                if (not body or self.state().get('draft_unsupported')
+                        or self.clock() < self.state().get('draft_retry_at', 0)):
+                    return card_shown
+                text = body
             route = {'chat_id': int(identity['chat_id']), 'message_thread_id': identity['topic_id'],
                      'draft_id': identity['draft_id']}
-            if self.preview_style == 'block':
+            if self.preview_style == 'status-card':
+                result = await telegram.call('sendRichMessageDraft', **route,
+                                             rich_message={'blocks': [{'type': 'thinking', 'text': text}]})
+            elif self.preview_style == 'block':
                 status, _, body = text.partition('\n\n')
                 blocks = [{'type': 'thinking', 'text': status}]
                 if body:
@@ -468,7 +485,7 @@ class CompletionDelivery:
                 state = self.state()
                 state['draft_retry_at'] = retry_at
                 self.store.set(self.KEY, json.dumps(state))
-                if identity.get('turn_id'):
+                if identity.get('turn_id') and self.preview_style != 'status-card':
                     with self.db:
                         self.db.execute('UPDATE completion_turns SET next_preview=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
                                         (retry_at, identity['turn_id'], identity['chat_id'], identity['topic_id']))
@@ -485,11 +502,25 @@ class CompletionDelivery:
             if not self.enabled or not self.bridge.owner_allowed():
                 self._clear_receipt()
                 return False
-            if (self.state().get('draft_unsupported')
-                    or self.clock() < self.state().get('draft_retry_at', 0)):
+            if self.preview_style == 'status-card':
+                await self._flush_status(telegram)
+            if (self.preview_style != 'status-card' and (self.state().get('draft_unsupported')
+                    or self.clock() < self.state().get('draft_retry_at', 0))):
                 return False
             source = self._latest_receipt_source()
             if source is None or source['state'] not in ('pending', 'dispatching', 'uncertain', 'running'):
+                if (self.preview_style == 'status-card' and source is not None
+                        and source['state'] == 'failed' and not source['turn_id']):
+                    card = self.status_card.load()
+                    identity = card.get('desired_identity', {})
+                    active = any(self._current(g) for g in self.db.execute(
+                        "SELECT * FROM completion_turns WHERE stage IN ('active','closing')"))
+                    if (identity.get('source_id') == source['id'] and not card.get('terminal')
+                            and not identity.get('turn_id') and not active):
+                        await self.status_card.update(
+                            telegram, identity,
+                            self._preview_text('⚠️ 本次消息未能提交', source['received_ms'] / 1000, ''),
+                            terminal=True)
                 self._clear_receipt()
                 return False
             previous = self._receipt_state()
@@ -543,7 +574,8 @@ class CompletionDelivery:
                 body, started = '', receipt['received_at']
             identity = {'native_id': self.bridge.thread_id, 'chat_id': str(self.bridge.owner),
                         'topic_id': self.bridge.target['message_thread_id'], 'draft_id': draft_id,
-                        'turn_id': group['turn_id'] if group is not None else None}
+                        'turn_id': group['turn_id'] if group is not None else None,
+                        'source_id': source['id']}
             return await self._send_preview(telegram, identity, self._preview_text(heading, started, body))
 
     async def update(self, telegram, *, turns=None, status=None, connected=True):
@@ -553,6 +585,8 @@ class CompletionDelivery:
     async def _update(self, telegram, *, turns=None, status=None, connected=True):
         if not self.enabled or not self.bridge.owner_allowed():
             return
+        if self.preview_style == 'status-card':
+            await self._flush_status(telegram)
         for turn in turns or []:
             self.watch(turn)
         self._sync_rows()
@@ -568,8 +602,9 @@ class CompletionDelivery:
             if status_turn is not None:
                 self._preview_status = status
                 self._preview_status_turn_id = status_turn
-        if (group is None or self.clock() < group['next_preview'] or self.state().get('draft_unsupported')
-                or self.clock() < self.state().get('draft_retry_at', 0)):
+        if (group is None or self.clock() < group['next_preview']
+                or (self.preview_style != 'status-card' and (self.state().get('draft_unsupported')
+                or self.clock() < self.state().get('draft_retry_at', 0)))):
             return
         if not connected:
             heading = '⚠️ 连接中断，等待恢复'
@@ -593,3 +628,43 @@ class CompletionDelivery:
             self.db.execute('UPDATE completion_turns SET next_preview=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
                             (self.clock() + self.INTERVAL, group['turn_id'], group['chat_id'], group['topic_id']))
         return await self._send_preview(telegram, dict(group), text)
+
+    async def _flush_status(self, telegram):
+        try:
+            previous = self.status_card.load().get('message_id')
+            shown = await self.status_card.flush(telegram)
+            if shown and not previous and self.status_card.load().get('message_id'):
+                self.reschedule_receipt()  # A deferred ordinary creation clears the visible body draft.
+            return shown
+        except Exception:
+            return False  # An optional UI update cannot invalidate a task acknowledgement.
+
+    async def complete_status(self, telegram, row):
+        """Edit the existing status card only after the final body was acknowledged.
+
+        The caller owns preview_lock. A newly received task takes precedence over
+        an older task whose final delivery has just finished.
+        """
+        if not self.enabled or self.preview_style != 'status-card':
+            return False
+        group = self.db.execute('SELECT * FROM completion_turns WHERE notice_key=?', (row['key'],)).fetchone()
+        if not group or not self._current(group) or group['notice_state'] != 'sent':
+            return False
+        source = self._latest_receipt_source()
+        if source is not None and source['turn_id'] != group['turn_id'] and (
+                source['state'] in ('pending', 'dispatching', 'uncertain', 'running')
+                or source['received_ms'] / 1000 >= group['started_at']):
+            return False
+        previous = self.status_card.load().get('desired_identity', {})
+        if previous.get('turn_id') and previous['turn_id'] != group['turn_id']:
+            newer = self._group(previous['turn_id'])
+            if newer is not None and newer['started_at'] >= group['started_at']:
+                return False
+        heading = {'completed': '✅ 已完成', 'failed': '❌ 执行失败', 'interrupted': '⏹ 已停止'}.get(group['status'])
+        if heading is None:
+            return False
+        try:
+            return await self.status_card.update(telegram, dict(group),
+                                                 self._preview_text(heading, group['started_at'], ''), terminal=True)
+        except Exception:
+            return False
