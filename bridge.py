@@ -38,6 +38,22 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def refresh_health_snapshot(component):
+    """Keep an unavailable diagnostic file from stopping message delivery."""
+    try:
+        component.write_health()
+    except OSError as error:
+        if not getattr(component, '_health_snapshot_unavailable', False):
+            LOG.warning('Health snapshot unavailable (%s, errno=%s); will retry',
+                        type(error).__name__, error.errno)
+        component._health_snapshot_unavailable = True
+        return False
+    if getattr(component, '_health_snapshot_unavailable', False):
+        LOG.info('Health snapshot writes recovered')
+    component._health_snapshot_unavailable = False
+    return True
+
+
 def chunks(text, limit=3800):
     """Keep every chunk below Telegram's limit, including UTF-16 surrogates."""
     part, size = [], 0
@@ -691,7 +707,7 @@ class Bridge:
                         await self.telegram.call("sendChatAction", chat_id=self.owner, action="typing")
                 except (ConnectionError, RpcError, TelegramError, asyncio.TimeoutError):
                     pass
-            self.write_health()
+            refresh_health_snapshot(self)
             tick += 1
             await asyncio.sleep(4)
 
@@ -736,7 +752,7 @@ class Bridge:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await self.codex.close()
                 self.ready.clear()
-                self.write_health()
+                refresh_health_snapshot(self)
 
 
 def main():

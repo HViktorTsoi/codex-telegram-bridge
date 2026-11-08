@@ -21,7 +21,8 @@ class ReceiptPreviewTests(unittest.IsolatedAsyncioTestCase):
 
     def text(self, index=-1):
         method, params = self.calls[index]
-        return params['rich_message']['blocks'][0]['text'] if method == 'sendRichMessageDraft' else params['text']
+        return ('\n\n'.join(block['text'] for block in params['rich_message']['blocks'])
+                if method == 'sendRichMessageDraft' else params['text'])
 
     async def test_pending_input_gets_block_receipt_without_native_turn_or_output(self):
         self.bridge.config['preview_style'] = 'block'
@@ -29,6 +30,7 @@ class ReceiptPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.accept()
         self.assertTrue(await self.delivery.receipt(self.telegram))
         self.assertEqual(self.calls[-1][0], 'sendRichMessageDraft')
+        self.assertEqual(len(self.calls[-1][1]['rich_message']['blocks']), 1)
         self.assertIn('已收到', self.text())
         self.assertIn('准备任务', self.text())
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM completion_turns').fetchone()[0], 0)

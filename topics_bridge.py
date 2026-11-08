@@ -19,7 +19,7 @@ import time
 import aiohttp
 
 from attachments import payload_from
-from bridge import BOT_COMMANDS, Bridge, Codex, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted
+from bridge import BOT_COMMANDS, Bridge, Codex, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted, refresh_health_snapshot
 from session_picker import topic_missing_error
 from message_format import send_output
 from activity_indicator import TopicActivity
@@ -735,7 +735,7 @@ class TopicRouter:
 
     async def health_loop(self):
         while True:
-            self.write_health()
+            refresh_health_snapshot(self)
             await asyncio.sleep(4)
 
     async def catalog_call(self, method, params):
@@ -966,7 +966,7 @@ class TopicRouter:
                 for bridge in self.bridges.values():
                     await bridge.codex.close()
                     bridge.ready.clear()
-                self.write_health()
+                refresh_health_snapshot(self)
 
 
 def main():

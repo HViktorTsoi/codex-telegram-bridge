@@ -83,7 +83,7 @@ class FastStatusIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def last_preview(self):
         method, params = self.previews()[-1]
         if method == 'sendRichMessageDraft':
-            return params['rich_message']['blocks'][0]['text']
+            return '\n\n'.join(block['text'] for block in params['rich_message']['blocks'])
         return params['text']
 
     def assert_no_formal_task_messages(self):
