@@ -445,8 +445,12 @@ class CompletionDelivery:
             route = {'chat_id': int(identity['chat_id']), 'message_thread_id': identity['topic_id'],
                      'draft_id': identity['draft_id']}
             if self.preview_style == 'block':
+                status, _, body = text.partition('\n\n')
+                blocks = [{'type': 'thinking', 'text': status}]
+                if body:
+                    blocks.append({'type': 'thinking', 'text': body})
                 result = await telegram.call('sendRichMessageDraft', **route,
-                                             rich_message={'blocks': [{'type': 'thinking', 'text': text}]})
+                                             rich_message={'blocks': blocks})
             else:
                 result = await telegram.call('sendMessageDraft', **route, text=text)
             if result is not True:
@@ -583,8 +587,8 @@ class CompletionDelivery:
         body = self._body(group)
         text = self._preview_text(heading, group['started_at'], body)
         # Keep one ID per task. Client animation is not reliably disabled by
-        # rotating IDs; on supported iPads the rich thinking block displays
-        # this public status/progress as a whole instead of revealing letters.
+        # rotating IDs; on supported iPads the rich thinking blocks display
+        # each public status/progress block without revealing letters.
         with self.db:
             self.db.execute('UPDATE completion_turns SET next_preview=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
                             (self.clock() + self.INTERVAL, group['turn_id'], group['chat_id'], group['topic_id']))

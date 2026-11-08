@@ -26,11 +26,11 @@ class BlockPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('text', params)
         self.assertEqual(set(params['rich_message']), {'blocks'})
         blocks = params['rich_message']['blocks']
-        self.assertEqual(len(blocks), 1)
-        self.assertEqual(blocks[0]['type'], 'thinking')
-        return blocks[0]['text']
+        self.assertIn(len(blocks), (1, 2))
+        self.assertTrue(all(block['type'] == 'thinking' for block in blocks))
+        return '\n\n'.join(block['text'] for block in blocks)
 
-    async def test_block_preview_contains_cumulative_literal_text_and_status_in_one_block(self):
+    async def test_block_preview_separates_status_from_cumulative_literal_body(self):
         self.select()
         first_body = '第一段 **公开进度**，保留 <tag> & 原样文字。路径 /private/data.png 只是说明。'
         self.output(first_body)
@@ -39,12 +39,20 @@ class BlockPreviewTests(unittest.IsolatedAsyncioTestCase):
         first_id = self.calls[-1][1]['draft_id']
         self.assertIn('正在工作', first_text)
         self.assertTrue(first_text.endswith(first_body))
+        blocks = self.calls[-1][1]['rich_message']['blocks']
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(len(blocks[0]['text'].splitlines()), 2)
+        self.assertNotIn(first_body, blocks[0]['text'])
+        self.assertEqual(blocks[1]['text'], first_body)
 
         self.output('第二段新增进度。', 'turn:work:second')
         self.now += 15
         await self.delivery.update(self.telegram, turns=[self.turn()])
         text = self.block_text()
         self.assertIn(first_body + '\n\n第二段新增进度。', text)
+        blocks = self.calls[-1][1]['rich_message']['blocks']
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[1]['text'], first_body + '\n\n第二段新增进度。')
         self.assertEqual(self.calls[-1][1]['draft_id'], first_id)
         self.assertEqual(self.calls[-1][1]['chat_id'], 123)
         self.assertEqual(self.calls[-1][1]['message_thread_id'], 42)
