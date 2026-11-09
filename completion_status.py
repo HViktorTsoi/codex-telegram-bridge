@@ -39,6 +39,38 @@ class CompletionStatus:
             return False
         return source['turn_id'] != identity.get('turn_id')
 
+    async def _pin(self, telegram, state, identity):
+        enabled = self.delivery.bridge.target.get(
+            'status_card_pin', self.delivery.bridge.config.get('status_card_pin', False))
+        message_id = state.get('message_id')
+        if (enabled is not True or not message_id or not self._allowed(identity)
+                or self._stale(identity)):
+            return
+        if state.get('pin_message_id') != message_id:
+            state.update(pin_message_id=message_id, pin_state='none', pin_retry_at=0)
+        if state.get('pin_state') == 'sending':
+            state['pin_state'] = 'uncertain'
+            self.save(state, identity)
+        if (state.get('pin_state') in ('pinned', 'uncertain', 'failed')
+                or self.delivery.clock() < state.get('pin_retry_at', 0)):
+            return
+        state['pin_state'] = 'sending'
+        self.save(state, identity)
+        try:
+            result = await telegram.call('pinChatMessage', chat_id=int(identity['chat_id']),
+                                         message_id=message_id, disable_notification=True)
+            if result is not True:
+                raise ConnectionError('Status pin acknowledgement unavailable')
+        except Exception as error:
+            code = getattr(error, 'code', None)
+            state['pin_state'] = ('queued' if code == 429 else
+                                  'failed' if code in (400, 403, 404) else 'uncertain')
+            state['pin_retry_at'] = (self.delivery.clock() + max(15, getattr(error, 'retry_after', 0))
+                                     if code == 429 else 0)
+        else:
+            state.update(pin_state='pinned', pin_retry_at=0)
+        self.save(state, identity)
+
     async def update(self, telegram, identity, text, *, terminal=False):
         if not self._allowed(identity):
             return False
@@ -66,7 +98,8 @@ class CompletionStatus:
         if self.delivery.clock() < state.get('retry_at', 0):
             return False
         if message_id and state.get('sent_text') == state['desired_text']:
-            return True
+            await self._pin(telegram, state, identity)
+            return self._allowed(identity)
         state['delivery'] = 'editing' if message_id else 'creating'
         self.save(state, identity)  # A lost creation acknowledgement must never create a second card.
         route = {'chat_id': int(identity['chat_id'])}
@@ -94,4 +127,5 @@ class CompletionStatus:
                 return False
         state.update(delivery='sent', sent_text=state['desired_text'], updated_at=self.delivery.clock(), retry_at=0)
         self.save(state, identity)
+        await self._pin(telegram, state, identity)
         return self._allowed(identity)

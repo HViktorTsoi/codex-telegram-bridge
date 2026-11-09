@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.8 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.9 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -202,6 +202,8 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 任务执行期间，中间正文使用临时草稿预览，每约 15 秒用累计内容更新。预览保留截至当前的文本；超过 3800 个 UTF-16 单元时，明确标注只显示最近部分，完整文本和图片仍保存在持久化队列中。草稿暂时失败或不受支持时，正文继续暂存到任务结束，不改发普通进度消息。草稿本身是临时显示，停止刷新约 30 秒后会消失，参见 [Telegram 草稿接口](https://core.telegram.org/bots/api#sendmessagedraft)。
 
 设置 `"preview_style": "status-card"` 可将状态栏与正文放在两个独立的聊天气泡中：两行状态使用普通消息，每个原生会话、接收账号与话题的固定绑定首次静音创建一次，之后每约 15 秒编辑同一个消息 ID，并在后续任务中继续复用；累计正文单独使用整块草稿，沿用同一轮固定的草稿标识。尚无正文时只显示状态消息，最终正文获得发送确认后再更新状态为完成、失败或停止。状态消息位置固定，不会自动移到聊天最底部；首次创建可能产生一次静音横幅，后续更新只编辑原消息。参见 [Telegram 消息编辑接口](https://core.telegram.org/bots/api#editmessagetext) 和 [静音发送参数](https://core.telegram.org/bots/api#sendmessage)。
+
+可选设置 `"status_card_pin": true` 会尝试把该绑定自己的状态消息静音加入置顶列表，便于从话题顶部定位；默认关闭，支持顶层及单个目标配置。置顶操作不更换状态消息、不清除其他置顶，正常刷新和后续任务继续编辑同一个消息；置顶请求失败不影响正文草稿，发送结果未知时不会自动重复置顶。客户端中的实际显示需要验证，参见 [Telegram 置顶接口](https://core.telegram.org/bots/api#pinchatmessage)。
 
 设置 `"preview_style": "block"` 保留同一条草稿内部的两个区块：上方两行状态，下方累计正文，客户端仍将它们显示在同一个消息气泡中。尚无正文时只显示状态区块。`status-card` 与 `block` 的正文都使用 thinking 区块，此前 iPad 实测确认该区块文字整段出现；具体布局仍取决于客户端。设置位置支持配置顶层或单个目标，目标配置优先。省略该项或使用 `"plain"` 保留状态与正文合并的纯文本草稿，逐字动画由客户端控制。草稿依赖客户端支持，旧客户端可能不显示，可切回 `plain`。轮换标识不能可靠关闭动画，部分客户端反而会重新动画全文，参见 [Telegram 流式预览说明](https://core.telegram.org/api/bots/ai)。
 
