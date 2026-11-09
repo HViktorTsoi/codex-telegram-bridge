@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import unittest
 
 from completion_delivery import CompletionDelivery
+from draft_position import StatusDraftPosition
 from message_format import send_output, utf16_size
 from test_completion_delivery import ApiError
 from topics_bridge import RoutedStore
@@ -355,6 +356,82 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
         self.restart()
         await self.update()
         self.assertEqual(self.drafts()[-1]['draft_id'], repaired_id)
+
+    async def test_injected_and_out_of_range_message_ids_cannot_freeze_real_message_positions(self):
+        delivery, store = self.deliveries['a'], self.bridges['a'].store
+        for uid, mid in ((-90, 2_000_000_000), (90, 1_793_896_675_577_860)):
+            store.accept({'update_id': uid}, {'message_id': mid, 'chat': {'id': 123},
+                                            'message_thread_id': 42, 'text': '历史注入任务'})
+            store.mark(uid, 'done')
+        store.enqueue_at('input:90:reply', '123', '历史注入回复', 42)
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=900000')
+            store.db.execute('UPDATE outbox SET message_id=1793896675577861')
+        store.accept({'update_id': 7}, {'message_id': 7, 'chat': {'id': 123},
+                                      'message_thread_id': 42, 'text': '本轮真实 Telegram 任务'})
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=1000000 WHERE id=7')
+        await delivery.receipt(self.telegram)
+        receipt_id = self.drafts()[-1]['draft_id']
+        self.assertEqual(delivery.state()['status_draft_ack']['position_tail'], 7)
+        store.mark(7, 'running', 'a-work')
+        self.output('真实正文')
+        self.now += 1
+        await self.update()
+        body_id = delivery.body_preview.load(self.identity())['message_id']
+        self.assertNotEqual(self.drafts()[-1]['draft_id'], receipt_id)
+        self.assertEqual(delivery.state()['status_draft_ack']['position_tail'], body_id)
+        moved_id = self.drafts()[-1]['draft_id']
+        store.accept({'update_id': 9}, {'message_id': 150, 'chat': {'id': 123},
+                                      'message_thread_id': 42, 'text': '下一条真实消息'})
+        store.mark(9, 'running', 'a-work')
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=1002000 WHERE id=9')
+        self.now += 1
+        await delivery.receipt(self.telegram)
+        self.assertNotEqual(self.drafts()[-1]['draft_id'], moved_id)
+        self.assertEqual(delivery.state()['status_draft_ack']['position_tail'], 150)
+
+    async def test_polluted_v11_tail_repairs_once_then_real_input_can_reanchor_again(self):
+        self.output()
+        await self.update()
+        delivery, store = self.deliveries['a'], self.bridges['a'].store
+        original_id = self.drafts()[-1]['draft_id']
+        key, value = store.db.execute('SELECT key,value FROM kv WHERE key LIKE ?',
+                                     (StatusDraftPosition.KEY + '%',)).fetchone()
+        polluted = json.loads(value)
+        polluted['position_tail'] = 1_793_896_675_577_860
+        store.set(key, json.dumps(polluted))
+        old_state = delivery.state()
+        old_state['status_draft_ack']['position_tail'] = polluted['position_tail']
+        store.set(delivery.KEY, json.dumps(old_state))
+        self.failures['sendRichMessageDraft'] = [ConnectionError('repair acknowledgement lost')]
+        self.restart()
+        self.now += 15
+        await self.update()
+        repaired_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(repaired_id, original_id)
+        position = json.loads(store.get(key))
+        body_id = self.deliveries['a'].body_preview.load(self.identity())['message_id']
+        self.assertEqual(position['position_tail'], body_id)
+        self.restart()
+        self.now += 15
+        await self.update()
+        self.assertEqual(self.drafts()[-1]['draft_id'], repaired_id)
+        store.accept({'update_id': 9}, {'message_id': 150, 'chat': {'id': 123},
+                                      'message_thread_id': 42, 'text': '修复后的真实新消息'})
+        store.mark(9, 'running', 'a-work')
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=1031000 WHERE id=9')
+        self.now += 1
+        await self.deliveries['a'].receipt(self.telegram)
+        moved_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(moved_id, repaired_id)
+        self.assertEqual(self.deliveries['a'].state()['status_draft_ack']['position_tail'], 150)
+        self.restart()
+        self.now += 15
+        await self.deliveries['a'].receipt(self.telegram)
+        self.assertEqual(self.drafts()[-1]['draft_id'], moved_id)
 
     async def test_final_output_reanchors_terminal_status_once_without_resending_final(self):
         delivery = self.deliveries['a']

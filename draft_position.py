@@ -6,6 +6,7 @@ import secrets
 
 class StatusDraftPosition:
     KEY = 'status_draft_position_v1:'
+    MAX_MESSAGE_ID = 2 ** 31 - 1  # Telegram cloud IDs are int32; injected jobs use other IDs.
 
     def __init__(self, delivery):
         self.delivery, self.store, self.db = delivery, delivery.store, delivery.db
@@ -17,10 +18,14 @@ class StatusDraftPosition:
     def _tail(self, identity):
         route = self.delivery.route()
         incoming = self.db.execute('SELECT MAX(source_message_id) FROM inbox WHERE chat_id=? '
-                                   'AND message_thread_id=? AND source_message_id>0', route[1:]).fetchone()[0] or 0
+                                   'AND message_thread_id=? AND id>=0 AND source_message_id BETWEEN 1 AND ?',
+                                   (*route[1:], self.MAX_MESSAGE_ID)).fetchone()[0] or 0
         outgoing = self.db.execute('SELECT MAX(message_id) FROM outbox WHERE chat_id=? '
-                                   'AND message_thread_id=? AND message_id>0', route[1:]).fetchone()[0] or 0
+                                   'AND message_thread_id=? AND message_id BETWEEN 1 AND ?',
+                                   (*route[1:], self.MAX_MESSAGE_ID)).fetchone()[0] or 0
         preview = self.delivery.body_preview.load(identity).get('message_id') or 0
+        if not isinstance(preview, int) or isinstance(preview, bool) or not 0 < preview <= self.MAX_MESSAGE_ID:
+            preview = 0
         return max(0, incoming, outgoing, preview)
 
     def prepare(self, identity):
@@ -72,7 +77,8 @@ class StatusDraftPosition:
                 # A fast next task may inherit the previous receipt's display
                 # ID. Its newer message must reanchor that reused ID too.
                 rotate = legacy or (state.get('route') == route and state.get('draft_id') == draft_id
-                                    and tail > state.get('position_tail', 0))
+                                    and (tail > state.get('position_tail', 0)
+                                         or state.get('position_tail', 0) > self.MAX_MESSAGE_ID))
                 if rotate:
                     previous = {draft_id, state.get('draft_id'), ack.get('draft_id')}
                     while draft_id in previous:
