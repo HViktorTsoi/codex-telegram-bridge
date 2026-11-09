@@ -317,12 +317,18 @@ class TargetBridge(Bridge):
                      f"ID：{self.thread_id}\n话题：{row['message_thread_id'] or '原私聊入口'}\n"
                      + self.settings_text(settings))
             if self.delivery.enabled:
-                reply += ('\n通知：完成后正常提醒；首次状态卡静音'
-                          if self.delivery.preview_style == 'status-card' else '\n通知：仅整轮任务结束时提醒')
+                if self.delivery.preview_style == 'status-card':
+                    reply += '\n通知：完成后正常提醒；首次状态卡静音'
+                elif self.delivery.preview_style == 'status-draft':
+                    reply += '\n通知：完成后正常提醒；首次正文预览静音'
+                else:
+                    reply += '\n通知：仅整轮任务结束时提醒'
                 if self.delivery.preview_style == 'block':
                     reply += '\n预览：整块累计进度'
                 elif self.delivery.preview_style == 'status-card':
                     reply += '\n预览：独立状态消息＋累计正文草稿'
+                elif self.delivery.preview_style == 'status-draft':
+                    reply += '\n预览：累计正文原地编辑＋底部独立状态草稿'
         if reply is None:
             result = await super().dispatch_one(row)
             if self.delivery.enabled:
@@ -345,6 +351,8 @@ class TargetBridge(Bridge):
         self.delivery.sent(row, sent['message_id'])
         if self.delivery.enabled and row['key'].startswith('completion-notice:'):
             await self.delivery.complete_status(self.telegram, row)
+        if self.delivery.enabled and (row['key'].startswith('completion-notice:')
+                                      or self.delivery.preview_style == 'status-draft'):
             self.delivery.reschedule_receipt()
             self.receipt_event.set()
         LOG.info("Sent target %s message %s", self.target["key"], sent["message_id"])
@@ -456,9 +464,13 @@ class TargetBridge(Bridge):
                 self.receipt_event.clear()
                 await asyncio.sleep(0.1)  # Coalesce a burst of album/input parts.
                 self.receipt_event.clear()
-            if not self.delivery.enabled or self.telegram is None:
+            if self.telegram is None:
                 continue
             try:
+                if not self.delivery.enabled:
+                    async with self.delivery.preview_lock:
+                        await self.delivery._cleanup_body_preview(self.telegram)
+                    continue
                 await self.delivery.receipt(self.telegram, connected=self.ready.is_set())
             except (ConnectionError, TelegramError, OSError, asyncio.TimeoutError) as error:
                 LOG.warning('Receipt preview failed (%s)', getattr(error, 'code', type(error).__name__))
