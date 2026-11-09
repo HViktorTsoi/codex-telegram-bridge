@@ -1,6 +1,10 @@
-"""Snapshot explicitly returned images and deliver them to their saved route."""
+"""Snapshot explicitly returned attachments and deliver them to their saved route.
+
+The historical class and sender names remain stable for existing queues.
+"""
 import hashlib
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -13,6 +17,24 @@ from message_format import normalize_local_links
 MAX_BYTES = 20 * 1024 * 1024
 PHOTO_BYTES = 10 * 1024 * 1024
 EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
+DOCUMENT_EXTENSIONS = {
+    '.pdf', '.doc', '.docx', '.odt', '.rtf', '.xls', '.xlsx', '.ods',
+    '.ppt', '.pptx', '.odp', '.csv', '.tsv', '.txt', '.md', '.markdown',
+    '.html', '.htm', '.json', '.xml', '.yaml', '.yml', '.toml', '.ini',
+    '.cfg', '.log', '.sql', '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
+    '.cmd', '.bat', '.ps1', '.sh', '.bash', '.zsh', '.py', '.js', '.ts',
+    '.jsx', '.tsx', '.css', '.scss', '.c', '.h', '.cpp', '.hpp', '.rs',
+    '.go', '.java', '.kt', '.swift', '.rb', '.php', '.ipynb',
+    '.mp3', '.m4a', '.wav', '.ogg', '.mp4', '.mov', '.webm',
+}
+SECRET_DIRECTORIES = {'.ssh', '.gnupg', '.aws', '.azure', '.kube', '.docker'}
+SECRET_EXTENSIONS = {'.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.kdbx'}
+SECRET_NAMES = {
+    '.netrc', '.npmrc', '.pypirc', '.git-credentials', 'auth.json', 'tokens.json',
+    'token.json', 'credentials.json', 'credential.json', 'application_default_credentials.json',
+    'secret.json', 'secrets.json', 'secret.yaml', 'secrets.yaml', 'secret.yml', 'secrets.yml',
+    'secrets.toml', 'secret.txt', 'secrets.txt', 'token.txt', 'tokens.txt',
+}
 DELIVERY = re.compile(
     r'(?:已(?:经)?|这次|直接|重新).{0,16}(?:附上|附了|发送|发出|发给|贴上).{0,16}(?:图片|截图|二维码|照片|图表)'
     r'|(?:图片|截图|二维码|照片|图表)\s*(?:如下|见下)'
@@ -37,6 +59,36 @@ def local_image_path(destination):
     return path if path.suffix.lower() in EXTENSIONS else None
 
 
+def credential_path(path):
+    """Never automatically attach obvious credential stores or their aliases."""
+    parts = [part.casefold() for part in path.parts]
+    name = path.name.casefold()
+    pairs = set(zip(parts, parts[1:]))
+    return (any(part in SECRET_DIRECTORIES for part in parts)
+            or any(pair in pairs for pair in (('.claude', 'channels'), ('.codex', 'channels'),
+                                             ('.config', 'gcloud'), ('.config', 'gh')))
+            or name in SECRET_NAMES or name == '.env' or name.startswith('.env.')
+            or path.suffix.casefold() in SECRET_EXTENSIONS
+            or name.startswith(('id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa',
+                                'private_key', 'private-key', 'secret_key', 'secret-key',
+                                'client_secret', 'client-secret', 'service_account',
+                                'service-account', 'credentials.', 'credentials-')))
+
+
+def local_document_path(destination):
+    if destination.lower().startswith('file:'):
+        url = urlsplit(destination)
+        if url.netloc not in ('', 'localhost') or url.query or url.fragment:
+            return None
+        destination = url.path
+    destination = unquote(destination)
+    if (not destination.startswith(('/', '~/'))
+            or re.search(r':\d+(?::\d+)?$', destination)):
+        return None
+    path = Path(destination).expanduser()
+    return path if path.suffix.lower() in DOCUMENT_EXTENSIONS and not credential_path(path) else None
+
+
 def image_type(data):
     if data.startswith(b'\x89PNG\r\n\x1a\n'):
         return 'image/png', '.png'
@@ -53,6 +105,7 @@ class OutputImages:
     def __init__(self, store, directory):
         self.store, self.db = store, store.db
         self.directory = Path(directory) / 'outgoing-images'
+        self.files_directory = Path(directory) / 'outgoing-files'
         self.db.execute('''CREATE TABLE IF NOT EXISTS output_image_views(
             turn_id TEXT,item_id TEXT,path TEXT,completed_ms INTEGER,
             PRIMARY KEY(turn_id,item_id))''')
@@ -118,6 +171,47 @@ class OutputImages:
                 'method': 'sendDocument' if len(data) > PHOTO_BYTES or mime == 'image/gif' else 'sendPhoto',
                 'delivery': 'queued'}
 
+    def snapshot_document(self, path, label):
+        try:
+            if credential_path(path):
+                raise ImageError('Document path is excluded')
+            resolved = path.resolve(strict=True)
+            if credential_path(resolved) or resolved.suffix.lower() not in DOCUMENT_EXTENSIONS:
+                raise ImageError('Document path is excluded')
+            fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_BYTES:
+                    raise ImageError('Document must be a nonempty regular file no larger than 20 MB')
+                data = stream.read(MAX_BYTES + 1)
+            if not data or len(data) > MAX_BYTES:
+                raise ImageError('Document is empty or exceeds 20 MB')
+        except (OSError, RuntimeError, ValueError):
+            raise ImageError('Document file is unavailable') from None
+        digest = hashlib.sha256(data).hexdigest()
+        try:
+            self.files_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            target = self.files_directory / (digest + path.suffix.lower())
+            if not target.exists():
+                fd, tmp = tempfile.mkstemp(prefix='.snapshot-', dir=self.files_directory)
+                try:
+                    with os.fdopen(fd, 'wb') as stream:
+                        stream.write(data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(tmp, target)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+        except OSError:
+            raise ImageError('Document snapshot cannot be saved') from None
+        mime, encoding = mimetypes.guess_type(path.name)
+        mime = {'gzip': 'application/gzip', 'bzip2': 'application/x-bzip2',
+                'xz': 'application/x-xz'}.get(encoding, mime)
+        return {'path': str(target), 'sha256': digest, 'name': path.name,
+                'caption': ' '.join(label.split())[:200], 'mime': mime or 'application/octet-stream',
+                'bytes': len(data), 'method': 'sendDocument', 'delivery': 'queued', 'kind': 'document'}
+
     def prepare(self, text):
         images, seen = [], set()
         changed = False
@@ -125,16 +219,22 @@ class OutputImages:
         def capture(label, destination, image):
             nonlocal changed
             path = local_image_path(destination)
+            document = False
+            if path is None and not image:
+                path = local_document_path(destination)
+                document = path is not None
             if path is None:
                 return None
             changed = True
             try:
-                media = self.snapshot(path, label)
+                media = self.snapshot_document(path, label) if document else self.snapshot(path, label)
             except ImageError:
-                return f'［图片未发送：{label}，文件不可读取、格式不支持或超过 20 MB］'
-            if media['sha256'] not in seen:
+                kind = '文件' if document else '图片'
+                return f'［{kind}未发送：{label}，文件不可读取、格式不支持或超过 20 MB］'
+            identity = ('document', media['sha256'], media['name']) if document else ('image', media['sha256'])
+            if identity not in seen:
                 images.append(media)
-                seen.add(media['sha256'])
+                seen.add(identity)
             return ''
 
         result = normalize_local_links(text, rewrite=capture)
@@ -162,8 +262,9 @@ class OutputImages:
         with self.db:
             self.db.execute('UPDATE outbox SET message_id=-1,media_json=? WHERE key=?',
                             (json.dumps(media), row['key']))
-        notice = ('图片发送结果未获确认，未自动重发；请明确要求重新发送图片。' if uncertain
-                  else '图片未能发送，请重新生成或要求重新发送图片。')
+        kind = '文件' if media.get('kind') == 'document' else '图片'
+        notice = (f'{kind}发送结果未获确认，未自动重发；请明确要求重新发送{kind}。' if uncertain
+                  else f'{kind}未能发送，请重新生成或要求重新发送{kind}。')
         if hasattr(self.store, 'enqueue_at'):
             self.store.enqueue_at('image-error:' + row['key'], row['chat_id'], notice, row['message_thread_id'])
         else:
@@ -188,22 +289,30 @@ class OutputImages:
 
 async def send_image(telegram, media_json, route):
     media = json.loads(media_json)
+    kind, method = media.get('kind', 'image'), media.get('method')
+    label = 'Document' if kind == 'document' else 'Image'
+    if (kind not in ('image', 'document') or method not in ('sendPhoto', 'sendDocument')
+            or (kind == 'document' and method != 'sendDocument')):
+        raise ImageError('Unsupported attachment method')
     try:
         path = Path(media['path'])
-        if not path.is_file() or path.stat().st_size > MAX_BYTES:
-            raise ImageError('Image snapshot is unavailable')
-        if hashlib.sha256(path.read_bytes()).hexdigest() != media['sha256']:
-            raise ImageError('Image snapshot changed')
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_BYTES:
+                raise ImageError(f'{label} snapshot is unavailable')
+            data = stream.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES or hashlib.sha256(data).hexdigest() != media['sha256']:
+            raise ImageError(f'{label} snapshot changed')
     except OSError:
-        raise ImageError('Image snapshot is unavailable') from None
+        raise ImageError(f'{label} snapshot is unavailable') from None
     params = {**route, 'caption': media['caption']}
-    method = media['method']
     try:
         return await telegram.upload(method, 'photo' if method == 'sendPhoto' else 'document', path,
                                      filename=media['name'], mime_type=media['mime'], **params)
     except Exception as error:
         if isinstance(error, OSError) and not isinstance(error, ConnectionError):
-            raise ImageError('Image snapshot is unavailable') from None
+            raise ImageError(f'{label} snapshot is unavailable') from None
         # Fallback only on an explicit photo-format rejection, never on lost
         # responses, missing topics, permissions, throttling or server errors.
         if (method != 'sendPhoto' or getattr(error, 'code', None) != 400
