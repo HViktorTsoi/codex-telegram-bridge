@@ -128,7 +128,7 @@ class StatusCardPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.creates()), 1)
         self.assertEqual([params['message_id'] for params in self.edits()], [card_id])
         self.assertEqual(self.drafts()[-1]['draft_id'], first_draft)
-        self.assertEqual(self.drafts()[-1]['rich_message']['blocks'][0]['text'], '第一段\n\n第二段')
+        self.assertEqual(self.drafts()[-1]['rich_message']['blocks'][0]['text'], '第一段\n\n────────────\n\n第二段')
         self.assertEqual(self.calls[-2][0], 'editMessageText')
         self.assertEqual(self.calls[-1][0], 'sendRichMessageDraft')
 

@@ -9,7 +9,7 @@ import secrets
 import time
 
 from message_format import utf16_size
-from completion_batch import CompletionBatches
+from completion_batch import CompletionBatches, ITEM_SEPARATOR
 from completion_status import CompletionStatus
 from completion_preview import CompletionPreview
 from draft_position import StatusDraftPosition
@@ -354,7 +354,9 @@ class CompletionDelivery:
                 kind = '文件' if media.get('kind') == 'document' else '图片'
                 text = '［' + kind + '：' + (media.get('caption') or media.get('name') or kind) + '，将在完成后发送］'
             if text:
-                parts.append(('\n\n' if parts and base != previous else '') + text)
+                # Match the completed transcript while it is still being
+                # edited; source chunks of one native item remain contiguous.
+                parts.append((ITEM_SEPARATOR if parts and base != previous else '') + text)
                 previous = base
         return ''.join(parts)
 
