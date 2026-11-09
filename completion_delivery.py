@@ -32,8 +32,8 @@ class CompletionDelivery:
         self._preview_status_turn_id = None
         self.enabled = bridge.target.get('notification_mode', bridge.config.get('notification_mode', 'all')) == 'completion'
         self.preview_style = bridge.target.get('preview_style', bridge.config.get('preview_style', 'plain'))
-        if self.preview_style not in ('plain', 'block', 'status-card', 'status-draft'):
-            raise ValueError('preview_style must be plain, block, status-card or status-draft')
+        if self.preview_style not in ('plain', 'block', 'status-card', 'status-draft', 'status-bar'):
+            raise ValueError('preview_style must be plain, block, status-card, status-draft or status-bar')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS completion_turns(
                 turn_id TEXT,chat_id TEXT,topic_id INTEGER,native_id TEXT,
@@ -447,9 +447,12 @@ class CompletionDelivery:
     async def _send_preview(self, telegram, identity, text):
         if not self.bridge.owner_allowed() or not self._current(identity):
             return False
-        if self.preview_style == 'status-draft' and self.status_card._stale(identity):
+        if self.preview_style in ('status-draft', 'status-bar') and self.status_card._stale(identity):
             return False
         try:
+            if self.preview_style == 'status-bar':
+                status, _, body = text.partition('\n\n')
+                return await self.body_preview.update_status(telegram, identity, status, body)
             card_shown = False
             if self.preview_style == 'status-draft':
                 status, _, body = text.partition('\n\n')
@@ -505,6 +508,8 @@ class CompletionDelivery:
                     self.store.set(self.KEY, json.dumps(state, ensure_ascii=False))
             return bool(allowed)
         except Exception as error:
+            if self.preview_style == 'status-bar':
+                return False  # Persistent status failures never change draft capability.
             if not self.bridge.owner_allowed() or not self._current(identity):
                 return False  # An old response must not disable a repaired topic.
             if getattr(error, 'code', None) in (400, 404):
@@ -536,12 +541,12 @@ class CompletionDelivery:
                 return False
             if self.preview_style == 'status-card':
                 await self._flush_status(telegram)
-            if (self.preview_style not in ('status-card', 'status-draft') and (self.state().get('draft_unsupported')
+            if (self.preview_style not in ('status-card', 'status-draft', 'status-bar') and (self.state().get('draft_unsupported')
                     or self.clock() < self.state().get('draft_retry_at', 0))):
                 return False
             source = self._latest_receipt_source()
             if source is None or source['state'] not in ('pending', 'dispatching', 'uncertain', 'running'):
-                if (self.preview_style == 'status-draft' and source is not None
+                if (self.preview_style in ('status-draft', 'status-bar') and source is not None
                         and source['state'] == 'failed' and not source['turn_id']):
                     previous = self._receipt_state()
                     active = any(self._current(g) for g in self.db.execute(
@@ -567,7 +572,7 @@ class CompletionDelivery:
                             self._preview_text('⚠️ 本次消息未能提交', source['received_ms'] / 1000, ''),
                             terminal=True)
                 self._clear_receipt()
-                if self.preview_style == 'status-draft':
+                if self.preview_style in ('status-draft', 'status-bar'):
                     # Native-client tasks have no Telegram receipt. A control
                     # reply clears their draft too, so honor redraw requests.
                     return bool(await self._update(telegram, connected=connected))
@@ -653,7 +658,7 @@ class CompletionDelivery:
                 self._preview_status = status
                 self._preview_status_turn_id = status_turn
         if (group is None or self.clock() < group['next_preview']
-                or (self.preview_style not in ('status-card', 'status-draft') and (self.state().get('draft_unsupported')
+                or (self.preview_style not in ('status-card', 'status-draft', 'status-bar') and (self.state().get('draft_unsupported')
                 or self.clock() < self.state().get('draft_retry_at', 0)))):
             return
         if not connected:
@@ -701,16 +706,18 @@ class CompletionDelivery:
         The caller owns preview_lock. A newly received task takes precedence over
         an older task whose final delivery has just finished.
         """
-        if not self.enabled or self.preview_style not in ('status-card', 'status-draft'):
+        if not self.enabled or self.preview_style not in ('status-card', 'status-draft', 'status-bar'):
             return False
         group = self.db.execute('SELECT rowid AS position_sequence,* FROM completion_turns WHERE notice_key=?', (row['key'],)).fetchone()
         if not group or not self._current(group) or group['notice_state'] != 'sent':
             return False
-        if self.preview_style == 'status-draft':
+        if self.preview_style in ('status-draft', 'status-bar'):
             # The final, canonical reply is durable before its temporary body
             # is removed. Each turn has its own preview; newer input is safe.
             self.body_preview.finish(dict(group))
             await self._cleanup_body_preview(telegram)
+            if self.preview_style == 'status-bar':
+                return True  # The confirmed final message already carries its durable terminal bar.
             newer = self.db.execute(
                 'SELECT 1 FROM completion_turns WHERE native_id=? AND chat_id=? AND topic_id=? '
                 'AND turn_id<>? AND notify=1 AND (started_at>? '
@@ -740,3 +747,16 @@ class CompletionDelivery:
                                                  self._preview_text(heading, group['started_at'], ''), terminal=True)
         except Exception:
             return False
+
+    def final_markup(self, row):
+        """Attach a durable terminal bar to this turn's canonical final reply."""
+        if (not self.enabled or self.preview_style != 'status-bar'
+                or not row['key'].startswith('completion-notice:') or not self.bridge.owner_allowed()):
+            return None
+        group = self.db.execute('SELECT * FROM completion_turns WHERE notice_key=?', (row['key'],)).fetchone()
+        if (not group or not self._current(group) or group['stage'] != 'ready'
+                or str(row['chat_id']) != group['chat_id'] or row['message_thread_id'] != group['topic_id']):
+            return None
+        heading = {'completed': '✅ 已完成', 'failed': '❌ 执行失败', 'interrupted': '⏹ 已停止'}.get(group['status'])
+        return (self.body_preview.status_markup(self._preview_text(heading, group['started_at'], ''))
+                if heading else None)
