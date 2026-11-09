@@ -49,10 +49,10 @@ class BlockPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.now += 15
         await self.delivery.update(self.telegram, turns=[self.turn()])
         text = self.block_text()
-        self.assertIn(first_body + '\n\n第二段新增进度。', text)
+        self.assertIn(first_body + '\n\n────────────\n\n第二段新增进度。', text)
         blocks = self.calls[-1][1]['rich_message']['blocks']
         self.assertEqual(len(blocks), 2)
-        self.assertEqual(blocks[1]['text'], first_body + '\n\n第二段新增进度。')
+        self.assertEqual(blocks[1]['text'], first_body + '\n\n────────────\n\n第二段新增进度。')
         self.assertEqual(self.calls[-1][1]['draft_id'], first_id)
         self.assertEqual(self.calls[-1][1]['chat_id'], 123)
         self.assertEqual(self.calls[-1][1]['message_thread_id'], 42)

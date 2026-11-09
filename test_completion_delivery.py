@@ -124,7 +124,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first['draft_id'], last['draft_id'])
         self.assertEqual(last['message_thread_id'], 42)
         self.assertEqual(last['chat_id'], 123)
-        self.assertIn('第一段保留\n\n第二段新增', last['text'])
+        self.assertIn('第一段保留\n\n────────────\n\n第二段新增', last['text'])
         self.assertTrue(all(method == 'sendMessageDraft' for method, _ in self.calls))
         self.assertEqual(len(self.all_outbox()), 2)
 

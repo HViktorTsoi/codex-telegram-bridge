@@ -286,7 +286,7 @@ class PersistentStatusTests(unittest.IsolatedAsyncioTestCase):
         await self.update()
         self.assertEqual(len(self.sends()), 1)
         self.assertEqual(len(self.calls_for('editMessageText')), 1)
-        self.assertIn('第一段\n\n第二段', self.body_text(self.messages[mid]))
+        self.assertIn('第一段\n\n────────────\n\n第二段', self.body_text(self.messages[mid]))
         self.assert_status_keyboard(self.messages[mid])
         before = len(self.calls)
         self.now += 15
