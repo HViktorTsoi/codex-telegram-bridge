@@ -611,6 +611,8 @@ class ControlCenter:
             target = bound.get(thread['id'], {})
             old = cache.get(thread['id'], {})
             entry = {**old, 'host': self.host, 'thread_id': thread['id'], 'name': clean(thread.get('name') or target.get('name') or thread.get('preview') or '未命名', 50),
+                     'cwd': (thread.get('cwd') if isinstance(thread.get('cwd'), str) and thread['cwd'] else
+                             old.get('cwd') if old.get('host', self.host) == self.host else None),
                      'status': thread.get('status', {}), 'updated': thread.get('updatedAt', 0),
                      'target_key': target.get('key'), 'topic_id': target.get('message_thread_id'),
                      'topic_missing': bool(target.get('topic_missing')), 'bot_username': self.router.username or self.router.config.get('expected_bot_username', '')}

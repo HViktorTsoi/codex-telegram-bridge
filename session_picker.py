@@ -4,6 +4,7 @@ import hashlib
 import json
 import secrets
 import time
+from pathlib import Path
 
 from bridge import RpcError, TelegramError, permitted
 
@@ -48,6 +49,8 @@ class SessionPicker:
                 thread_id TEXT PRIMARY KEY,target_json TEXT,status TEXT,error TEXT,updated_at REAL);
             CREATE TABLE IF NOT EXISTS ui_catalogs(
                 id TEXT PRIMARY KEY,payload TEXT,expires_at REAL);
+            CREATE TABLE IF NOT EXISTS ui_thread_directories(
+                thread_id TEXT PRIMARY KEY,cwd TEXT,updated_at REAL);
         ''')
         from session_creator import SessionCreator
         self.creator = SessionCreator(self)
@@ -125,7 +128,8 @@ class SessionPicker:
 
     async def home(self, update):
         targets = self.router.recent.ordered(self.router.targets.values())[:12]
-        directories = await asyncio.gather(*(self.directory(t['thread_id'], 90) for t in targets))
+        cached = self._directory_values()
+        directories = [self.cached_directory(t['thread_id'], 90, cached) for t in targets]
         lines = ['已绑定的原 Codex 会话（最近使用在前）：']
         for number, (target, directory) in enumerate(zip(targets, directories), 1):
             ready = self.router.bridges[target['key']].ready.is_set()
@@ -152,11 +156,66 @@ class SessionPicker:
         text += '\n点击“新建会话”可选择或新建工作目录，并创建全新的 Codex 会话。'
         await self.panel(update, text, rows)
 
+    def cache_directory(self, thread):
+        """Retain display metadata; binding still requires a fresh native check."""
+        thread_id = thread.get('id')
+        if not isinstance(thread_id, str) or not thread_id or 'cwd' not in thread:
+            return
+        cwd = thread['cwd']
+        cwd = cwd if isinstance(cwd, str) and cwd else None
+        with self.db:
+            self.db.execute('INSERT INTO ui_thread_directories VALUES(?,?,?) '
+                            'ON CONFLICT(thread_id) DO UPDATE SET cwd=excluded.cwd,updated_at=excluded.updated_at',
+                            (thread_id, cwd, time.time()))
+
+    def _directory_values(self):
+        # Historical picker catalogs are a display fallback only. Their expired
+        # buttons and binding confirmations retain the usual validation.
+        values = {}
+        for row in self.db.execute('SELECT payload FROM ui_catalogs ORDER BY expires_at DESC'):
+            try:
+                groups = json.loads(row['payload'])
+                for group in groups if isinstance(groups, list) else []:
+                    if not isinstance(group, dict) or 'cwd' not in group:
+                        continue
+                    cwd = group['cwd']
+                    if cwd is not None and not isinstance(cwd, str):
+                        continue
+                    for thread in group.get('threads', []):
+                        if isinstance(thread, dict) and isinstance(thread.get('id'), str):
+                            values.setdefault(thread['id'], cwd)
+            except (TypeError, ValueError):
+                continue
+        try:
+            snapshot = json.loads((Path(self.router.state_dir) / 'control/local.json').read_text())
+            host = self.router.config.get('host_id')
+            if isinstance(snapshot, dict) and (host is None or snapshot.get('host') == host):
+                for entry in snapshot.get('entries', []):
+                    if not isinstance(entry, dict) or not isinstance(entry.get('thread_id'), str) or 'cwd' not in entry:
+                        continue
+                    if host is not None and entry.get('host', host) != host:
+                        continue
+                    cwd = entry['cwd']
+                    if cwd is None or isinstance(cwd, str):
+                        values[entry['thread_id']] = cwd
+        except (OSError, TypeError, ValueError):
+            pass
+        # Successful exact-thread reads take precedence over fallback snapshots.
+        values.update({row['thread_id']: row['cwd'] for row in self.db.execute('SELECT * FROM ui_thread_directories')})
+        return values
+
+    def cached_directory(self, thread_id, limit=220, values=None):
+        values = self._directory_values() if values is None else values
+        return directory_text({'cwd': values[thread_id]}, limit) if thread_id in values else '目录暂不可用'
+
     async def directory(self, thread_id, limit=220):
         try:
             result = await asyncio.wait_for(self.router.catalog_call('thread/read', {'threadId': thread_id}), 5)
             thread = result['thread']
-            return directory_text(thread, limit) if thread.get('id') == thread_id else '暂时无法读取'
+            if thread.get('id') != thread_id:
+                return '暂时无法读取'
+            self.cache_directory(thread)
+            return directory_text(thread, limit)
         except (RpcError, ConnectionError, asyncio.TimeoutError):
             return '暂时无法读取'
 
@@ -172,6 +231,7 @@ class SessionPicker:
                         or thread['id'] in seen):
                     continue
                 seen.add(thread['id'])
+                self.cache_directory(thread)
                 cwd = thread.get('cwd')
                 cwd = cwd if isinstance(cwd, str) and cwd else None
                 threads.append({'id': thread['id'], 'name': thread.get('name'), 'cwd': cwd})
@@ -284,6 +344,7 @@ class SessionPicker:
         thread = result['thread']
         if thread['id'] != thread_id or thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
             raise BindingError('所选会话当前不可绑定，请重新选择。')
+        self.cache_directory(thread)
         text = (f"确认接入这个原会话？\n\n名称：{clean_name(thread.get('name') or '未命名会话', 140)}\n"
                 f"主机：{self.router.config.get('host_id', '本机')}\nID：{thread_id}\n"
                 f"目录：{directory_text(thread)}\n\n确认后会创建新 Telegram 话题，沿用此会话的历史和设置。")
@@ -313,6 +374,7 @@ class SessionPicker:
         if not allow_create:
             raise BindingError('这个确认按钮已处理，请重新打开 /sessions。')
         thread = await self.router.verify_existing(thread_id)
+        self.cache_directory(thread)
         name = clean_name(thread.get('name') or 'Codex ' + thread_id[-8:])
         if any(t['name'] == name for t in self.router.targets.values()):
             name += ' · ' + thread_id[-6:]
@@ -353,6 +415,7 @@ class SessionPicker:
         thread = (await self.router.catalog_call('thread/read', {'threadId': thread_id}))['thread']
         if thread['id'] != thread_id:
             raise BindingError('会话 ID 不一致，请重新打开 /sessions。')
+        self.cache_directory(thread)
         text = (f"重新创建这个会话的 Telegram 话题？\n\n名称：{clean_name(thread.get('name') or target['name'])}\n"
                 f"ID：{thread_id}\n旧话题：{topic_id}\n\n新话题仍连接这个原会话，保留其历史和设置。"
                 '旧话题的待回传消息不会被自动重发；已执行的请求也不会重复执行。')
@@ -378,6 +441,7 @@ class SessionPicker:
         if not allow_create:
             raise BindingError('这个重建按钮已处理，请重新打开 /sessions。')
         thread = await self.router.verify_existing(thread_id)
+        self.cache_directory(thread)
         target = {k: v for k, v in existing.items() if k not in ('message_thread_id', 'topic_missing', 'topic_missing_reason')}
         target.update({'name': clean_name(thread.get('name') or existing['name']), 'previous_message_thread_id': topic_id})
         target = await self.create_topic(thread_id, target)
@@ -395,8 +459,25 @@ class SessionPicker:
             [('重新创建话题', 'repair_select', {'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']})],
             [('继续添加', 'catalog', catalog or {}), ('返回', 'home', {})]])
 
-    async def handle_one(self):
-        job = self.db.execute("SELECT * FROM ui_jobs WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
+    def _direct_home(self, update):
+        if update.get('callback_query') or self.creator.is_reply(update) or self.renamer.is_reply(update):
+            return False
+        from attachments import payload_from
+        message = update.get('message', {})
+        words = message.get('text', '').strip().split(maxsplit=1)
+        return bool(words and words[0].split('@')[0].lower() == '/sessions' and not payload_from(message))
+
+    async def handle_one(self, lane=None):
+        if lane not in (None, 'home', 'actions'):
+            raise ValueError('Unknown session picker lane')
+        job = None
+        for candidate in self.db.execute("SELECT * FROM ui_jobs WHERE state='pending' ORDER BY id"):
+            if lane is not None:
+                direct_home = self._direct_home(json.loads(candidate['payload']))
+                if direct_home != (lane == 'home'):
+                    continue
+            job = candidate
+            break
         if job is None:
             return False
         if not self.router.owner_allowed():
@@ -407,7 +488,9 @@ class SessionPicker:
         if not update.get('callback_query') and self.guard.is_message(update) and not self.guard.ready(update):
             return False
         with self.db:
-            self.db.execute("UPDATE ui_jobs SET state='processing' WHERE id=?", (job['id'],))
+            claimed = self.db.execute("UPDATE ui_jobs SET state='processing' WHERE id=? AND state='pending'", (job['id'],))
+            if not claimed.rowcount:
+                return False
         update = json.loads(job['payload'])
         callback = update.get('callback_query')
         words = update.get('message', {}).get('text', '').strip().split(maxsplit=1)
@@ -477,7 +560,12 @@ class SessionPicker:
 
     async def loop(self):
         while True:
-            if not await self.handle_one():
+            if not await self.handle_one(lane='actions'):
+                await asyncio.sleep(0.2)
+
+    async def home_loop(self):
+        while True:
+            if not await self.handle_one(lane='home'):
                 await asyncio.sleep(0.2)
 
     async def recover(self):

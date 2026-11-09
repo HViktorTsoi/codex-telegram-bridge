@@ -325,11 +325,13 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refresh_extracts_only_conversation_and_never_generates(self):
         node = self.nodes['A']
+        (node.state_dir / 'control/local.json').write_text(json.dumps({'host': 'A', 'entries': [
+            {'host': 'B', 'thread_id': 'unbound', 'cwd': '/other-machine', 'updated': 0}]}))
         calls = []
         async def catalog(method, params):
             calls.append(method)
             if method == 'thread/list':
-                return {'data': [{'id': 'A-native', 'name': 'Manager', 'updatedAt': time.time(), 'status': {'type': 'idle'}},
+                return {'data': [{'id': 'A-native', 'name': 'Manager', 'cwd': '/work/manager', 'updatedAt': time.time(), 'status': {'type': 'idle'}},
                                  {'id': 'unbound', 'name': '未绑定', 'updatedAt': time.time(), 'status': {'type': 'idle'}}]}
             return {'data': [{'id': 'turn1', 'status': 'completed', 'items': [
                 {'type': 'userMessage', 'content': [{'type': 'text', 'text': '继续'}]},
@@ -339,6 +341,8 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         await node.control.refresh()
         local = json.loads((node.state_dir / 'control/local.json').read_text())
         self.assertEqual(len(local['entries']), 2)
+        self.assertEqual(local['entries'][0]['cwd'], '/work/manager')
+        self.assertIsNone(local['entries'][1]['cwd'])
         self.assertNotIn('PRIVATE REASONING', json.dumps(local))
         self.assertEqual(local['entries'][0]['questions'][0]['kind'], 'question')
         self.assertTrue(all(c in ('thread/list', 'thread/turns/list') for c in calls))

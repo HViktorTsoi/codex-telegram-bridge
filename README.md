@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.7 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.8 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -114,6 +114,8 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 上述 BotFather 开关阻止 Telegram 客户端在主窗口发送 `/tasks`、`/sessions` 等消息时先自动创建话题。可用 `getMe` 验证 `has_topics_enabled=true`、`allows_users_to_create_topics=false`；此开关需要 Bot 所有者在 BotFather 设置，Bot Token 无法修改。它同时禁止用户手动新建、编辑和删除话题，桥接仍可通过 `/sessions` 创建和重建绑定话题。参见 [Telegram 官方说明](https://core.telegram.org/api/forum#bot-forums)。
 
 话题模式中，`/sessions`、`/tasks`、`/inbox`、`/to`、`/aliases`、`/help`、`/start` 等全局菜单及派单汇总发送到主对话；旧话题里的管理菜单按钮会在下一次操作时转到主对话。`/status`、`/model`、`/effort`、`/format`、`/stop` 作用于输入所在话题对应的原 Codex 会话，查询结果、确认和错误提示均发回输入所在对话；在主对话输入则回复主对话。未知命令及未绑定话题中的会话指令错误也回复原处，未绑定会话不会改投默认目标。发送层只显示正文，不自动添加 `〔会话标题〕` 前缀。普通对话、图片和状态提示继续使用原话题；已有发信队列保留原来保存的位置。
+
+直接输入 `/sessions` 使用独立的菜单处理通道，首页读取本机已保存的目录信息，无需等待正在执行的任务或较早的目录查询、绑定、改名操作。尚无缓存的目录会显示待同步，后续原生元数据读取会补充；缓存只用于显示，实际绑定与重建仍重新核对原生会话身份。
 
 ### All 防误发
 

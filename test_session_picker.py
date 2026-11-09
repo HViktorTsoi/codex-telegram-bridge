@@ -76,6 +76,8 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         root = self.router.bridges['meeting']
         root.ready.set()
         root.codex = Catalog()
+        for target in self.config['targets']:
+            self.router.picker.cache_directory({'id': target['thread_id'], 'cwd': '/work/' + target['thread_id']})
 
     async def asyncTearDown(self):
         for bridge in self.router.bridges.values():
