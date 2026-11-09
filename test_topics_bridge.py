@@ -149,10 +149,11 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
     def test_unauthorized_senders_groups_and_topic_service_messages_are_not_forwarded(self):
         for update in [self.message(100, 11, **{'from': {'id': 999}}),
                        self.message(101, 11, chat={'id': -456, 'type': 'supergroup'}),
-                       self.message(102, 11, forum_topic_created={'name': 'test'})]:
+                       self.message(102, 11, forum_topic_created={'name': 'test'}),
+                       self.message(103, 11, text='', pinned_message={'message_id': 50, 'text': '工作状态'})]:
             self.accept(update)
         self.assertEqual(self.router.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
-        self.assertEqual(self.router.store.offset(), 103)
+        self.assertEqual(self.router.store.offset(), 104)
 
     def test_revoked_owner_is_denied_before_queue_handoff(self):
         self.router.ingest(self.message(100, 11))

@@ -623,7 +623,8 @@ class TopicRouter:
             self.store.accept(update, None)
             return
         if any(k in message for k in ("forum_topic_created", "forum_topic_edited", "forum_topic_closed",
-                                      "forum_topic_reopened", "general_forum_topic_hidden", "general_forum_topic_unhidden")):
+                                      "forum_topic_reopened", "general_forum_topic_hidden", "general_forum_topic_unhidden",
+                                      "pinned_message")):
             self.store.accept(update, None)
             return
         topic_id = topic_of(message)
