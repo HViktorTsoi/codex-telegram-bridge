@@ -1,6 +1,7 @@
 """A single bottom status draft must remain independent of editable task text."""
 import asyncio
 import copy
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -113,6 +114,14 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
             await self.acknowledge(row, name)
         self.fail('Final output did not become idle')
 
+    async def control_reply(self, name='a', key='input:8:reply'):
+        delivery, store = self.deliveries[name], self.bridges[name].store
+        store.enqueue_at(key, '123', '当前模型信息', self.bridges[name].target['message_thread_id'])
+        row = delivery.next_row()
+        self.assertTrue(row['key'].startswith(key))
+        await self.acknowledge(row, name)
+        delivery.reschedule_receipt()
+
     async def test_body_and_bottom_status_are_separate_and_body_precedes_single_draft(self):
         self.output('正文不应进入状态草稿')
         await self.update()
@@ -131,7 +140,7 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(method != 'pinChatMessage' for method, _ in self.calls))
         self.assertIsNone(self.deliveries['a'].next_row())
 
-    async def test_input_receipt_has_only_status_and_native_turn_adopts_same_draft(self):
+    async def test_first_body_moves_receipt_status_once_and_persists_new_draft_identity(self):
         store, delivery = self.bridges['a'].store, self.deliveries['a']
         store.accept({'update_id': 7}, {'message_id': 7, 'chat': {'id': 123},
                                       'message_thread_id': 42, 'text': '开始这个任务'})
@@ -145,8 +154,14 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
         self.output()
         self.now += 1
         await self.update()
-        self.assertEqual(self.drafts()[-1]['draft_id'], draft_id)
+        moved_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(moved_id, draft_id)
+        self.assertEqual(self.identity()['draft_id'], moved_id)
+        self.assertEqual(delivery._receipt_state()['draft_id'], moved_id)
         self.assertEqual(len(self.calls_for('sendRichMessage', 'sendMessage')), 1)
+        self.now += 15
+        await delivery.receipt(self.telegram)
+        self.assertEqual(self.drafts()[-1]['draft_id'], moved_id)
 
     async def test_control_reply_redraw_restores_native_client_task_status_immediately(self):
         delivery, store = self.deliveries['a'], self.bridges['a'].store
@@ -156,11 +171,10 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 0)
         self.now += 1
         # A real /model or /status reply clears the client's only live draft.
-        await self.telegram.call('sendMessage', chat_id=123, message_thread_id=42, text='当前模型信息')
-        delivery.reschedule_receipt()
+        await self.control_reply()
         await delivery.receipt(self.telegram)
         self.assertEqual(len(self.drafts()), 2)
-        self.assertEqual(self.drafts()[-1]['draft_id'], draft_id)
+        self.assertNotEqual(self.drafts()[-1]['draft_id'], draft_id)
         self.assertIn('正在工作', self.drafts()[-1]['rich_message']['blocks'][0]['text'])
         self.assertEqual(self.calls[-1][0], 'sendRichMessageDraft')
         self.assertEqual(self.calls_for('editMessageText'), [])
@@ -204,6 +218,7 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_text_edits_the_same_body_before_redrawing_status(self):
         self.output('正文一')
         await self.update()
+        draft_id = self.drafts()[-1]['draft_id']
         mid = self.deliveries['a'].body_preview.load(self.identity())['message_id']
         self.output('正文二', iid='second')
         self.now += 15
@@ -216,6 +231,180 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[-1][0], 'sendRichMessageDraft')
         self.assertEqual(len(self.calls_for('sendRichMessage', 'sendMessage')), 1)
         self.assertNotIn('正文二', str(self.drafts()[-1]['rich_message']))
+        self.assertEqual(self.drafts()[-1]['draft_id'], draft_id)
+
+    async def test_body_before_first_status_keeps_initial_task_draft_id(self):
+        delivery = self.deliveries['a']
+        delivery.watch(self.turn())
+        initial_id = self.identity()['draft_id']
+        self.output('先有正文，再第一次显示状态')
+        await self.update()
+        self.assertEqual(self.drafts()[0]['draft_id'], initial_id)
+        self.assertEqual(len(self.drafts()), 1)
+        self.now += 15
+        await self.update()
+        self.assertEqual(self.drafts()[-1]['draft_id'], initial_id)
+
+    async def test_new_telegram_input_moves_status_once_without_recreating_body(self):
+        delivery, store = self.deliveries['a'], self.bridges['a'].store
+        self.output()
+        await self.update()
+        original_id = self.drafts()[-1]['draft_id']
+        store.accept({'update_id': 9}, {'message_id': 150, 'chat': {'id': 123},
+                                      'message_thread_id': 42, 'text': '补充一项要求'})
+        store.mark(9, 'running', 'a-work')
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=1001000 WHERE id=9')
+        self.now += 1
+        await delivery.receipt(self.telegram)
+        moved_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(moved_id, original_id)
+        self.assertEqual(self.identity()['draft_id'], moved_id)
+        self.assertEqual(delivery._receipt_state()['draft_id'], moved_id)
+        self.now += 15
+        await delivery.receipt(self.telegram)
+        self.assertEqual(self.drafts()[-1]['draft_id'], moved_id)
+        self.assertEqual(len(self.calls_for('sendRichMessage', 'sendMessage')), 1)
+        self.assertEqual(self.calls_for('editMessageText'), [])
+
+    async def test_messages_in_other_chats_or_topics_do_not_move_this_status(self):
+        store = self.bridges['a'].store
+        self.output()
+        await self.update()
+        original_id = self.drafts()[-1]['draft_id']
+        store.enqueue_at('input:90:reply', '999', '其他接收人', 42)
+        store.enqueue_at('input:91:reply', '123', '其他话题', 420)
+        with store.db:
+            store.db.execute("UPDATE outbox SET message_id=10000 WHERE chat_id='999'")
+            store.db.execute('UPDATE outbox SET message_id=10001 WHERE message_thread_id=420')
+        for uid, owner, topic in ((90, 999, 42), (91, 123, 420)):
+            store.accept({'update_id': uid}, {'message_id': 10000 + uid, 'chat': {'id': owner},
+                                            'message_thread_id': topic, 'text': '其他对话的消息'})
+        self.now += 15
+        await self.update()
+        self.assertEqual(self.drafts()[-1]['draft_id'], original_id)
+        self.assertEqual(self.calls_for('editMessageText'), [])
+
+    async def test_rotated_status_id_survives_rate_limit_and_restart_for_the_same_tail(self):
+        self.output()
+        await self.update()
+        original_id = self.drafts()[-1]['draft_id']
+        await self.control_reply()
+        self.failures['sendRichMessageDraft'] = [ApiError(429, retry_after=30)]
+        self.now += 1
+        await self.deliveries['a'].receipt(self.telegram)
+        attempted_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(attempted_id, original_id)
+        self.assertEqual(self.identity()['draft_id'], attempted_id)
+        self.restart()
+        self.now += 15
+        await self.deliveries['a'].receipt(self.telegram)
+        self.assertEqual(len(self.drafts()), 2)
+        self.now += 15
+        await self.deliveries['a'].receipt(self.telegram)
+        self.assertEqual([p['draft_id'] for p in self.drafts()], [original_id, attempted_id, attempted_id])
+
+    async def test_rotation_is_persisted_before_api_and_unknown_ack_reuses_id_after_restart(self):
+        self.output()
+        await self.update()
+        original_id = self.drafts()[-1]['draft_id']
+        store = self.bridges['a'].store
+        store.accept({'update_id': 9}, {'message_id': 150, 'chat': {'id': 123},
+                                      'message_thread_id': 42, 'text': '补充要求'})
+        store.mark(9, 'running', 'a-work')
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=1001000 WHERE id=9')
+        original_call = self.telegram.call
+        persisted = []
+
+        async def inspect_before_api(method, **params):
+            if method == 'sendRichMessageDraft':
+                delivery = self.deliveries['a']
+                persisted.append((self.identity()['draft_id'], delivery._receipt_state()['draft_id']))
+                self.assertEqual(persisted[-1], (params['draft_id'], params['draft_id']))
+            return await original_call(method, **params)
+
+        self.telegram.call = inspect_before_api
+        self.failures['sendRichMessageDraft'] = [ConnectionError('lost status acknowledgement')]
+        self.now += 1
+        await self.deliveries['a'].receipt(self.telegram)
+        attempted_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(attempted_id, original_id)
+        self.restart()
+        self.now += 15
+        await self.deliveries['a'].receipt(self.telegram)
+        self.assertEqual(self.drafts()[-1]['draft_id'], attempted_id)
+        self.assertEqual(persisted, [(attempted_id, attempted_id)] * 2)
+
+    async def test_legacy_ack_without_position_tail_gets_one_repair_id(self):
+        delivery = self.deliveries['a']
+        delivery.watch(self.turn())
+        self.output()
+        identity = self.identity()
+        await delivery.body_preview.update(self.telegram, identity, '第一段正文')
+        original_id = identity['draft_id']
+        state = delivery.state()
+        state['status_draft_ack'] = {'route': delivery.route(), 'turn_id': 'a-work',
+                                     'draft_id': original_id, 'text': '旧版状态', 'sent_at': self.now}
+        delivery.store.set(delivery.KEY, json.dumps(state))
+        self.restart()
+        await self.update()
+        repaired_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(repaired_id, original_id)
+        self.now += 15
+        self.restart()
+        await self.update()
+        self.assertEqual(self.drafts()[-1]['draft_id'], repaired_id)
+
+    async def test_final_output_reanchors_terminal_status_once_without_resending_final(self):
+        delivery = self.deliveries['a']
+        self.output()
+        await self.update()
+        original_id = self.drafts()[-1]['draft_id']
+        delivery.seal(self.turn(status='completed'))
+        final = delivery.next_row()
+        await self.acknowledge(final)
+        terminal_id = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(terminal_id, original_id)
+        self.assertIn('已完成', str(self.drafts()[-1]['rich_message']))
+        self.restart()
+        await self.deliveries['a'].complete_status(self.telegram, final)
+        self.assertEqual(self.drafts()[-1]['draft_id'], terminal_id)
+        finals = [p for _, p in self.calls_for('sendRichMessage', 'sendMessage')
+                  if p.get('disable_notification') is not True]
+        self.assertEqual(len(finals), 1)
+
+    async def test_fast_pending_input_after_final_gets_fresh_status_before_native_turn(self):
+        delivery, store = self.deliveries['a'], self.bridges['a'].store
+        store.accept({'update_id': 7}, {'message_id': 7, 'chat': {'id': 123},
+                                      'message_thread_id': 42, 'text': '任务 A'})
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=1000000 WHERE id=7')
+        await delivery.receipt(self.telegram)
+        store.mark(7, 'running', 'a-work')
+        self.output('任务 A 的正文')
+        self.now += 1
+        await self.update()
+        delivery.seal(self.turn(status='completed'))
+        await self.acknowledge(delivery.next_row())
+        final_a_draft = self.drafts()[-1]['draft_id']
+        store.mark(7, 'done', 'a-work')
+        self.assertEqual(delivery._receipt_state()['source_id'], 7)
+        sends_before_b = len(self.calls_for('sendRichMessage', 'sendMessage'))
+        store.accept({'update_id': 9}, {'message_id': 150, 'chat': {'id': 123},
+                                      'message_thread_id': 42, 'text': '紧接着开始任务 B'})
+        with store.db:
+            store.db.execute('UPDATE inbox SET received_ms=1002000 WHERE id=9')
+        self.now += 1
+        await delivery.receipt(self.telegram)
+        pending_b_draft = self.drafts()[-1]['draft_id']
+        self.assertNotEqual(pending_b_draft, final_a_draft)
+        self.assertEqual(delivery._receipt_state()['source_id'], 9)
+        self.assertEqual(delivery._receipt_state()['draft_id'], pending_b_draft)
+        self.assertIn('已收到', str(self.drafts()[-1]['rich_message']))
+        self.assertNotIn('已完成', str(self.drafts()[-1]['rich_message']))
+        self.assertEqual(len(self.calls_for('sendRichMessage', 'sendMessage')), sends_before_b)
+        self.assertEqual(store.db.execute('SELECT COUNT(*) FROM completion_turns').fetchone()[0], 1)
 
     async def test_unknown_body_create_ack_never_resends_after_restart(self):
         self.failures['sendRichMessage'] = [ConnectionError('lost creation acknowledgement')]
@@ -451,6 +640,34 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
         finals = [p for _, p in self.calls_for('sendRichMessage', 'sendMessage')
                   if p.get('disable_notification') is not True]
         self.assertEqual(len(finals), 1)
+
+    async def test_same_timestamp_native_turns_use_creation_order_for_status_and_completion(self):
+        delivery = self.deliveries['a']
+        self.output('同一秒开始的任务 A')
+        await delivery.update(self.telegram, turns=[self.turn(started=1001)])
+        old_mid = delivery.body_preview.load(self.identity())['message_id']
+        delivery.seal(self.turn(status='completed', started=1001))
+        final_a = delivery.next_row()
+        self.output('同一秒开始的任务 B', tid='a-next')
+        self.now += 15
+        await delivery.update(self.telegram, turns=[self.turn('a-next', started=1001)])
+        next_mid = delivery.body_preview.load(self.identity('a-next'))['message_id']
+        next_status = copy.deepcopy(self.drafts()[-1])
+        self.assertIn('正在工作', str(next_status['rich_message']))
+        self.assertNotEqual(next_mid, old_mid)
+        await self.acknowledge(final_a)
+        self.assertNotIn(old_mid, self.messages)
+        self.assertIn(next_mid, self.messages)
+        self.assertEqual(self.drafts()[-1], next_status)
+        delivery.seal(self.turn('a-next', status='completed', started=1001))
+        final_b = delivery.next_row()
+        await self.acknowledge(final_b)
+        self.assertNotIn(next_mid, self.messages)
+        self.assertIn('已完成', str(self.drafts()[-1]['rich_message']))
+        self.assertIsNone(delivery.next_row())
+        finals = [p for _, p in self.calls_for('sendRichMessage', 'sendMessage')
+                  if p.get('disable_notification') is not True]
+        self.assertEqual(len(finals), 2)
 
     async def test_default_plain_mode_keeps_body_in_draft_and_creates_no_preview_message(self):
         self.bridges['a'].config.pop('preview_style')

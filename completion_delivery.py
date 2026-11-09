@@ -12,6 +12,7 @@ from message_format import utf16_size
 from completion_batch import CompletionBatches
 from completion_status import CompletionStatus
 from completion_preview import CompletionPreview
+from draft_position import StatusDraftPosition
 
 
 TERMINAL = ('completed', 'failed', 'interrupted')
@@ -48,6 +49,7 @@ class CompletionDelivery:
         self.batches = CompletionBatches(self)
         self.status_card = CompletionStatus(self)
         self.body_preview = CompletionPreview(self)
+        self.draft_position = StatusDraftPosition(self)
         state = self.state()
         if self.enabled:
             if state.get('route') != self.route() or state.get('enabled') is not True:
@@ -457,6 +459,9 @@ class CompletionDelivery:
                 if (not self.bridge.owner_allowed() or not self._current(identity)
                         or self.status_card._stale(identity)):
                     return False
+                identity = self.draft_position.prepare(identity)
+                if identity is None:
+                    return False
                 if (self.state().get('draft_unsupported')
                         or self.clock() < self.state().get('draft_retry_at', 0)):
                     return False
@@ -495,7 +500,8 @@ class CompletionDelivery:
                     state = self.state()
                     state['status_draft_ack'] = {
                         'route': self.route(), 'turn_id': identity.get('turn_id'),
-                        'draft_id': identity['draft_id'], 'text': text, 'sent_at': self.clock()}
+                        'draft_id': identity['draft_id'], 'text': text, 'sent_at': self.clock(),
+                        'position_tail': identity['position_tail']}
                     self.store.set(self.KEY, json.dumps(state, ensure_ascii=False))
             return bool(allowed)
         except Exception as error:
@@ -577,7 +583,7 @@ class CompletionDelivery:
                 return False
             if group is None:
                 group = next((g for g in self.db.execute(
-                    "SELECT * FROM completion_turns WHERE stage IN ('active','closing') ORDER BY started_at DESC")
+                    "SELECT * FROM completion_turns WHERE stage IN ('active','closing') ORDER BY started_at DESC,rowid DESC")
                     if self._current(g)), None)
             if group is not None and not self._current(group):
                 self._clear_receipt()
@@ -635,7 +641,7 @@ class CompletionDelivery:
             self.watch(turn)
         self._sync_rows()
         groups = self.db.execute("SELECT * FROM completion_turns WHERE notify=1 AND notice_state NOT IN ('sent','failed','uncertain','blocked') "
-                                 'ORDER BY started_at DESC').fetchall()
+                                 'ORDER BY started_at DESC,rowid DESC').fetchall()
         receipt_source = self._unresolved_receipt_source()
         group = next((g for g in groups if self._current(g)
                       and not (g['stage'] == 'ready' and receipt_source is not None
@@ -697,7 +703,7 @@ class CompletionDelivery:
         """
         if not self.enabled or self.preview_style not in ('status-card', 'status-draft'):
             return False
-        group = self.db.execute('SELECT * FROM completion_turns WHERE notice_key=?', (row['key'],)).fetchone()
+        group = self.db.execute('SELECT rowid AS position_sequence,* FROM completion_turns WHERE notice_key=?', (row['key'],)).fetchone()
         if not group or not self._current(group) or group['notice_state'] != 'sent':
             return False
         if self.preview_style == 'status-draft':
@@ -707,8 +713,10 @@ class CompletionDelivery:
             await self._cleanup_body_preview(telegram)
             newer = self.db.execute(
                 'SELECT 1 FROM completion_turns WHERE native_id=? AND chat_id=? AND topic_id=? '
-                'AND turn_id<>? AND started_at>=? AND notify=1 LIMIT 1',
-                (*self.route(), group['turn_id'], group['started_at'])).fetchone()
+                'AND turn_id<>? AND notify=1 AND (started_at>? '
+                'OR (started_at=? AND rowid>?)) LIMIT 1',
+                (*self.route(), group['turn_id'], group['started_at'], group['started_at'],
+                 group['position_sequence'])).fetchone()
             if newer:
                 return False  # Native-client tasks may have no Telegram inbox receipt.
         source = self._latest_receipt_source()
@@ -717,7 +725,7 @@ class CompletionDelivery:
                 or source['received_ms'] / 1000 >= group['started_at']):
             return False
         previous = self.status_card.load().get('desired_identity', {})
-        if previous.get('turn_id') and previous['turn_id'] != group['turn_id']:
+        if self.preview_style == 'status-card' and previous.get('turn_id') and previous['turn_id'] != group['turn_id']:
             newer = self._group(previous['turn_id'])
             if newer is not None and newer['started_at'] >= group['started_at']:
                 return False
