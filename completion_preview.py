@@ -24,12 +24,38 @@ class CompletionPreview:
         return [identity['native_id'], identity['chat_id'], identity['topic_id']]
 
     def _key(self, identity):
-        frozen = self._route(identity) + [identity['turn_id']]
+        task = [identity['turn_id']] if identity.get('turn_id') else ['source', identity['source_id']]
+        frozen = self._route(identity) + task
         return self.KEY + hashlib.sha256(json.dumps(frozen).encode()).hexdigest()[:24]
 
     def load(self, identity):
-        identity = self._identity(identity)
-        return json.loads(self.store.get(self._key(identity), '{}')) if identity else {}
+        identity = self._bar_identity(identity)
+        if not identity:
+            return {}
+        key, seen = self._key(identity), set()
+        while key not in seen:
+            seen.add(key)
+            state = json.loads(self.store.get(key, '{}'))
+            if state.get('route') and state['route'] != self._route(identity):
+                return {}
+            stored = self._bar_identity(state['desired_identity']) if state.get('desired_identity') else None
+            if stored and (self._route(stored) != self._route(identity) or self._key(stored) != key):
+                return {}
+            target = state.get('transferred_to')
+            if not target:
+                return state
+            if not target.startswith(self.KEY):
+                return {}
+            key = target
+        return {}
+
+    @staticmethod
+    def _bar_identity(identity):
+        value = dict(identity)
+        value.update(chat_id=str(value['chat_id']), topic_id=int(value['topic_id']))
+        if not value.get('native_id') or (not value.get('turn_id') and value.get('source_id') is None):
+            return None
+        return value
 
     def _save(self, state, identity):
         self.store.set(self._key(identity), json.dumps(state, ensure_ascii=False))
@@ -38,8 +64,112 @@ class CompletionPreview:
         return self.delivery.bridge.owner_allowed() and self.delivery._current(identity)
 
     def _allowed(self, identity):
+        if self.delivery.preview_style == 'status-bar':
+            return self._bar_allowed(identity)
         return (self.delivery.enabled and self.delivery.preview_style == 'status-draft'
                 and self._current(identity) and not self.delivery.status_card._stale(identity))
+
+    def _bar_allowed(self, identity):
+        if (not self.delivery.enabled or self.delivery.preview_style != 'status-bar'
+                or not self._current(identity) or self.delivery.status_card._stale(identity)):
+            return False
+        if identity.get('source_id') is not None:
+            source = self._source(identity)
+            if source is None:
+                return False
+            if identity.get('turn_id') and source['turn_id'] != identity['turn_id']:
+                return False
+            latest = self.delivery._latest_receipt_source()
+            if not identity.get('turn_id') and latest is not None and latest['id'] != source['id']:
+                return False
+        if identity.get('turn_id'):
+            group = self.store.db.execute('SELECT rowid AS ordering_id,* FROM completion_turns '
+                                         'WHERE native_id=? AND chat_id=? AND topic_id=? AND turn_id=?',
+                                         (*self._route(identity), identity['turn_id'])).fetchone()
+            if group is None:
+                return False
+            newer = self.store.db.execute(
+                'SELECT 1 FROM completion_turns WHERE native_id=? AND chat_id=? AND topic_id=? '
+                'AND turn_id<>? AND notify=1 AND (started_at>? OR (started_at=? AND rowid>?)) LIMIT 1',
+                (*self._route(identity), identity['turn_id'], group['started_at'], group['started_at'],
+                 group['ordering_id'])).fetchone()
+            if newer:
+                return False
+        return True
+
+    @staticmethod
+    def status_markup(status):
+        lines = [line.strip(' ━═─=\t') for line in status.splitlines() if line.strip(' ━═─=\t')]
+        lines = (lines + ['任务已收到。', '处理中。'])[:2]
+        return {'inline_keyboard': [[{'text': line, 'disabled': {}}] for line in lines]}
+
+    def _source(self, identity):
+        return self.store.db.execute('SELECT * FROM inbox WHERE id=? AND chat_id=? AND message_thread_id=?',
+                                     (identity.get('source_id'), identity['chat_id'], identity['topic_id'])).fetchone()
+
+    def _adopt(self, identity):
+        """Move one pending creation intent into its real source/turn atomically."""
+        key, route = self._key(identity), self._route(identity)
+        existing = json.loads(self.store.get(key, '{}'))
+        if existing:
+            return
+        candidates = []
+        for old_key, value in self.store.db.execute('SELECT key,value FROM kv WHERE key LIKE ?',
+                                                   (self.KEY + '%',)).fetchall():
+            state = json.loads(value)
+            original = state.get('desired_identity', {})
+            if (state.get('route') != route or original.get('turn_id') or state.get('transferred_to')
+                    or state.get('closed') or state.get('finished') or original.get('source_id') is None):
+                continue
+            if self._route(original) != route or old_key != self._key(original):
+                continue
+            source = self._source(original)
+            if source is None:
+                continue
+            if identity.get('turn_id'):
+                matched = source['turn_id'] == identity['turn_id']
+            else:
+                matched = not source['turn_id'] and source['state'] in ('pending', 'dispatching', 'uncertain')
+            if matched:
+                candidates.append((source['received_ms'], source['id'], old_key, state))
+        if not candidates:
+            return
+        _, _, old_key, state = max(candidates, key=lambda candidate: candidate[:2])
+        old_state = dict(state)
+        state.update(desired_identity=dict(identity), turn_id=identity.get('turn_id'),
+                     source_id=identity.get('source_id'))
+        old_state['transferred_to'] = key
+        with self.store.db:
+            self.store.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)',
+                                  (key, json.dumps(state, ensure_ascii=False)))
+            self.store.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)',
+                                  (old_key, json.dumps(old_state, ensure_ascii=False)))
+
+    async def update_status(self, telegram, identity, status, body):
+        """Render an ordinary preview and its two durable disabled status rows."""
+        try:
+            identity = self._bar_identity(identity)
+            if not identity:
+                return False
+            source = self._source(identity) if identity.get('source_id') is not None else None
+            if not identity.get('turn_id') and source is not None and source['turn_id']:
+                group = self.store.db.execute('SELECT 1 FROM completion_turns WHERE native_id=? AND chat_id=? '
+                                              'AND topic_id=? AND turn_id=?',
+                                              (*self._route(identity), source['turn_id'])).fetchone()
+                if group:
+                    identity['turn_id'] = source['turn_id']
+            if (identity.get('turn_id') and source is not None and not source['turn_id']
+                    and source['state'] in ('pending', 'dispatching', 'uncertain')):
+                return False  # A native fallback cannot steal a newer unassigned receipt.
+            if not self._bar_allowed(identity):
+                return False
+            self._adopt(identity)
+            state = self.load(identity)
+            if not body or not body.strip():
+                body = state.get('desired_text') or state.get('sent_text') or '任务已收到。'
+            return await self.update(telegram, identity, body, reply_markup=self.status_markup(status), _status_bar=True)
+        except Exception:
+            return False
 
     def _delay(self, error):
         return max(15, getattr(error, 'retry_after', 0) or 0)
@@ -51,13 +181,15 @@ class CompletionPreview:
         note = '（过程较长，预览仅显示最近部分；完整过程将在完成后发送。）\n\n'
         return note + self.delivery._tail(body, limit - utf16_size(note))
 
-    async def _render(self, telegram, identity, state, text):
+    async def _render(self, telegram, identity, state, text, reply_markup=None):
         message_id = state.get('message_id')
         route = {'chat_id': int(identity['chat_id'])}
         if message_id:
             route['message_id'] = message_id
         else:
             route.update(message_thread_id=identity['topic_id'], disable_notification=True)
+        if reply_markup is not None:
+            route['reply_markup'] = reply_markup
         if self.store.get('output_format', 'rich') == 'rich' and getattr(telegram, 'rich_supported', None) is not False:
             try:
                 return await telegram.call('editMessageText' if message_id else 'sendRichMessage',
@@ -72,11 +204,12 @@ class CompletionPreview:
                     raise ConnectionError('Preview route or access changed during formatting fallback')
         return await telegram.call('editMessageText' if message_id else 'sendMessage', **route, text=text)
 
-    async def update(self, telegram, identity, body):
+    async def update(self, telegram, identity, body, *, reply_markup=None, _status_bar=False):
         """Create quietly once, then edit only the known preview message ID."""
         try:
-            identity = self._identity(identity)
-            if not identity or not body or not body.strip() or not self._allowed(identity):
+            identity = self._bar_identity(identity) if _status_bar else self._identity(identity)
+            if (not identity or not body or not body.strip() or not self._allowed(identity)
+                    or (not _status_bar and self.delivery.preview_style != 'status-draft')):
                 return False
             state = self.load(identity)
             if state.get('finished'):
@@ -85,21 +218,35 @@ class CompletionPreview:
             if not message_id and state.get('delivery') == 'creating':
                 state['delivery'] = 'uncertain'
                 self._save(state, identity)
+            if _status_bar:
+                source = self._source(identity) if identity.get('source_id') is not None else None
+                state.update(route=self._route(identity), turn_id=identity.get('turn_id'),
+                             desired_identity=identity, desired_text=self._text(body), desired_markup=reply_markup,
+                             source_id=identity.get('source_id'),
+                             closed=bool(source is not None and not source['turn_id'] and source['state'] == 'failed'))
+                self._save(state, identity)
             if (state.get('delivery') == 'failed'
                     or (not message_id and state.get('delivery') == 'uncertain')):
                 return False
             text = self._text(body)
-            state.update(route=self._route(identity), turn_id=identity['turn_id'],
+            state.update(route=self._route(identity), turn_id=identity.get('turn_id'),
                          desired_identity=identity, desired_text=text)
+            if _status_bar:
+                state['desired_markup'] = reply_markup
             self._save(state, identity)
             if self.delivery.clock() < state.get('retry_at', 0):
                 return False
-            if message_id and state.get('sent_text') == text:
+            same_body = message_id and state.get('sent_text') == text
+            if same_body and (not _status_bar or state.get('sent_markup') == reply_markup):
                 return True
             state['delivery'] = 'editing' if message_id else 'creating'
             self._save(state, identity)  # Unknown creation must never be replayed.
             try:
-                result = await self._render(telegram, identity, state, text)
+                if same_body and _status_bar:
+                    result = await telegram.call('editMessageReplyMarkup', chat_id=int(identity['chat_id']),
+                                                 message_id=message_id, reply_markup=reply_markup)
+                else:
+                    result = await self._render(telegram, identity, state, text, reply_markup)
                 if not message_id:
                     mid = result.get('message_id') if isinstance(result, dict) else None
                     if (not isinstance(mid, int) or isinstance(mid, bool) or mid <= 0
@@ -119,6 +266,8 @@ class CompletionPreview:
                     self._save(state, identity)
                     return False
             state.update(delivery='sent', sent_text=text, retry_at=0, updated_at=self.delivery.clock())
+            if _status_bar:
+                state['sent_markup'] = reply_markup
             self._save(state, identity)
             return bool(self._allowed(identity))
         except Exception:
@@ -130,6 +279,10 @@ class CompletionPreview:
             identity = self._identity(identity)
             if not identity or not self._current(identity):
                 return
+            if self.store.db.execute('SELECT 1 FROM completion_turns WHERE native_id=? AND chat_id=? '
+                                     'AND topic_id=? AND turn_id=?',
+                                     (*self._route(identity), identity['turn_id'])).fetchone():
+                self._adopt(identity)  # A fast final ACK may arrive before the first native preview.
             state = self.load(identity)
             if not state:
                 return
@@ -160,11 +313,22 @@ class CompletionPreview:
         attempted = 0
         for key, value in rows:
             try:
-                state = json.loads(value)
-                identity = self._identity(state['desired_identity'])
+                # Another record in this scan may already have adopted this source.
+                state = json.loads(self.store.get(key, '{}'))
+                identity = self._bar_identity(state['desired_identity'])
                 if (not identity or key != self._key(identity) or state.get('route') != self._route(identity)
-                        or not self._current(identity)):
+                        or state.get('transferred_to') or not self._current(identity)):
                     continue
+                if not identity.get('turn_id'):
+                    source = self._source(identity)
+                    if state.get('closed') or source is None or not source['turn_id']:
+                        continue
+                    native = dict(identity, turn_id=source['turn_id'])
+                    if not self._final_sent(native):
+                        continue
+                    self._adopt(native)
+                    self.finish(native)
+                    identity, state = native, self.load(native)
                 if not state.get('finished') and state.get('message_id') and self._final_sent(identity):
                     # Recover a crash after the canonical final ACK but before finish().
                     self.finish(identity)

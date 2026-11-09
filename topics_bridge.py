@@ -321,6 +321,8 @@ class TargetBridge(Bridge):
                     reply += '\n通知：完成后正常提醒；首次状态卡静音'
                 elif self.delivery.preview_style == 'status-draft':
                     reply += '\n通知：完成后正常提醒；首次正文预览静音'
+                elif self.delivery.preview_style == 'status-bar':
+                    reply += '\n通知：完成后正常提醒；首次接收预览静音'
                 else:
                     reply += '\n通知：仅整轮任务结束时提醒'
                 if self.delivery.preview_style == 'block':
@@ -329,6 +331,8 @@ class TargetBridge(Bridge):
                     reply += '\n预览：独立状态消息＋累计正文草稿'
                 elif self.delivery.preview_style == 'status-draft':
                     reply += '\n预览：累计正文原地编辑＋底部独立状态草稿'
+                elif self.delivery.preview_style == 'status-bar':
+                    reply += '\n预览：累计正文原地编辑＋正文下方持久状态条'
         if reply is None:
             result = await super().dispatch_one(row)
             if self.delivery.enabled:
@@ -346,13 +350,14 @@ class TargetBridge(Bridge):
         self.store.images.begin(row)
         sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
                                  rich_text=row['rich_text'], topic_id=row['message_thread_id'], media_json=row['media_json'],
-                                 disable_notification=self.delivery.silent(row) if self.delivery.enabled else None)
+                                 disable_notification=self.delivery.silent(row) if self.delivery.enabled else None,
+                                 reply_markup=self.delivery.final_markup(row))
         self.store.images.sent(row, sent['message_id'])
         self.delivery.sent(row, sent['message_id'])
         if self.delivery.enabled and row['key'].startswith('completion-notice:'):
             await self.delivery.complete_status(self.telegram, row)
         if self.delivery.enabled and (row['key'].startswith('completion-notice:')
-                                      or self.delivery.preview_style == 'status-draft'):
+                                      or self.delivery.preview_style in ('status-draft', 'status-bar')):
             self.delivery.reschedule_receipt()
             self.receipt_event.set()
         LOG.info("Sent target %s message %s", self.target["key"], sent["message_id"])

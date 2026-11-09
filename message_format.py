@@ -183,13 +183,15 @@ def formatting_reason(error):
 
 
 async def send_output(telegram, *, chat_id, text, rich_text=None, topic_id=None, label=None, media_json=None,
-                      disable_notification=None):
+                      disable_notification=None, reply_markup=None):
     """Send the body only; legacy label metadata is accepted without rendering it."""
     route = {'chat_id': chat_id}
     if disable_notification is not None:
         route['disable_notification'] = disable_notification
     if topic_id:
         route['message_thread_id'] = topic_id
+    if reply_markup is not None:
+        route['reply_markup'] = reply_markup
     if media_json is not None:
         from outgoing_images import send_image
         return await send_image(telegram, media_json, route)
