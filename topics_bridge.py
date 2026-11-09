@@ -958,6 +958,7 @@ class TopicRouter:
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
                     self.spawn(coro)
+                self.spawn(self.picker.home_loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())
