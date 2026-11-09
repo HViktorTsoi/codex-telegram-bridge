@@ -351,7 +351,8 @@ class CompletionDelivery:
             text = row['text']
             if row['media_json']:
                 media = json.loads(row['media_json'])
-                text = '［图片：' + (media.get('caption') or media.get('name') or '图片') + '，将在完成后发送］'
+                kind = '文件' if media.get('kind') == 'document' else '图片'
+                text = '［' + kind + '：' + (media.get('caption') or media.get('name') or kind) + '，将在完成后发送］'
             if text:
                 parts.append(('\n\n' if parts and base != previous else '') + text)
                 previous = base
