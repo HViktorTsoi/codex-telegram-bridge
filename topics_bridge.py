@@ -602,6 +602,8 @@ class TopicRouter:
         self.picker = SessionPicker(self)
         from control_center import ControlCenter
         self.control = ControlCenter(self)
+        from status_controls import StatusControls
+        self.status_controls = StatusControls(self)
 
     def access(self):
         try:
@@ -623,6 +625,8 @@ class TopicRouter:
         return "\n".join(lines)
 
     def ingest(self, update):
+        if self.status_controls.ingest(update):
+            return
         if self.picker.creator.is_reply(update):
             self.picker.ingest(update)
             return
@@ -972,11 +976,13 @@ class TopicRouter:
             self.running = True
             try:
                 await self.picker.recover()
+                self.status_controls.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
                     self.spawn(coro)
                 self.spawn(self.picker.home_loop())
+                self.spawn(self.status_controls.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())

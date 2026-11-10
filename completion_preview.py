@@ -5,6 +5,9 @@ import json
 from message_format import formatting_error, normalize_local_links, utf16_size
 
 
+STOP_REQUEST_KEY = 'status_stop_v1:'
+
+
 class CompletionPreview:
     KEY = 'completion_preview_v1:'
 
@@ -98,10 +101,34 @@ class CompletionPreview:
         return True
 
     @staticmethod
-    def status_markup(status):
+    def status_markup(status, stop_callback=None):
         lines = [line.strip(' ━═─=\t') for line in status.splitlines() if line.strip(' ━═─=\t')]
         lines = (lines + ['任务已收到。', '处理中。'])[:2]
-        return {'inline_keyboard': [[{'text': line, 'disabled': {}}] for line in lines]}
+        rows = [[{'text': line, 'disabled': {}}] for line in lines]
+        if stop_callback:
+            rows[1].append({'text': '⏹ 停止当前任务', 'callback_data': stop_callback})
+        return {'inline_keyboard': rows}
+
+    def stop_callback(self, identity):
+        """Expose a control only for this exact current, active native turn."""
+        try:
+            identity = self._bar_identity(identity)
+            if not identity or not identity.get('turn_id') or not self._bar_allowed(identity):
+                return None
+            group = self.delivery._group(identity['turn_id'], identity['chat_id'], identity['topic_id'])
+            if (not group or group['native_id'] != identity['native_id']
+                    or group['stage'] != 'active' or group['status'] != 'inProgress'):
+                return None
+            preview = self.load(identity)
+            if preview.get('finished') or preview.get('closed'):
+                return None
+            digest = self._key(identity)[-24:]
+            request = json.loads(self.store.get(STOP_REQUEST_KEY + digest, '{}'))
+            if request.get('state') in ('sending', 'requested', 'uncertain'):
+                return None
+            return 'stop:' + digest
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None  # Malformed identity or durable state cannot expose a control.
 
     def _source(self, identity):
         return self.store.db.execute('SELECT * FROM inbox WHERE id=? AND chat_id=? AND message_thread_id=?',
@@ -146,7 +173,7 @@ class CompletionPreview:
                                   (old_key, json.dumps(old_state, ensure_ascii=False)))
 
     async def update_status(self, telegram, identity, status, body):
-        """Render an ordinary preview and its two durable disabled status rows."""
+        """Render two durable status rows, with a bound active-turn control."""
         try:
             identity = self._bar_identity(identity)
             if not identity:
@@ -167,7 +194,8 @@ class CompletionPreview:
             state = self.load(identity)
             if not body or not body.strip():
                 body = state.get('desired_text') or state.get('sent_text') or '任务已收到。'
-            return await self.update(telegram, identity, body, reply_markup=self.status_markup(status), _status_bar=True)
+            markup = self.status_markup(status, self.stop_callback(identity))
+            return await self.update(telegram, identity, body, reply_markup=markup, _status_bar=True)
         except Exception:
             return False
 

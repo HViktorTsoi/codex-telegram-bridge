@@ -138,10 +138,16 @@ class PersistentStatusTests(unittest.IsolatedAsyncioTestCase):
     def assert_status_keyboard(self, message, text=None):
         rows = message['reply_markup']['inline_keyboard']
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all(len(row) == 1 for row in rows))
+        self.assertEqual(len(rows[0]), 1)
+        self.assertIn(len(rows[1]), (1, 2))
         for row in rows:
             self.assertEqual(row[0]['disabled'], {})
             self.assertNotIn('callback_data', row[0])
+        if len(rows[1]) == 2:
+            control = rows[1][1]
+            self.assertEqual(control['text'], '⏹ 停止当前任务')
+            self.assertNotIn('disabled', control)
+            self.assertRegex(control['callback_data'], r'^stop:[0-9a-f]{24}$')
         if text:
             self.assertIn(text, self.keyboard_text(message))
 
