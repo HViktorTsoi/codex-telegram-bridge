@@ -547,8 +547,13 @@ class SessionPicker:
         text = (f"重新创建这个会话的 Telegram 话题？\n\n名称：{clean_name(thread.get('name') or target['name'])}\n"
                 f"ID：{thread_id}\n旧话题：{topic_id}\n\n新话题仍连接这个原会话，保留其历史和设置。"
                 '旧话题的待回传消息不会被自动重发；已执行的请求也不会重复执行。')
-        await self.panel(update, text, [[('确认重新创建话题', 'repair_confirm', {'thread_id': thread_id, 'topic_id': topic_id})],
-                                        [('取消', 'home', {})]])
+        rows = [[('确认重新创建话题', 'repair_confirm', {'thread_id': thread_id, 'topic_id': topic_id})]]
+        if target['key'] != self.router.config['root_target']:
+            rows.append([('取消绑定', 'unbind:start', {'key': target['key'],
+                                                    'thread_id': target['thread_id'],
+                                                    'topic_id': target['message_thread_id']})])
+        rows.append([('取消', 'home', {})])
+        await self.panel(update, text, rows)
 
     async def repair(self, thread_id, topic_id, allow_create=True):
         existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)

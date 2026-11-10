@@ -419,6 +419,18 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         self.router.mark_topic_missing('meeting', 11)
         self.assertTrue(self.router.targets['meeting']['topic_missing'])
         self.assertNotIn(11, self.router.by_topic)
+        await self.router.picker.repair_selected(
+            {'message': {'message_id': 999, 'chat': {'id': 123}, 'from': {'id': 123}}},
+            'meeting-native', 11)
+        repair_panel = self.telegram.messages[self.telegram.next_id]
+        self.assertNotIn('取消绑定', str(repair_panel['reply_markup']))
+
+        self.router.mark_topic_missing('instagram', 22)
+        await self.router.picker.repair_selected(
+            {'message': {'message_id': 1000, 'chat': {'id': 123}, 'from': {'id': 123}}},
+            'instagram-native', 22)
+        repair_panel = self.telegram.messages[self.telegram.next_id]
+        self.assertIn('取消绑定', str(repair_panel['reply_markup']))
         persisted = json.loads((self.path / 'config.json').read_text())
         reloaded = TopicRouter(persisted, self.path)
         try:
