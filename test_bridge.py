@@ -88,6 +88,34 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.finish_turn({"id": "t1", "status": "completed"})
         self.assertEqual(self.bridge.store.counts()["running_inputs"], 0)
 
+    async def test_single_chat_default_still_sends_progress_before_the_turn_finishes(self):
+        self.bridge.store.mark(1, 'running', 'active-turn')
+        for index, text in enumerate(('第一条单会话进度', '第二条单会话进度')):
+            self.bridge.record_item('active-turn', {'type': 'agentMessage', 'id': str(index),
+                                    'phase': 'commentary', 'text': text}, self.since + 1)
+        calls, sent = [], asyncio.Event()
+
+        class Telegram:
+            async def call(self, method, **params):
+                calls.append((method, params))
+                if len(calls) == 2:
+                    sent.set()
+                return {'message_id': 100 + len(calls)}
+
+        self.bridge.telegram = Telegram()
+        sender = asyncio.create_task(self.bridge.sender_loop())
+        try:
+            await asyncio.wait_for(sent.wait(), 2)
+        finally:
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+        self.assertEqual([params.get('text') or params['rich_message']['markdown'] for _, params in calls],
+                         ['第一条单会话进度', '第二条单会话进度'])
+        self.assertTrue(all(method in ('sendMessage', 'sendRichMessage') for method, _ in calls))
+        self.assertTrue(all('reply_markup' not in params for _, params in calls))
+        self.assertEqual(self.bridge.store.counts()['running_inputs'], 1)
+        self.assertEqual(self.bridge.store.counts()['unsent_messages'], 0)
+
     async def test_reconnect_recovers_accepted_input_and_reply_without_reexecution(self):
         self.bridge.store.mark(1, "dispatching")
         since = self.since

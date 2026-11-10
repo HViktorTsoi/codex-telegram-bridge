@@ -816,6 +816,8 @@ class TopicRouter:
                             "topic_missing": bool(bridge.target.get('topic_missing')),
                             "notification_mode": 'completion' if bridge.delivery.enabled else 'all',
                             "preview_style": bridge.delivery.preview_style,
+                            "preview_body_style": bridge.delivery.preview_body_style,
+                            "status_card_pin": bridge.target.get('status_card_pin', self.config.get('status_card_pin', False)),
                             "connected": bridge.ready.is_set(), "last_error": bridge.last_error, **local_counts}
         pending = self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state='pending'").fetchone()[0]
         counts['pending_inputs'] += pending

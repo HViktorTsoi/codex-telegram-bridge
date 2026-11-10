@@ -26,7 +26,8 @@ Add these fields (the IDs below are placeholders):
 {
   "mode": "topics",
   "notification_mode": "completion",
-  "preview_style": "block",
+  "preview_style": "status-bar",
+  "status_card_pin": false,
   "host_id": "zbox",
   "root_target": "meeting",
   "initial_telegram_offset": 123456,
@@ -211,72 +212,140 @@ digest and delivery state; saved topic IDs are retained through topic repair.
 Upload intent is committed before the HTTP request. Uncertain sends and crashes
 are not retried automatically; 429 retries reuse the saved bytes. Existing queued
 text is not rewritten or backfilled during migration.
-Set `notification_mode: "completion"` globally or per target to hold task
-messages until the native turn ends; the target setting takes precedence.
-Omitting it, or setting `"all"`, preserves the original immediate-delivery
-behavior. This option is specific to topic mode and leaves single-chat instances
-unchanged.
 
-After a new task input commits to the durable inbox, a receipt event wakes a
-separate preview loop. It attempts a received/preparing draft without waiting
-for native readiness, attachment preparation, `turn/start`, a first reply or a
-history scan, and runs outside the native dispatch/reconciliation locks. The
-receipt uses the real inbox identity and exact native/chat/topic route; it does
-not create a synthetic native turn or completion record. Disconnected and
-uncertain deliveries receive accurate waiting/checking labels. Existing active
-progress remains visible when more input arrives, and the real turn takes over
-the receipt's draft identity. Receipt and ordinary preview updates share a send
-lock to prevent an older response from overwriting newer progress. Direct topic
-input, selected All input and imported dispatches follow this path; commands,
-empty or unauthorized input and unselected All drafts do not. The first attempt
-is independent of model output, while visible latency still depends on Telegram
-and the network. Subsequent refreshes keep the 15-second cadence and existing
-completion-only notification rule.
+## Recommended presentation
 
-During an active turn, one temporary draft combines a two-line status header
-and cumulative visible text, refreshing about every 15 seconds. Ordinary status
-cards are neither created nor moved. The preview is bounded
-to 3800 UTF-16 units; long content shows an explicit recent-tail notice while the complete
-text and image snapshots stay in the durable outbox. An unsupported or failed
-draft never falls back to an ordinary progress message. Drafts are temporary
-and expire about 30 seconds after refresh stops; see
-[Telegram's draft API](https://core.telegram.org/bots/api#sendmessagedraft).
+New topic instances default to completion-only delivery with a persistent inline
+status bar. For deployment and uniform migration, explicitly merge these fields
+into the existing private `config.json`:
 
-`preview_style: "block"`, globally or per target, uses `sendRichMessageDraft`
-with a single `thinking` block containing the status and cumulative public
-progress text. The target setting takes precedence. An iPad trial confirmed
-whole-block text display; this is not a guarantee for every client. Older clients
-may ignore this block. Omit the setting or use `"plain"` for the compatible
-`sendMessageDraft` path, whose text animation remains client-controlled. The
-block contains the same public progress as the plain preview, not hidden model
-reasoning. See [the block definition](https://core.telegram.org/bots/api#inputrichblockthinking).
+```json
+{
+  "notification_mode": "completion",
+  "preview_style": "status-bar",
+  "status_card_pin": false
+}
+```
 
-Both styles retain one stable `draft_id` for the turn. Rotating the identifier
-does not reliably disable animation and may animate the entire draft again;
-the [Telegram protocol guide](https://core.telegram.org/api/bots/ai) documents
-client differences. Unsupported preview APIs keep task output buffered until
-completion and never fall back to ordinary progress messages. Changing preview
-style does not change the 15-second cadence, queue contents or notification rule.
+This is a field fragment, not a replacement configuration. Preserve credentials,
+owner, socket, native IDs and topic bindings. Target settings override global
+settings; remove or align old target-level copies of these three fields when
+choosing a uniform presentation. Explicit legacy settings remain supported and
+are not silently overwritten. Updating source code or copying an example does
+not edit private configuration or clear durable delivery records. Follow
+[the deployment migration steps](DEPLOYMENT.md#呈现配置与旧实例迁移), restart the
+correct instance with its actual Python interpreter, and verify each target's
+effective `notification_mode`, `preview_style`, `preview_body_style` and
+`status_card_pin` in `health.json`. Single-chat instances keep their existing
+behavior and use the separate single-chat example.
+
+After input commits to the durable inbox, a receipt event wakes a separate
+preview loop. It attempts a received/preparing preview without waiting for native
+readiness, attachment preparation, `turn/start`, a first reply or a history scan.
+The receipt uses the real inbox identity and exact native/chat/topic route; it
+does not invent a native turn or completion record. Disconnected and uncertain
+inputs show waiting/checking labels. Additional input preserves active progress,
+and the real turn adopts the receipt's display identity. The preview runs outside
+native dispatch/reconciliation locks and shares a send lock with status updates,
+so older responses cannot overwrite newer content. Direct topic input, selected
+All input and imported dispatches follow this path; system commands, empty or
+unauthorized input and unselected All drafts do not. Visible latency still
+depends on Telegram and the network.
+
+`status-bar` quietly creates one ordinary receipt message per task, then edits
+that same message with cumulative public text and two inline status rows about
+every 15 seconds. When the body is unchanged it edits only the keyboard; no
+separate status bubble is sent. Status labels are disabled buttons. A verified
+active native turn also gets an exact-turn **⏹ 停止当前任务** button; pending and
+terminal displays do not. Controls validate owner, Bot, message, topic, binding
+and turn before interrupting. Old buttons cannot stop a newer task, uncertain
+interrupt requests are not repeated, and confirmations remain in the original
+topic without model generation.
+
+Different public source items use blank lines and `────────────` separators;
+internal slices of one item join directly. A preview over 3800 UTF-16 units shows
+the recent tail with an explicit notice, while complete text and immutable media
+snapshots remain in the outbox. The bar belongs to an ordinary message and scrolls
+with it; it is not a fixed screen overlay and has no draft expiry. Its initial
+quiet creation may still produce an OS banner.
 
 Only explicit native `completed`, `failed` or `interrupted` state plus a
 successful full history scan releases a turn. An item with `final_answer` phase,
-waiting for approval/input, disconnection or an unknown state does not prove
-completion. Formal process text, results, images and the All user-text copy are
-sent silently after release; one normal completion/failure/stop notice follows
-after that turn's queued output has been handled. Desktop mirror turns follow
-the same rule. Held task output does not block explicit control replies such as
-`/sessions` or `/model`, and old completed history does not generate new notices.
+waiting for approval/input, disconnection or an unknown state is not proof of
+completion. On success, public process items are combined into quiet packets and
+the complete final assistant reply is delivered separately. Selection prefers
+the last `final_answer`, with the last public assistant item as the fallback when
+phase metadata is absent; a turn with no process sends only its final reply.
+Process and final text are separately split at 3800 UTF-16 units with balanced
+code fences and no source-text loss. Images and files remain separate quiet
+uploads. Only the final reply's last text packet has a normal notification;
+failed/interrupted output retains its combined body and corresponding status
+explanation, with only its last packet notifying.
 
-The private completion ledger freezes the original native/chat/topic route and
-persists notification intent. Repeated events and restarts do not generate a
-second completion notice; an uncertain notification send is not automatically
-repeated. The mode changes only presentation and delivery timing, with no model
-calls, settings changes or session replacement. Normal notifications still obey
-the user's Telegram mute and system Do Not Disturb settings. Telegram's
-`disable_notification` means no sound, not a guarantee against every OS banner;
-this mode avoids ordinary task messages while work is active, and phone draft
-behavior must still be verified. See the
-[official notification parameter](https://core.telegram.org/bots/api#sendmessage).
+Successful text no longer appends “✅ 本轮任务已完成”. The final reply's last
+packet retains the durable terminal keyboard. After an explicit delivery ACK,
+the bridge cleans up that task's temporary body preview by its saved message ID.
+Desktop mirror turns use the same policy. Held output does not block explicit
+control replies such as `/sessions` or `/model`, and old completed history does
+not produce new alerts.
+
+The completion ledger freezes the native/chat/topic route and notification
+intent. Repeated events and restarts do not create a second final alert; unknown
+send outcomes are not automatically retried. Prepared or attempted legacy plans
+keep their frozen content across upgrades, and sent history is not rewritten.
+This changes presentation and timing without extra model calls, settings changes
+or session replacement. Normal notifications still obey Telegram mute and system
+Do Not Disturb. `disable_notification` means no sound, not a guarantee against
+every OS banner; see [the notification parameter](https://core.telegram.org/bots/api#sendmessage).
+
+### Optional preview body styles
+
+`preview_body_style` defaults to `normal`. With `status-bar` or `status-draft`,
+explicit `quote` wraps Rich public preview text in a non-collapsed blockquote;
+explicit `footer` gives ordinary top-level paragraphs small theme-secondary text
+without a quote frame. Headings, lists, existing quotes, code and tables keep
+their normal structure. The client theme and text-size settings choose exact
+colors and sizes. Validate a single target first if using Footer, then optionally
+set it globally for targets without overrides. These styles change only the
+intermediate preview, not formal process text, final replies, controls or saved
+source. Plain output and formatting fallback preserve the original text; a code
+upgrade does not automatically enable Footer.
+
+### Explicit compatibility styles
+
+Keep these only when deliberately selected; they are not the recommended values
+for a new deployment:
+
+| `preview_style` | Intermediate display |
+|---|---|
+| `plain` | One temporary plain draft with status and cumulative public text; animation is client-controlled |
+| `block` | One Rich `thinking` draft block containing status and cumulative public text, never hidden reasoning |
+| `status-card` | One ordinary status card edited in place, plus a separate cumulative body draft |
+| `status-draft` | One ordinary cumulative body message edited per task, plus separate temporary status drafts |
+
+Temporary drafts expire about 30 seconds after refresh stops and may need the
+next refresh to reappear after switching apps. Unsupported `plain`/`block`
+previews leave output buffered until completion rather than posting ordinary
+progress messages. `status-card` and `status-draft` can create an initial quiet
+ordinary message. These modes keep the 15-second cadence, frozen destinations,
+full source content and completion-only notification rule. Explicit older styles
+continue to take precedence; uniform migration should write `status-bar` and
+check per-target overrides. See [Telegram's draft API](https://core.telegram.org/bots/api#sendmessagedraft)
+and [client streaming behavior](https://core.telegram.org/api/bots/ai).
+
+`status-draft` allocates a new status-draft ID after confirming newer ordinary
+messages, attempting to place it below the newest content. Heartbeats and body
+edits keep the current ID. Position and IDs are durable before requests, so
+retries and restarts do not repeatedly rotate them; actual layout remains
+client-controlled.
+
+`status_card_pin` remains `false` by default. Only an explicitly selected
+`status-card` setup should consider `true`; it quietly adds that status message
+to the pinned list without clearing other pins. Bot API cannot choose whether
+the client shows a pin only inside a specific topic, so this is not a fixed
+topic-footer solution. See [the pin API](https://core.telegram.org/bots/api#pinchatmessage).
+
+### Explicit immediate delivery and legacy activity cards
 
 With `notification_mode: "all"`, status cards use Rich HTML bold text on the
 first of two lines with `━━━━` separators on either side. Duration and update

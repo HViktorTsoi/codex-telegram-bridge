@@ -220,7 +220,7 @@ class ActivityTests(unittest.IsolatedAsyncioTestCase):
         target = {'key': 'manager', 'name': 'Manager', 'thread_id': 'existing',
                   'message_thread_id': 42, 'activity_indicator': True}
         config = {'thread_id': 'existing', 'owner_id': '123', 'telegram_state_dir': str(self.path),
-                  'socket_path': '/unused'}
+                  'socket_path': '/unused', 'notification_mode': 'all'}
         (self.path / 'manager').mkdir()
         bridge = TargetBridge(config, self.path / 'manager', target, lambda: '')
         try:

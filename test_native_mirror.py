@@ -14,7 +14,7 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
         self.path = Path(self.tmp.name)
         (self.path / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': ['123']}))
         self.config = {'owner_id': '123', 'thread_id': 'existing-native', 'socket_path': '/unused',
-                       'telegram_state_dir': str(self.path), 'native_mirror': True}
+                       'telegram_state_dir': str(self.path), 'native_mirror': True, 'notification_mode': 'all'}
         self.target = {'key': 'paper', 'name': '论文', 'thread_id': 'existing-native', 'message_thread_id': 42}
         self.bridge = TargetBridge(self.config, self.path, self.target, lambda: '')
         self.now = 1000
