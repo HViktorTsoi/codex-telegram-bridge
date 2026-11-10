@@ -19,7 +19,7 @@ import time
 import aiohttp
 
 from attachments import payload_from
-from bridge import BOT_COMMANDS, Bridge, Codex, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted, refresh_health_snapshot
+from bridge import BOT_COMMANDS, Bridge, Codex, InputPreparationError, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted, refresh_health_snapshot
 from session_picker import topic_missing_error
 from message_format import send_output
 from activity_indicator import TopicActivity
@@ -87,6 +87,7 @@ class RoutedStore(Store):
         for table, name, kind in (("inbox", "message_thread_id", "INTEGER"),
                                   ("inbox", "source_message_id", "INTEGER"),
                                   ("inbox", "main_guard_json", "TEXT"),
+                                  ("inbox", "skill_json", "TEXT"),
                                   ("outbox", "message_thread_id", "INTEGER")):
             columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
             if name not in columns:
@@ -97,19 +98,20 @@ class RoutedStore(Store):
             raise ValueError("Target queue is bound to another native thread")
         self.set("bound_thread_id", thread_id)
 
-    def accept(self, update, message=None, *, reply_context=None, guard_binding=None):
+    def accept(self, update, message=None, *, reply_context=None, guard_binding=None, skill=None):
         inserted = False
         with self.db:
             if message is not None:
                 inserted = bool(self.db.execute(
                     "INSERT OR IGNORE INTO inbox(id,chat_id,text,received_ms,client_id,message_json,"
-                    "media_group_id,message_thread_id,source_message_id,reply_json,main_guard_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "media_group_id,message_thread_id,source_message_id,reply_json,main_guard_json,skill_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (update["update_id"], str(message["chat"]["id"]),
                      message.get("text") or message.get("caption", ""), now_ms(),
                      "telegram-" + str(update["update_id"]), json.dumps(payload_from(message), ensure_ascii=False),
                      str(message["media_group_id"]) if message.get("media_group_id") else None,
                      topic_of(message), message.get("message_id"), reply_serialized(message, reply_context),
-                     json.dumps(guard_binding, sort_keys=True) if guard_binding else None),
+                     json.dumps(guard_binding, sort_keys=True) if guard_binding else None,
+                     json.dumps(skill, sort_keys=True) if skill else None),
                 ).rowcount)
             self.db.execute("INSERT OR REPLACE INTO kv VALUES('offset',?)",
                             (str(max(int(self.get("offset", 0)), update["update_id"] + 1)),))
@@ -184,6 +186,49 @@ class TargetBridge(Bridge):
                                       '所选会话的绑定已变化，这条 All 消息尚未执行。请重新发送并选择目标会话。', None)
                 return False
         return True
+
+    async def prepare_inputs(self, rows, inputs):
+        selected = []
+        try:
+            for row in rows:
+                if not row['skill_json']:
+                    continue
+                skill = json.loads(row['skill_json'])
+                if (not isinstance(skill, dict) or set(skill) != {'name', 'path', 'cwd'}
+                        or not all(isinstance(skill.get(key), str) and skill[key].strip()
+                                   for key in ('name', 'path', 'cwd'))
+                        or not Path(skill['path']).is_absolute() or not Path(skill['cwd']).is_absolute()):
+                    raise ValueError('Invalid selected skill')
+                if skill not in selected:
+                    selected.append(skill)
+        except (KeyError, TypeError, ValueError):
+            raise InputPreparationError('技能选择记录无效，请重新打开 /skills 选择技能。') from None
+        if not selected:
+            return inputs
+        try:
+            result = await asyncio.wait_for(self.codex.call('thread/read', {'threadId': self.thread_id}), 5)
+            if not isinstance(result, dict) or not isinstance(result.get('thread'), dict):
+                raise InputPreparationError('无法读取当前会话，本次技能任务未提交。请稍后重新打开 /skills。')
+            thread = result.get('thread', {})
+            cwd = thread.get('cwd')
+            if (thread.get('id') != self.thread_id or thread.get('ephemeral')
+                    or thread.get('canAcceptDirectInput') is False
+                    or any(skill['cwd'] != cwd for skill in selected)):
+                raise InputPreparationError('会话工作目录已变化，请重新打开 /skills 选择技能。')
+            result = await asyncio.wait_for(self.codex.call('skills/list', {'cwds': [cwd], 'forceReload': True}), 5)
+            if not isinstance(result, dict) or not isinstance(result.get('data'), list):
+                raise InputPreparationError('无法读取技能列表，本次任务未提交。请稍后重新打开 /skills。')
+            available = [skill for group in result['data']
+                         if isinstance(group, dict) and group.get('cwd') == cwd
+                         and isinstance(group.get('skills'), list)
+                         for skill in group['skills'] if isinstance(skill, dict)]
+            if any(not any(skill.get('enabled') is True and skill.get('name') == chosen['name']
+                           and skill.get('path') == chosen['path'] for skill in available)
+                   for chosen in selected):
+                raise InputPreparationError('所选技能已不可用或被禁用，请重新打开 /skills 选择技能。')
+        except (RpcError, ConnectionError, asyncio.TimeoutError):
+            raise InputPreparationError('暂时无法核验所选技能，本次任务未提交。请稍后重新打开 /skills。') from None
+        return [*inputs, *({'type': 'skill', 'name': skill['name'], 'path': skill['path']} for skill in selected)]
 
     def mirror_allowed(self):
         return (self.target.get('native_mirror', self.config.get('native_mirror', False))
@@ -325,6 +370,7 @@ class TargetBridge(Bridge):
             reply = (self.sessions_text() + "\n\n进入对应话题即可继续原会话。\n"
                      "All 普通消息选择接收会话即发送；/sessions → 待发送可找回未发内容。\n"
                      "/sessions 查看会话并添加绑定\n"
+                     "/skills 查看本机会话可用技能并选择使用\n"
                      "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
                      "/status 查看此会话及完整 ID\n/model 查看或切换此会话模型\n"
                      "/effort 查看或修改此会话强度\n/stop 停止此会话的当前任务\n"
@@ -627,6 +673,8 @@ class TopicRouter:
         self.control = ControlCenter(self)
         from status_controls import StatusControls
         self.status_controls = StatusControls(self)
+        from skills_menu import SkillsMenu
+        self.skills = SkillsMenu(self)
 
     def access(self):
         try:
@@ -655,6 +703,8 @@ class TopicRouter:
             return
         if self.picker.renamer.is_reply(update):
             self.picker.ingest(update)
+            return
+        if self.skills.ingest(update):
             return
         if self.picker.guard.ingest(update):
             return
@@ -994,7 +1044,8 @@ class TopicRouter:
             scope = {'type': 'chat', 'chat_id': int(self.owner)}
             from control_center import COMMANDS
             commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'},
-                        {'command': 'rename', 'description': '修改会话名称，同步话题名称'}, *COMMANDS]
+                        {'command': 'rename', 'description': '修改会话名称，同步话题名称'},
+                        {'command': 'skills', 'description': '查看本机会话技能并选择使用'}, *COMMANDS]
             if await self.telegram.call('getMyCommands', scope=scope) != commands:
                 await self.telegram.call('setMyCommands', scope=scope, commands=commands)
             self.failure = asyncio.get_running_loop().create_future()
@@ -1002,12 +1053,14 @@ class TopicRouter:
             try:
                 await self.picker.recover()
                 self.status_controls.recover()
+                self.skills.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
                     self.spawn(coro)
                 self.spawn(self.picker.home_loop())
                 self.spawn(self.status_controls.loop())
+                self.spawn(self.skills.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())
