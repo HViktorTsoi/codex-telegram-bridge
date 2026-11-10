@@ -897,12 +897,14 @@ class TopicRouter:
         from control_center import alias, clean, read_json, write_json
         path = self.state_dir / 'control/local.json'
         snapshot = read_json(path, {'host': self.control.host, 'generated': 0, 'entries': []})
-        entry = next((e for e in snapshot.get('entries', []) if e.get('thread_id') == updated['thread_id']), None)
+        entry = next((e for e in snapshot.get('entries', [])
+                      if e.get('host') == self.control.host and e.get('thread_id') == updated['thread_id']), None)
         if entry is None:
             entry = {'host': self.control.host, 'thread_id': updated['thread_id'],
                      'target_key': key, 'topic_id': updated['message_thread_id'], 'status': {}, 'updated': 0}
             snapshot.setdefault('entries', []).append(entry)
         entry['name'] = clean(new_name, 50)
+        entry['metadata_name'] = clean(new_name, 50)
         entry.update(target_key=key, topic_id=updated['message_thread_id'], topic_missing=False)
         entry['aliases'] = list(dict.fromkeys([*(alias(a) for a in updated.get('aliases', [])),
                                               alias(entry['name']), key]))

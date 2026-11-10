@@ -296,18 +296,45 @@ class ControlCenter:
             self.db.execute("UPDATE kv SET value=? WHERE key='offset'", (str(max(self.router.store.offset(), update['update_id'] + 1)),))
         return True
 
+    def _local_entries(self, raw_entries):
+        """Overlay live bindings even when the native catalog omits a new thread."""
+        entries = {}
+        for raw in raw_entries:
+            thread_id = raw.get('thread_id')
+            if raw.get('host') != self.host or not thread_id or thread_id in entries:
+                continue
+            entry = dict(raw)
+            entry.update(target_key=None, topic_id=None, topic_missing=False)
+            entry['name'] = clean(entry.get('name') or '未命名', 50)
+            status = entry.get('status')
+            entry['status'] = dict(status) if isinstance(status, dict) else {}
+            entry['status']['type'] = entry['status'].get('type') or 'unknown'
+            entry['aliases'] = [alias(value) for value in (entry.get('metadata_name'), thread_id) if value]
+            entries[thread_id] = entry
+        for key, target in self.router.targets.items():
+            thread_id = target['thread_id']
+            entry = entries.get(thread_id)
+            if entry is None:
+                entry = {'host': self.host, 'thread_id': thread_id, 'cwd': None, 'updated': 0,
+                         'status': {'type': 'unknown'}, 'metadata_pending': True, 'questions': []}
+                entries[thread_id] = entry
+            entry.update(target_key=key, topic_id=target['message_thread_id'],
+                         topic_missing=bool(target.get('topic_missing')),
+                         bot_username=self.router.username or self.router.config.get('expected_bot_username', ''))
+            entry['name'] = clean(target.get('name') or entry.get('metadata_name') or entry.get('name') or '未命名', 50)
+            configured = target.get('aliases', [])
+            values = [*(configured if isinstance(configured, (list, tuple)) else []),
+                      target.get('name'), entry.get('metadata_name'), key]
+            entry['aliases'] = list(dict.fromkeys(alias(value) for value in values
+                                                  if isinstance(value, str) and value.strip()))
+        return list(entries.values())
+
     def view(self):
         local = read_json(self.router.state_dir / 'control/local.json', {'host': self.host, 'generated': 0, 'entries': []})
-        nodes = {self.host: local}
-        entries = []
-        for node in nodes.values():
-            for raw in node.get('entries', []):
-                if raw.get('host') != self.host:
-                    continue
-                entry = dict(raw)
-                entry['stale'] = time.time() - node.get('generated', 0) > 60
-                entries.append(entry)
-        return entries, nodes
+        entries = self._local_entries(local.get('entries', []))
+        for entry in entries:
+            entry['stale'] = time.time() - local.get('generated', 0) > 60
+        return entries, {self.host: local}
 
     @staticmethod
     def selector(entry):
@@ -380,7 +407,8 @@ class ControlCenter:
         lines, rows = [heading], []
         for entry in entries[start:start + self.PAGE]:
             status = entry.get('status', {})
-            badge = ('⚠️ 数据过期' if entry['stale'] else '🙋 等待处理' if status.get('activeFlags')
+            badge = ('状态待同步' if entry.get('metadata_pending') or status.get('type') in (None, 'unknown')
+                     else '⚠️ 数据过期' if entry['stale'] else '🙋 等待处理' if status.get('activeFlags')
                      else '⏳ 工作中' if status.get('type') == 'active' else '✅ 上轮完成' if entry.get('last_status') == 'completed'
                      else '⏹ 已停止' if entry.get('last_status') == 'interrupted' else '❌ 失败' if entry.get('last_status') == 'failed' else '空闲')
             lines.append('\n' + entry['host'] + ' / ' + clean(entry['name'], 40) + ' · ' + badge)
@@ -593,7 +621,8 @@ class ControlCenter:
 
     async def refresh(self):
         previous = read_json(self.router.state_dir / 'control/local.json', {})
-        cache = {e['thread_id']: e for e in previous.get('entries', [])}
+        cache = {e['thread_id']: e for e in previous.get('entries', [])
+                 if e.get('host') == self.host and e.get('thread_id')}
         threads, cursor = [], None
         for _ in range(5):
             params = {'limit': 100, 'sortKey': 'updated_at', 'sortDirection': 'desc', 'archived': False}
@@ -604,22 +633,26 @@ class ControlCenter:
             if not cursor:
                 break
         bound = {t['thread_id']: t for t in self.router.targets.values()}
-        entries = []
+        entries, seen = [], set()
         for thread in threads:
-            if thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
+            thread_id = thread.get('id')
+            if (not thread_id or thread_id in seen or thread.get('ephemeral')
+                    or thread.get('canAcceptDirectInput') is False):
                 continue
+            seen.add(thread_id)
             target = bound.get(thread['id'], {})
             old = cache.get(thread['id'], {})
+            status = thread.get('status')
+            status = dict(status) if isinstance(status, dict) else {}
+            status['type'] = status.get('type') or 'unknown'
             entry = {**old, 'host': self.host, 'thread_id': thread['id'], 'name': clean(thread.get('name') or target.get('name') or thread.get('preview') or '未命名', 50),
-                     'cwd': (thread.get('cwd') if isinstance(thread.get('cwd'), str) and thread['cwd'] else
-                             old.get('cwd') if old.get('host', self.host) == self.host else None),
-                     'status': thread.get('status', {}), 'updated': thread.get('updatedAt', 0),
-                     'target_key': target.get('key'), 'topic_id': target.get('message_thread_id'),
-                     'topic_missing': bool(target.get('topic_missing')), 'bot_username': self.router.username or self.router.config.get('expected_bot_username', '')}
-            configured = target.get('aliases', [])
-            entry['aliases'] = list(dict.fromkeys([*(alias(a) for a in configured), alias(entry['name']), target.get('key', thread['id'])]))
+                     'metadata_name': clean(thread.get('name'), 50) or None, 'metadata_pending': False,
+                     'cwd': thread.get('cwd') if isinstance(thread.get('cwd'), str) and thread['cwd'] else old.get('cwd'),
+                     'status': status,
+                     'updated': thread.get('updatedAt', 0),
+                     'bot_username': self.router.username or self.router.config.get('expected_bot_username', '')}
             active = entry['status'].get('type') == 'active'
-            if not old or old.get('updated') != entry['updated'] or (active and time.time() - old.get('details_at', 0) > 15):
+            if not old or old.get('metadata_pending') or old.get('updated') != entry['updated'] or (active and time.time() - old.get('details_at', 0) > 15):
                 try:
                     history = await self.router.catalog_call('thread/turns/list', {'threadId': thread['id'], 'limit': 2, 'sortDirection': 'desc', 'itemsView': 'full'})
                     turns = history.get('data', [])
@@ -629,6 +662,7 @@ class ControlCenter:
                     entry['latest_reply'] = clean(agents[-1] if agents else '', 1200)
                     entry['questions'] = questions_for(entry, turns)
                     entry['details_at'] = time.time()
+                    entry.pop('detail_error', None)
                 except (RpcError, ConnectionError, asyncio.TimeoutError):
                     entry['detail_error'] = True
             elif entry['status'].get('activeFlags'):
@@ -637,7 +671,8 @@ class ControlCenter:
             elif any(q.get('kind') == 'native' for q in entry.get('questions', [])):
                 entry['questions'] = []
             entries.append(entry)
-        write_json(self.router.state_dir / 'control/local.json', {'host': self.host, 'generated': time.time(), 'entries': entries})
+        write_json(self.router.state_dir / 'control/local.json',
+                   {'host': self.host, 'generated': time.time(), 'entries': self._local_entries(entries)})
 
     async def refresh_loop(self):
         while True:
