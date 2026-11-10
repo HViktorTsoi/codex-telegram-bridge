@@ -245,12 +245,15 @@ class TargetBridge(Bridge):
             collect = self.delivery.collect_output(turn['id'])
             if terminal or (routes and any(r['pending'] for r in ready_rows)):
                 occurrences = Counter()
+                final_candidates = []
+                legacy_final_sources = {}
                 legacy_sources = {}
                 prefix = 'turn:' + turn['id'] + ':'
                 for old in self.store.db.execute('SELECT * FROM outbox WHERE substr(key,1,?)=? ORDER BY rowid',
                                                   (len(prefix), prefix)):
                     base = old['key'].rsplit(':topic:', 1)[0]
-                    if base.startswith(prefix + 'completion-content-') or old['media_json']:
+                    if (base.startswith(prefix + 'completion-content-') or old['media_json']
+                            or base.startswith(prefix + 'delivery-warning-') or base == prefix + 'status'):
                         continue
                     source = (old['chat_id'], old['message_thread_id'], base)
                     legacy_sources[source] = legacy_sources.get(source, '') + old['text']
@@ -271,6 +274,8 @@ class TargetBridge(Bridge):
                     if not terminal and fingerprint not in ready:
                         continue
                     identity = 'completion-content-' + fingerprint + '-' + str(occurrences[fingerprint])
+                    if terminal:
+                        final_candidates.append((fingerprint + '-' + str(occurrences[fingerprint]), item.get('phase')))
                     body = self.store.images.agent_text(turn['id'], item)
                     for route in routes:
                         completed_ms = entry.get('completedAtMs')
@@ -280,9 +285,27 @@ class TargetBridge(Bridge):
                         if completed_ms is not None and completed_ms < cutoff:
                             continue
                         if completed_ms is None and history_occurrences[source] <= legacy[source]:
+                            matching = [base for (chat, topic, base), text in legacy_sources.items()
+                                        if chat == route['chat_id'] and topic == route['message_thread_id'] and text == body]
+                            legacy_base = matching[history_occurrences[source] - 1]
+                            legacy_final_sources[(str(route['chat_id']), route['message_thread_id'],
+                                                  fingerprint + '-' + str(occurrences[fingerprint]))] = (
+                                                      legacy_base + f":topic:{route['message_thread_id'] or 0}")
                             continue  # Legacy delivery already owns this history occurrence.
                         self.store.enqueue_at(f"turn:{turn['id']}:{identity}", route['chat_id'],
                                               body, route['message_thread_id'])
+                if turn.get('status') == 'completed':
+                    destinations = {(str(route['chat_id']), route['message_thread_id']) for route in routes}
+                    destinations.add((str(self.owner), self.target['message_thread_id']))
+                    for chat_id, topic_id in destinations:
+                        candidates = []
+                        for identity, phase in final_candidates:
+                            legacy_base = legacy_final_sources.get((chat_id, topic_id, identity))
+                            bases = ([legacy_base] if legacy_base else
+                                     [f"turn:{turn['id']}:{kind}{identity}:topic:{topic_id or 0}"
+                                      for kind in ('completion-content-', 'native-content-')])
+                            candidates.extend((base, phase) for base in bases)
+                        self.delivery.batches.choose_final(turn['id'], chat_id, topic_id, candidates)
                 with self.store.db:
                     for fingerprint in occurrences:
                         self.store.db.execute('UPDATE completion_ready_items SET pending=0 WHERE turn_id=? AND fingerprint=?',

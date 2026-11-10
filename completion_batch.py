@@ -10,14 +10,17 @@ from message_format import message_parts, utf16_size
 
 
 STATUS = {
-    'completed': '✅ 本轮任务已完成。',
+    'completed': '',
     'failed': '❌ 本轮任务执行失败，请查看上方过程和 Codex 会话。',
     'interrupted': '⏹ 本轮任务已停止。',
 }
 ITEM_SEPARATOR = '\n\n────────────\n\n'
+LEGACY_SUCCESS = '✅ 本轮任务已完成。'
 
 
 class CompletionBatches:
+    SPLIT_KEY = 'completion_split_notice_v1:'
+
     def __init__(self, delivery):
         self.delivery, self.db = delivery, delivery.db
         self.db.executescript('''
@@ -27,6 +30,9 @@ class CompletionBatches:
             CREATE TABLE IF NOT EXISTS completion_packet_sources(
                 source_key TEXT PRIMARY KEY,turn_id TEXT,chat_id TEXT,topic_id INTEGER,
                 generation INTEGER);
+            CREATE TABLE IF NOT EXISTS completion_final_sources(
+                turn_id TEXT,chat_id TEXT,topic_id INTEGER,source_base TEXT,
+                PRIMARY KEY(turn_id,chat_id,topic_id));
             CREATE INDEX IF NOT EXISTS completion_packets_route
                 ON completion_packets(turn_id,chat_id,topic_id);
             CREATE INDEX IF NOT EXISTS completion_packet_sources_route
@@ -72,13 +78,54 @@ class CompletionBatches:
 
     @staticmethod
     def without_status(text):
-        for status in STATUS.values():
+        for status in (LEGACY_SUCCESS, *STATUS.values()):
+            if not status:
+                continue
             if text == status:
                 return ''
             suffix = '\n\n' + status
             if text.endswith(suffix):
                 return text[:-len(suffix)]
         return text
+
+    def choose_final(self, turn_id, chat_id, topic_id, candidates):
+        """Freeze a native item's identity only after its complete history scan."""
+        group = self.delivery._group(turn_id, chat_id, topic_id)
+        if group is None or group['stage'] == 'ready':
+            return
+        eligible = []
+        for source_base, phase in candidates:
+            exists = self.db.execute('SELECT 1 FROM outbox WHERE chat_id=? AND message_thread_id=? '
+                                     'AND substr(key,1,?)=? AND (message_id IS NULL OR message_id=-2) LIMIT 1',
+                                     (str(chat_id), topic_id, len(source_base) + 1, source_base + ':')).fetchone()
+            if exists:
+                eligible.append((source_base, phase))
+        marked = [source for source, phase in eligible if phase == 'final_answer']
+        if not eligible:
+            return  # Legacy identities remain eligible for the queue fallback.
+        chosen = marked[-1] if marked else eligible[-1][0]
+        with self.db:
+            self.db.execute('INSERT INTO completion_final_sources VALUES(?,?,?,?) '
+                            'ON CONFLICT(turn_id,chat_id,topic_id) DO UPDATE SET source_base=excluded.source_base',
+                            (turn_id, str(chat_id), topic_id, chosen))
+
+    def _final_base(self, group, sources):
+        saved = self.db.execute('SELECT source_base FROM completion_final_sources '
+                                'WHERE turn_id=? AND chat_id=? AND topic_id=?', self.identity(group)).fetchone()
+        if saved:
+            return saved['source_base']
+        # Legacy/direct queue producers have no phase metadata. Freeze the last
+        # public assistant item, excluding transport notices and user echoes.
+        prefix = 'turn:' + group['turn_id'] + ':'
+        candidates = [row['key'].rsplit(':', 1)[0] for row in sources
+                      if row['key'].startswith(prefix)
+                      and not row['key'].startswith(prefix + 'delivery-warning-')
+                      and not row['key'].startswith(prefix + 'status:')]
+        chosen = candidates[-1] if candidates else ''
+        if chosen:
+            self.db.execute('INSERT OR IGNORE INTO completion_final_sources VALUES(?,?,?,?)',
+                            (*self.identity(group), chosen))
+        return chosen
 
     def _insert_packet(self, group, generation, index, text, rich_text, retry_at):
         key = f"completion-part:{self.digest(group)}:{generation}:{index}:topic:{group['topic_id']}:0"
@@ -103,6 +150,8 @@ class CompletionBatches:
                                'ORDER BY o.rowid', self.identity(group)).fetchall()
 
     def _prepare(self, group):
+        if group['status'] == 'completed':
+            return self._prepare_completed(group)
         if self.media_pending(group):
             return  # Snapshot upload failures into the same final text, too.
         pending = self._sources(group)
@@ -164,6 +213,61 @@ class CompletionBatches:
                                 (source['key'], *self.identity(group), generation))
                 self.db.execute('UPDATE outbox SET message_id=-2 WHERE key=? AND message_id IS NULL', (source['key'],))
 
+    def _prepare_completed(self, group):
+        if self.media_pending(group):
+            return
+        pending = self._sources(group)
+        final_key = group['notice_key'] or f"completion-notice:{self.digest(group)}:topic:{group['topic_id']}:0"
+        final = self.db.execute('SELECT * FROM outbox WHERE key=?', (final_key,)).fetchone()
+        final_mutable = (group['notice_state'] in ('none', 'queued')
+                         and (final is None or final['message_id'] is None))
+        if not pending and (final is not None or group['notice_state'] != 'none'):
+            return
+        begun = self.db.execute('SELECT 1 FROM completion_packets WHERE turn_id=? AND chat_id=? AND topic_id=? '
+                                'AND begun=1 LIMIT 1', self.identity(group)).fetchone()
+        # Once any prefix was attempted its body and the prepared final tail
+        # remain frozen. Late progress/warnings become additional quiet packets.
+        rebuild = final_mutable and not begun and (final is None or not final['attempts'])
+        sources = self._sources(group, include_claimed=True) if rebuild else pending
+        generation = self._generation(group)
+        retry_at = max(max((row['retry_at'] for row in sources), default=0),
+                       final['retry_at'] if final_mutable and final else 0)
+        rich = self.delivery.store.get('output_format', 'rich') == 'rich'
+        with self.db:
+            final_base = self._final_base(group, sources)
+            if rebuild:
+                self.db.execute('UPDATE outbox SET message_id=-1 WHERE message_id IS NULL AND key IN '
+                                '(SELECT key FROM completion_packets WHERE turn_id=? AND chat_id=? AND topic_id=? '
+                                "AND state='queued' AND begun=0)", self.identity(group))
+                self.db.execute("UPDATE completion_packets SET state='superseded' WHERE turn_id=? AND chat_id=? AND topic_id=? "
+                                "AND state='queued' AND begun=0", self.identity(group))
+            final_sources = [row for row in sources if row['key'].rsplit(':', 1)[0] == final_base] if rebuild else []
+            history = [row for row in sources if row not in final_sources]
+            history_parts = list(message_parts(self.body(history), rich=rich, limit=self.delivery.LIMIT))
+            index = 0
+            for raw, formatted in history_parts:
+                self._insert_packet(group, generation, index, raw, formatted, retry_at)
+                index += 1
+            if rebuild or (final_mutable and final is None):
+                final_body = self.body(final_sources) or '本轮没有文本回复。'
+                final_parts = list(message_parts(final_body, rich=rich, limit=self.delivery.LIMIT))
+                for raw, formatted in final_parts[:-1]:
+                    self._insert_packet(group, generation, index, raw, formatted, retry_at)
+                    index += 1
+                raw, formatted = final_parts[-1]
+                self.db.execute('INSERT INTO outbox(key,chat_id,text,rich_text,message_thread_id,retry_at) '
+                                'VALUES(?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET '
+                                'text=excluded.text,rich_text=excluded.rich_text,retry_at=excluded.retry_at',
+                                (final_key, group['chat_id'], raw, formatted, group['topic_id'], retry_at))
+                self.db.execute("UPDATE completion_turns SET notice_state='queued',notice_key=? "
+                                'WHERE turn_id=? AND chat_id=? AND topic_id=?', (final_key, *self.identity(group)))
+                self.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)', (self.SPLIT_KEY + final_key, '1'))
+            for source in sources:
+                self.db.execute('INSERT INTO completion_packet_sources VALUES(?,?,?,?,?) '
+                                'ON CONFLICT(source_key) DO UPDATE SET generation=excluded.generation',
+                                (source['key'], *self.identity(group), generation))
+                self.db.execute('UPDATE outbox SET message_id=-2 WHERE key=? AND message_id IS NULL', (source['key'],))
+
     def prepare(self):
         for group in self.db.execute("SELECT * FROM completion_turns WHERE stage='ready' AND notify=1 "
                                      "AND status IN ('completed','failed','interrupted') "
@@ -184,8 +288,9 @@ class CompletionBatches:
         for group in self.db.execute("SELECT * FROM completion_turns WHERE notice_state='queued'").fetchall():
             row = self.db.execute('SELECT * FROM outbox WHERE key=?', (group['notice_key'],)).fetchone()
             if row and row['message_id'] is None:
-                text = self.without_status(row['text'])
-                rich = self.without_status(row['rich_text']) if row['rich_text'] is not None else None
+                split = self.delivery.store.get(self.SPLIT_KEY + row['key']) == '1'
+                text = row['text'] if split else self.without_status(row['text'])
+                rich = row['rich_text'] if split or row['rich_text'] is None else self.without_status(row['rich_text'])
                 if text:
                     self._insert_packet(group, self._generation(group), 0, text, rich, row['retry_at'])
 

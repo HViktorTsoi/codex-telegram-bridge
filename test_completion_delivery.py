@@ -87,8 +87,13 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.delivery.next_row())
         self.now += 20
         first = self.delivery.next_row()
-        self.assertEqual(first['text'], '第一段等待限流重试\n\n────────────\n\n第二段不能提前发送\n\n✅ 本轮任务已完成。')
+        self.assertEqual(first['text'], '第一段等待限流重试')
+        self.assertTrue(self.delivery.silent(first))
         self.mark_sent(first)
+        final = self.delivery.next_row()
+        self.assertEqual(final['text'], '第二段不能提前发送')
+        self.assertFalse(self.delivery.silent(final))
+        self.mark_sent(final)
         self.assertIsNone(self.delivery.next_row())
 
     async def test_terminal_event_does_not_release_before_full_scan_seal(self):
@@ -101,7 +106,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.delivery.next_row())
         self.assertTrue(self.delivery.seal(self.turn('completed')))
         row = self.delivery.next_row()
-        self.assertEqual(row['text'], '阶段一\n\n✅ 本轮任务已完成。')
+        self.assertEqual(row['text'], '阶段一')
         self.assertFalse(self.delivery.silent(row))
         self.assertTrue(row['key'].startswith('completion-notice:'))
         self.delivery.begin(row)
@@ -239,7 +244,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.delivery.seal(self.turn('completed', tid='still-active'))
         self.assertTrue(self.delivery.next_row()['key'].startswith('completion-notice:'))
 
-    async def test_reenable_suppresses_an_old_queued_unnoticed_completion(self):
+    async def test_reenable_suppresses_old_alert_but_preserves_prepared_body(self):
         self.delivery.watch(self.turn())
         self.delivery.seal(self.turn('completed'))
         notice = self.delivery.next_row()
@@ -248,6 +253,10 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.now += 15
         self.bridge.config['notification_mode'] = 'completion'
         self.delivery = CompletionDelivery(self.bridge, clock=lambda: self.now)
+        preserved = self.delivery.next_row()
+        self.assertEqual(preserved['text'], '本轮没有文本回复。')
+        self.assertTrue(self.delivery.silent(preserved))
+        self.mark_sent(preserved)
         self.assertIsNone(self.delivery.next_row())
         saved = self.store.db.execute('SELECT message_id FROM outbox WHERE key=?', (notice['key'],)).fetchone()
         self.assertEqual(saved[0], -1)
@@ -266,7 +275,11 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.delivery.seal(self.turn('completed'))
         row = self.delivery.next_row()
         self.assertIn('📩 原输入', row['text'])
-        self.assertFalse(self.delivery.silent(row))
+        self.assertTrue(self.delivery.silent(row))
+        self.mark_sent(row)
+        final = self.delivery.next_row()
+        self.assertEqual(final['text'], '本轮没有文本回复。')
+        self.assertFalse(self.delivery.silent(final))
 
     async def test_approval_notice_remains_frozen_to_original_turn(self):
         self.delivery.watch(self.turn())
@@ -276,7 +289,11 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.delivery.watch(self.turn(tid='second'))
         row = self.delivery.next_row()
         self.assertIn('请返回 Codex 处理', row['text'])
-        self.assertFalse(self.delivery.silent(row))
+        self.assertTrue(self.delivery.silent(row))
+        self.mark_sent(row)
+        final = self.delivery.next_row()
+        self.assertEqual(final['text'], '本轮没有文本回复。')
+        self.assertFalse(self.delivery.silent(final))
         self.assertEqual(self.store.db.execute('SELECT turn_id FROM completion_rows WHERE key LIKE ?',
                                              ('request:rpc-1%',)).fetchone()[0], 'work')
 
@@ -292,10 +309,14 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.store.db.execute('UPDATE outbox SET message_id=-1 WHERE key=?', (image['key'],))
         self.output('图片结果尚未确认', 'image-error:' + image['key'])
         error = self.delivery.next_row()
-        self.assertTrue(error['key'].startswith('completion-notice:'))
+        self.assertTrue(error['key'].startswith('completion-part:'))
         self.assertIn('图片结果尚未确认', error['text'])
-        self.assertFalse(self.delivery.silent(error))
+        self.assertTrue(self.delivery.silent(error))
         self.mark_sent(error)
+        final = self.delivery.next_row()
+        self.assertEqual(final['text'], '本轮没有文本回复。')
+        self.assertFalse(self.delivery.silent(final))
+        self.mark_sent(final)
         self.assertIsNone(self.delivery.next_row())
 
     async def test_late_content_precedes_already_queued_notice(self):
@@ -304,7 +325,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         notice = self.delivery.next_row()
         self.output('迟到的最终片段', 'turn:work:late')
         content = self.delivery.next_row()
-        self.assertEqual(content['text'], '迟到的最终片段\n\n✅ 本轮任务已完成。')
+        self.assertEqual(content['text'], '迟到的最终片段')
         self.assertEqual(content['key'], notice['key'])
         self.mark_sent(content)
         self.assertIsNone(self.delivery.next_row())
