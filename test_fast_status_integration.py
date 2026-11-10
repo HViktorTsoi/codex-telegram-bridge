@@ -245,7 +245,12 @@ class FastStatusIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(lambda: any(method in ('sendMessage', 'sendRichMessage')
                                         for method, _ in self.telegram_calls))
         methods = [method for method, _ in self.telegram_calls]
-        self.assertLess(methods.index('sendRichMessageDraft'), methods.index('sendMessage'))
+        final_index = next(index for index, method in enumerate(methods)
+                           if method in ('sendMessage', 'sendRichMessage'))
+        self.assertLess(methods.index('sendRichMessageDraft'), final_index)
+        final = self.telegram_calls[final_index][1]
+        self.assertEqual(final.get('text') or final.get('rich_message', {}).get('markdown'),
+                         '本轮没有文本回复。')
         self.assertEqual(sum(method in ('sendMessage', 'sendRichMessage') for method in methods), 1)
         self.assertEqual(self.bridge.store.db.execute('SELECT notice_state FROM completion_turns').fetchone()[0], 'sent')
 

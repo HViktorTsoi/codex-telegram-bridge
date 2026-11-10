@@ -167,7 +167,7 @@ class FooterPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(not silent for _, _, silent in rows), 1)
         self.assertNotIn(preview_id, self.messages)
         final = next(iter(self.messages.values()))
-        self.assertEqual(final['rich_message'], {'markdown': body + '\n\n✅ 本轮任务已完成。'})
+        self.assertEqual(final['rich_message'], {'markdown': body})
         self.assert_status_keyboard(final, '已完成')
         self.assertEqual(self.controls(final), [])
 

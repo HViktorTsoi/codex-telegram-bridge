@@ -73,7 +73,7 @@ class QuotePreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(preview_id, self.messages)
         self.assertEqual(len(self.messages), 1)
         final = next(iter(self.messages.values()))
-        self.assertEqual(self.body_text(final), body + '\n\n✅ 本轮任务已完成。')
+        self.assertEqual(self.body_text(final), body)
         self.assert_status_keyboard(final, '已完成')
         self.assertEqual(self.controls(final), [])
 
