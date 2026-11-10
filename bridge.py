@@ -34,6 +34,10 @@ BOT_COMMANDS = [
 ]
 
 
+class InputPreparationError(Exception):
+    """A selected input is no longer valid and must not start a model turn."""
+
+
 def now_ms():
     return int(time.time() * 1000)
 
@@ -545,6 +549,9 @@ class Bridge:
     def validate_destination(self, rows):
         return True
 
+    async def prepare_inputs(self, rows, inputs):
+        return inputs
+
     async def dispatch_one(self, row):
         update_id, text, chat_id = row["id"], row["text"], row["chat_id"]
         batch = self.store.batch(row)
@@ -604,8 +611,10 @@ class Bridge:
             return
         try:
             user_input = await inputs_for(batch, self.telegram, self.state_dir / "inbox")
-        except AttachmentError as error:
-            self.store.enqueue(f"input:{update_id}:attachment_error", chat_id, str(error))
+            user_input = await self.prepare_inputs(batch, user_input)
+        except (AttachmentError, InputPreparationError) as error:
+            kind = 'attachment_error' if isinstance(error, AttachmentError) else 'input_error'
+            self.store.enqueue(f"input:{update_id}:{kind}", chat_id, str(error))
             self.store.mark_batch(batch, "failed")
             return
         if not self.owner_allowed():
