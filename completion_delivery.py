@@ -34,6 +34,9 @@ class CompletionDelivery:
         self.preview_style = bridge.target.get('preview_style', bridge.config.get('preview_style', 'plain'))
         if self.preview_style not in ('plain', 'block', 'status-card', 'status-draft', 'status-bar'):
             raise ValueError('preview_style must be plain, block, status-card, status-draft or status-bar')
+        self.preview_body_style = bridge.target.get('preview_body_style', bridge.config.get('preview_body_style', 'normal'))
+        if self.preview_body_style not in ('normal', 'quote'):
+            raise ValueError('preview_body_style must be normal or quote')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS completion_turns(
                 turn_id TEXT,chat_id TEXT,topic_id INTEGER,native_id TEXT,
@@ -62,6 +65,9 @@ class CompletionDelivery:
                     state['preview_style'] = self.preview_style
                     state.pop('draft_unsupported', None)
                     self.store.set(self.KEY, json.dumps(state))
+                if state.get('preview_body_style', 'normal') != self.preview_body_style:
+                    state['preview_body_style'] = self.preview_body_style
+                    self.store.set(self.KEY, json.dumps(state))
         elif state:
             state['enabled'] = False
             self.store.set(self.KEY, json.dumps(state))
@@ -85,7 +91,8 @@ class CompletionDelivery:
                             "ELSE notice_state END")
             self.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)',
                             (self.KEY, json.dumps({'route': self.route(), 'since': self.clock(), 'enabled': True,
-                                                   'preview_style': self.preview_style})))
+                                                   'preview_style': self.preview_style,
+                                                   'preview_body_style': self.preview_body_style})))
             self.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)', (self.RECEIPT_KEY, '{}'))
 
     def _current(self, row):

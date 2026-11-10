@@ -209,7 +209,21 @@ class CompletionPreview:
         note = '（过程较长，预览仅显示最近部分；完整过程将在完成后发送。）\n\n'
         return note + self.delivery._tail(body, limit - utf16_size(note))
 
-    async def _render(self, telegram, identity, state, text, reply_markup=None):
+    def _render_request(self, telegram):
+        rich = (self.store.get('output_format', 'rich') == 'rich'
+                and getattr(telegram, 'rich_supported', None) is not False)
+        style = self.delivery.preview_body_style if rich else 'normal'
+        return style, 'rich' if rich else 'plain'
+
+    @staticmethod
+    def _not_modified(error, message_id):
+        return bool(message_id and getattr(error, 'code', None) == 400
+                    and 'message is not modified' in str(error).lower())
+
+    async def _render(self, telegram, identity, state, text, reply_markup=None, request=None):
+        """Return the ACK, applied style and frozen render request for caching."""
+        request = self._render_request(telegram) if request is None else request
+        body_style, body_format = request
         message_id = state.get('message_id')
         route = {'chat_id': int(identity['chat_id'])}
         if message_id:
@@ -218,19 +232,32 @@ class CompletionPreview:
             route.update(message_thread_id=identity['topic_id'], disable_notification=True)
         if reply_markup is not None:
             route['reply_markup'] = reply_markup
-        if self.store.get('output_format', 'rich') == 'rich' and getattr(telegram, 'rich_supported', None) is not False:
+        if body_format == 'rich':
+            markdown = normalize_local_links(text)
+            if body_style == 'quote':
+                markdown = '\n'.join('> ' + line for line in markdown.split('\n'))
             try:
-                return await telegram.call('editMessageText' if message_id else 'sendRichMessage',
-                                           **route, rich_message={'markdown': normalize_local_links(text)})
+                result = await telegram.call('editMessageText' if message_id else 'sendRichMessage',
+                                             **route, rich_message={'markdown': markdown})
+                return result, body_style, request
             except Exception as error:
+                if self._not_modified(error, message_id):
+                    return True, body_style, request
                 # Only a known formatting rejection permits a second request.
                 if not formatting_error(error) or (message_id and getattr(error, 'code', None) == 404):
                     raise
                 if not message_id and getattr(error, 'code', None) == 404:
                     telegram.rich_supported = False
+                    request = ('normal', 'plain')
                 if not self._allowed(identity):
                     raise ConnectionError('Preview route or access changed during formatting fallback')
-        return await telegram.call('editMessageText' if message_id else 'sendMessage', **route, text=text)
+        try:
+            result = await telegram.call('editMessageText' if message_id else 'sendMessage', **route, text=text)
+        except Exception as error:
+            if not self._not_modified(error, message_id):
+                raise
+            result = True
+        return result, 'normal', request
 
     async def update(self, telegram, identity, body, *, reply_markup=None, _status_bar=False):
         """Create quietly once, then edit only the known preview message ID."""
@@ -264,17 +291,22 @@ class CompletionPreview:
             self._save(state, identity)
             if self.delivery.clock() < state.get('retry_at', 0):
                 return False
-            same_body = message_id and state.get('sent_text') == text
+            request = self._render_request(telegram)
+            same_body = (message_id and state.get('sent_text') == text
+                         and state.get('sent_body_style_requested', 'normal') == request[0]
+                         and state.get('sent_body_format_requested', 'rich') == request[1])
             if same_body and (not _status_bar or state.get('sent_markup') == reply_markup):
                 return True
             state['delivery'] = 'editing' if message_id else 'creating'
             self._save(state, identity)  # Unknown creation must never be replayed.
+            applied_style = state.get('sent_body_style', 'normal')
             try:
                 if same_body and _status_bar:
                     result = await telegram.call('editMessageReplyMarkup', chat_id=int(identity['chat_id']),
                                                  message_id=message_id, reply_markup=reply_markup)
                 else:
-                    result = await self._render(telegram, identity, state, text, reply_markup)
+                    result, applied_style, request = await self._render(telegram, identity, state, text,
+                                                                       reply_markup, request)
                 if not message_id:
                     mid = result.get('message_id') if isinstance(result, dict) else None
                     if (not isinstance(mid, int) or isinstance(mid, bool) or mid <= 0
@@ -294,6 +326,8 @@ class CompletionPreview:
                     self._save(state, identity)
                     return False
             state.update(delivery='sent', sent_text=text, retry_at=0, updated_at=self.delivery.clock())
+            state.update(sent_body_style=applied_style, sent_body_style_requested=request[0],
+                         sent_body_format_requested=request[1])
             if _status_bar:
                 state['sent_markup'] = reply_markup
             self._save(state, identity)
