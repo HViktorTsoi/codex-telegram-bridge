@@ -6,7 +6,7 @@ import time
 
 from attachments import payload_from
 from bridge import RpcError
-from session_picker import BindingError, clean_name, directory_text
+from session_picker import BindingError, TopicCreationUnavailable, clean_name, directory_text
 
 
 PROMPT_TITLE = '新建 Codex 会话 · '
@@ -186,11 +186,12 @@ class SessionCreator:
         except BindingError as error:
             return await self.prompt(update, draft, prompt['kind'], str(error))
 
-    async def review(self, update, draft):
+    async def review(self, update, draft, notice=None):
         await self.show(update, draft,
                         f"确认新建 Codex 会话？\n\n主机：{self.router.config.get('host_id', '本机')}\n"
                         f"名称：{draft['name']}\n目录：{directory_text(dict(draft), 1200)}\n\n"
-                        '确认后新建空会话并连接新 Telegram 话题。模型和权限沿用本机默认设置；在话题发消息后才开始运行模型。',
+                        '确认后新建空会话并连接新 Telegram 话题。模型和权限沿用本机默认设置；在话题发消息后才开始运行模型。'
+                        + ('\n\n' + notice if notice else ''),
                         [[('确认新建并连接', 'new:confirm', {'id': draft['id']})],
                          [('修改名称', 'new:name', {'id': draft['id']}), ('修改目录', 'new:browse', {'id': draft['id']})],
                          [('取消', 'new:cancel', {'id': draft['id']})]])
@@ -220,6 +221,11 @@ class SessionCreator:
                 raise BindingError('请先选择目录并填写会话名称。')
             if not confirm:
                 return await self.review(update, draft)
+            try:
+                self.picker.check_topic_creation_available()
+            except TopicCreationUnavailable as error:
+                return await self.review(update, draft, str(error) +
+                                         '\n本次尚未新建 Codex 会话，名称和目录已保留，请稍后再确认。')
             cwd = str(self.resolve(draft['cwd']))
             if cwd != draft['cwd']:
                 raise BindingError('目录位置已经改变，请重新选择目录后确认。')
@@ -259,7 +265,16 @@ class SessionCreator:
                 raise BindingError('新会话信息无法核对，已停止命名和绑定，请检查已有会话列表。')
             await self.router.catalog_call('thread/name/set', {'threadId': tid, 'name': draft['name']})
             self.save(draft['id'], state='named')
-        target = await self.picker.bind(tid)
+        try:
+            target = await self.picker.bind(tid)
+        except TopicCreationUnavailable as error:
+            draft = self.draft(draft['id'], draft['chat_id'])
+            return await self.show(update, draft,
+                                   'Codex 会话已创建并保留，暂未连接 Telegram。\n\n'
+                                   f"名称：{draft['name']}\n目录：{directory_text(dict(draft), 1200)}\nID：{tid}\n\n"
+                                   + str(error) + '\n稍后点击“重试连接”继续连接这个原会话，不会再次新建会话。',
+                                   [[('重试连接', 'new:resume', {'id': draft['id']})],
+                                    [('返回会话管理', 'home', {})]])
         self.save(draft['id'], state='done')
         await self.picker.bound_panel(update, target)
 

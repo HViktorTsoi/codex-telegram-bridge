@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.16 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.17 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -104,6 +104,8 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 填写名称后展示主机、目录和名称，点击“确认新建并连接”才调用 `thread/start`，再用 `thread/name/set` 命名并绑定返回的同一个 ID。新会话继承本机 Codex 默认模型和权限，不复制原会话的历史；直到你在新话题发送消息才调用模型生成。接口依据 [Codex 官方 app-server 文档](https://learn.chatgpt.com/docs/app-server)，本机 app-server 需支持这两个方法。已有会话的绑定和修复仍不会调用 `thread/start` 或 `thread/fork`。
 
 创建记录持久化到私有 SQLite：重复点击不会重复创建；创建成功后命名或绑定失败，可在 `/sessions` 首页点击“继续处理”沿用已记录的新会话 ID。若 `thread/start` 或 `createForumTopic` 的返回结果丢失，会提示先核对已有会话或话题，不自动重建。
+
+如果 Telegram 明确返回 `BOT_TOPIC_WRONG_HOME`，桥接会提示话题服务暂不可用，保留已创建的 Codex 会话，并提供“重试连接”入口。此错误触发同一 Bot 与私聊 5 分钟的持久冷却；期间不调用话题创建接口，新建向导也不会先生成另一个空会话。冷却结束后手动重试会继续同一个原生会话。客户端出现“话题已创建”的服务记录不代表该话题可用，桥接不会据此猜测话题 ID 或绑定。Telegram 官方仓库的[相关故障报告](https://github.com/tdlib/telegram-bot-api/issues/944)记录了这类现象；本地处理不能替代 Telegram 服务恢复。其他明确拒绝和未知结果仍按原规则处理。
 
 ### 修改会话名称
 

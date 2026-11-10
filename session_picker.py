@@ -13,6 +13,19 @@ class BindingError(Exception):
     """An expected binding failure that can be shown to the owner."""
 
 
+class TopicCreationUnavailable(BindingError):
+    """Telegram explicitly refused topic creation; the native session is safe."""
+
+    def __init__(self, retry_after=300):
+        self.retry_after = max(1, int(retry_after))
+        super().__init__('Telegram 暂时无法为当前 Bot 创建话题，'
+                         f'请约 {self.retry_after} 秒后手动重试。')
+
+
+TOPIC_CREATION_COOLDOWN_KEY = 'topic_creation_cooldown_v1:'
+TOPIC_CREATION_COOLDOWN_SECONDS = 300
+
+
 def clean_name(value, limit=90):
     return ' '.join(str(value).split())[:limit]
 
@@ -356,6 +369,26 @@ class SessionPicker:
             self.db.execute('INSERT OR REPLACE INTO binding_ops VALUES(?,?,?,?,?)',
                             (thread_id, json.dumps(target, ensure_ascii=False), status, error, time.time()))
 
+    def _topic_creation_cooldown(self):
+        # The runtime bot identity comes from getMe; never reuse another Bot's
+        # circuit breaker merely because its state directory was copied.
+        route = [self.router.bot_id, str(self.router.owner)]
+        key = TOPIC_CREATION_COOLDOWN_KEY + hashlib.sha256(json.dumps(route).encode()).hexdigest()[:24]
+        return key, route
+
+    def check_topic_creation_available(self):
+        key, route = self._topic_creation_cooldown()
+        row = self.db.execute('SELECT value FROM kv WHERE key=?', (key,)).fetchone()
+        if not row:
+            return
+        try:
+            saved = json.loads(row['value'])
+            remaining = saved['until'] - time.time() if saved.get('route') == route else 0
+        except (KeyError, TypeError, ValueError):
+            return
+        if remaining > 0:
+            raise TopicCreationUnavailable(int(remaining + 0.999))
+
     async def bind(self, thread_id, allow_create=True):
         existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
         if existing:
@@ -386,10 +419,24 @@ class SessionPicker:
         return target
 
     async def create_topic(self, thread_id, target):
+        self.check_topic_creation_available()
         self.operation(thread_id, target, 'creating')
         try:
             topic = await self.router.telegram.call('createForumTopic', chat_id=int(self.router.owner), name=target['name'])
         except TelegramError as error:
+            if error.code == 400 and 'BOT_TOPIC_WRONG_HOME' in str(error).upper():
+                key, route = self._topic_creation_cooldown()
+                now = time.time()
+                with self.db:
+                    # Refusal and cooldown must survive together. Recovering
+                    # a UI job must not repeat the request between these writes.
+                    self.db.execute('INSERT OR REPLACE INTO binding_ops VALUES(?,?,?,?,?)',
+                                    (thread_id, json.dumps(target, ensure_ascii=False), 'failed',
+                                     'BOT_TOPIC_WRONG_HOME', now))
+                    self.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)',
+                                    (key, json.dumps({'route': route, 'code': 'BOT_TOPIC_WRONG_HOME',
+                                                      'until': now + TOPIC_CREATION_COOLDOWN_SECONDS})))
+                raise TopicCreationUnavailable(TOPIC_CREATION_COOLDOWN_SECONDS) from None
             status = 'uncertain' if error.code >= 500 else 'failed'
             self.operation(thread_id, target, status, 'Telegram ' + str(error.code))
             if status == 'uncertain':
