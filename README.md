@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.25 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.26 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -313,7 +313,26 @@ Telegram 托管 Bot API 的附件下载上限为 20MB。图片作为 `localImage
 
 ## 可选提醒示例
 
-`bus_reminder.py` 和 `manage_bus_reminder.py` 是独立的九巴末班车提醒示例。它们不接收 Telegram 更新，可与聊天桥接共用 Bot；配置与状态默认位于 `~/.local/state/kmb72-reminder/`，需要另行配置，启动桥接不会自动启用提醒。
+`bus_reminder.py` 和 `manage_bus_reminder.py` 是独立的九巴末班车提醒示例。配置与状态默认位于 `~/.local/state/kmb72-reminder/`，需要另行配置；启动聊天桥接不会自动启用提醒。它们不接收 Telegram 更新。
+
+如需在电脑扬声器播放语音，在现有 `config.json` 中明确设置以下字段，保留原有线路与站点配置：
+
+```json
+{
+  "delivery_mode": "local_audio",
+  "audio_device": "default:CARD=Generic",
+  "start_minute": 20,
+  "end_minute": 60,
+  "interval_seconds": 60,
+  "lead_minutes": 12
+}
+```
+
+此示例每天香港时间 00:20–01:00 检查末班车到站时间，预计到赤泥坪前 12 分钟内播放一次。`audio_device` 必须按本机声卡选择，可用 `aplay -L` 查看；`Generic` 只是设备示例。播放依赖 Linux ALSA 的 `/usr/bin/aplay`（`alsa-utils`）和支持 MP3 解码的 `libsndfile`，运行账号须有声卡访问权限。电脑需保持开机、扬声器取消静音并设置合适音量，提醒程序本身不修改音量。
+
+本机正式提醒使用独立缓存 `alert-local.mp3`，首次预制语音需要联网，内容不包含 Telegram 的文字查看指引；旧 Telegram 缓存 `alert.mp3` 保留。`local_audio.py` 将语音转换成经过校验的同名 PCM WAV 缓存，再等待本机播放完成，播放阶段不访问网络；实时到站查询仍需要联网。可先运行 `python3 bus_reminder.py prepare` 预制正式语音，再运行 `python3 manage_bus_reminder.py test-voice` 测试本机扬声器。测试使用 `test.mp3`，不会发送 Telegram 消息，也不会占用当晚的真实提醒；`check` 仅查询到站数据，不播放提醒。
+
+`local_audio` 模式不读取 Bot Token、桥接配置或白名单，也不向 Telegram 发送语音、文字或故障通知。播放失败会记入日志和健康状态，保留后续检查的重试机会，不降级为 Telegram 提醒；只有成功播完才保存当晚已提醒记录，正常重启后继续去重。若需要原有 Telegram 投递方式，明确设置 `"delivery_mode": "telegram"`；省略该字段也保留原来的 Telegram 行为。
 
 ## 接口文档
 
