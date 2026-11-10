@@ -172,7 +172,7 @@ class CompletionPreview:
             self.store.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)',
                                   (old_key, json.dumps(old_state, ensure_ascii=False)))
 
-    async def update_status(self, telegram, identity, status, body):
+    async def update_status(self, telegram, identity, status, body, *, rich_body=None):
         """Render two durable status rows, with a bound active-turn control."""
         try:
             identity = self._bar_identity(identity)
@@ -194,8 +194,10 @@ class CompletionPreview:
             state = self.load(identity)
             if not body or not body.strip():
                 body = state.get('desired_text') or state.get('sent_text') or '任务已收到。'
+                rich_body = state.get('desired_display_text')
             markup = self.status_markup(status, self.stop_callback(identity))
-            return await self.update(telegram, identity, body, reply_markup=markup, _status_bar=True)
+            return await self.update(telegram, identity, body, reply_markup=markup, _status_bar=True,
+                                     rich_body=rich_body)
         except Exception:
             return False
 
@@ -233,7 +235,8 @@ class CompletionPreview:
         if reply_markup is not None:
             route['reply_markup'] = reply_markup
         if body_format == 'rich':
-            markdown = normalize_local_links(text)
+            display = state.get('desired_display_text')
+            markdown = normalize_local_links(text if display is None else display)
             applied_style = body_style
             rich_message = {'markdown': markdown}
             if body_style == 'quote':
@@ -270,7 +273,7 @@ class CompletionPreview:
             result = True
         return result, 'normal', request
 
-    async def update(self, telegram, identity, body, *, reply_markup=None, _status_bar=False):
+    async def update(self, telegram, identity, body, *, reply_markup=None, _status_bar=False, rich_body=None):
         """Create quietly once, then edit only the known preview message ID."""
         try:
             identity = self._bar_identity(identity) if _status_bar else self._identity(identity)
@@ -296,14 +299,16 @@ class CompletionPreview:
                 return False
             text = self._text(body)
             state.update(route=self._route(identity), turn_id=identity.get('turn_id'),
-                         desired_identity=identity, desired_text=text)
+                         desired_identity=identity, desired_text=text, desired_display_text=rich_body)
             if _status_bar:
                 state['desired_markup'] = reply_markup
             self._save(state, identity)
             if self.delivery.clock() < state.get('retry_at', 0):
                 return False
             request = self._render_request(telegram)
+            display = rich_body if rich_body is not None and request[1] == 'rich' else text
             same_body = (message_id and state.get('sent_text') == text
+                         and state.get('sent_display_text', state.get('sent_text')) == display
                          and state.get('sent_body_style_requested', 'normal') == request[0]
                          and state.get('sent_body_format_requested', 'rich') == request[1])
             if same_body and (not _status_bar or state.get('sent_markup') == reply_markup):
@@ -338,7 +343,8 @@ class CompletionPreview:
                     return False
             state.update(delivery='sent', sent_text=text, retry_at=0, updated_at=self.delivery.clock())
             state.update(sent_body_style=applied_style, sent_body_style_requested=request[0],
-                         sent_body_format_requested=request[1])
+                         sent_body_format_requested=request[1],
+                         sent_display_text=rich_body if rich_body is not None and request[1] == 'rich' else text)
             if _status_bar:
                 state['sent_markup'] = reply_markup
             self._save(state, identity)

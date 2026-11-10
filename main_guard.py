@@ -269,7 +269,8 @@ class MainChatGuard:
                 bridge.store.accept({'update_id': row['update_id']}, message, reply_context=context, guard_binding=binding)
             # Mirror the user's text into the selected Telegram topic,
             # including on recovery after input import but before outbox commit.
-            # This distinct key stays plain text and never becomes model input.
+            # This distinct key retains literal source text for quote rendering
+            # and never becomes model input.
             body = message.get('text') or message.get('caption', '')
             if body:
                 text = '📩 你在 All 说：\n' + body
