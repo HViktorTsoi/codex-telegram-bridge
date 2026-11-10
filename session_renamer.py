@@ -64,9 +64,10 @@ class SessionRenamer:
         if not self.router.owner_allowed():
             raise BindingError('访问权限已变化，已停止同步。')
         frozen = json.loads(draft['binding_json'])
-        target = self.router.targets.get(frozen['key'])
-        bridge = self.router.bridges.get(frozen['key'])
-        if (not target or target.get('topic_missing') or self.binding(target) != frozen
+        target = self.router.route_targets().get(frozen['key'])
+        bridge = self.router.route_bridges().get(frozen['key'])
+        if (not target or (not target.get('temporary_all') and target.get('topic_missing'))
+                or self.binding(target) != frozen
                 or not bridge or bridge.thread_id != frozen['thread_id']
                 or self.binding(bridge.target) != frozen
                 or target['name'] not in (draft['old_name'], draft['new_name'])):
@@ -87,7 +88,7 @@ class SessionRenamer:
                 or utf16_size(name) > 90):
             raise BindingError('请输入非空名称，最多 90 个字符；部分表情会占两个字符。')
         if any(t['thread_id'] != thread_id and str(t['name']).casefold() == name.casefold()
-               for t in self.router.targets.values()):
+               for t in self.router.route_targets().values()):
             raise BindingError('本机已有同名会话，请换一个名称。')
         for pending in self.db.execute("SELECT binding_json,new_name FROM ui_renames WHERE stage IN "
                                        "('native_pending','topic_pending','config_pending')").fetchall():
@@ -126,10 +127,12 @@ class SessionRenamer:
         return await self.choose(update, proposed=proposed)
 
     async def choose(self, update, page=0, proposed=None):
-        targets = self.router.recent.ordered([t for t in self.router.targets.values() if not t.get('topic_missing')])
+        targets = self.router.recent.ordered([t for t in self.router.route_targets().values()
+                                              if not t.get('topic_missing')])
         pages = max(1, (len(targets) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
-        rows = [[(clean_name(t['name'], 40), 'rename:select', {'thread_id': t['thread_id'], 'proposed': proposed})]
+        rows = [[(clean_name(t['name'], 40) + (' 【临时】' if t.get('temporary_all') else ''),
+                   'rename:select', {'thread_id': t['thread_id'], 'proposed': proposed})]
                 for t in targets[page * self.PAGE:(page + 1) * self.PAGE]]
         navigation = []
         if page:
@@ -139,23 +142,24 @@ class SessionRenamer:
         if navigation:
             rows.append(navigation)
         rows.append([('返回会话管理', 'home', {})])
-        return await self._panel(update, f'会话改名 · 选择会话\n按最近访问排序，第 {page + 1}/{pages} 页。\n请选择要同时修改 Codex 和 Telegram 名称的会话。', rows)
+        return await self._panel(update, f'会话改名 · 选择会话\n按最近访问排序，第 {page + 1}/{pages} 页。\n请选择要修改名称的会话。', rows)
 
     async def start(self, update, thread_id, proposed=None):
         if not self.router.owner_allowed():
             raise BindingError('当前账号没有访问权限。')
-        target = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
-        if not target or target.get('topic_missing'):
-            raise BindingError('目标会话或话题不可用，请先从 /sessions 修复绑定。')
+        target = next((t for t in self.router.route_targets().values() if t['thread_id'] == thread_id), None)
+        if not target or (not target.get('temporary_all') and target.get('topic_missing')):
+            raise BindingError('目标会话或入口不可用，请先从 /sessions 核对。')
         pending = self._other_pending(thread_id)
         if pending:
             return await self.pending_panel(update, pending)
         frozen = self.binding(target)
         result = await self.router.catalog_call('thread/read', {'threadId': thread_id})
         thread = result.get('thread') if isinstance(result, dict) else None
-        current = self.router.targets.get(target['key'])
+        current = self.router.route_targets().get(target['key'])
         if (not isinstance(thread, dict) or thread.get('id') != thread_id or not current
-                or current.get('topic_missing') or self.binding(current) != frozen
+                or (not current.get('temporary_all') and current.get('topic_missing'))
+                or self.binding(current) != frozen
                 or not self.router.owner_allowed()):
             raise BindingError('会话信息已变化，请重新选择。')
         origin = update.get('callback_query', {}).get('message') or update['message']
@@ -217,9 +221,15 @@ class SessionRenamer:
 
     async def review(self, update, draft):
         binding = json.loads(draft['binding_json'])
-        text = (f"确认改名？\n\n原名称：{draft['old_name']}\n新名称：{draft['new_name']}\n"
-                f"主机：{self.router.config.get('host_id', '本机')}\n会话：{binding['thread_id']}\n话题：{binding['message_thread_id']}\n\n"
-                '确认后同时修改 Codex 会话名和 Telegram 话题名。')
+        temporary = self.router.route_targets().get(binding['key'], {}).get('temporary_all')
+        if temporary:
+            text = (f"确认改名？\n\n原名称：{draft['old_name']}\n新名称：{draft['new_name']}\n"
+                    f"主机：{self.router.config.get('host_id', '本机')}\n会话：{binding['thread_id']}\n\n"
+                    '确认后修改 Codex 会话名称和临时 All 标签。')
+        else:
+            text = (f"确认改名？\n\n原名称：{draft['old_name']}\n新名称：{draft['new_name']}\n"
+                    f"主机：{self.router.config.get('host_id', '本机')}\n会话：{binding['thread_id']}\n话题：{binding['message_thread_id']}\n\n"
+                    '确认后同时修改 Codex 会话名和 Telegram 话题名。')
         if draft['native_old_name'] != draft['old_name']:
             text += '\n当前 Codex 名称：' + clean_name(draft['native_old_name'] or '未命名', 220)
         return await self._panel(update, text,
@@ -237,7 +247,7 @@ class SessionRenamer:
         phase = {'native_pending': 'Codex 名称仍待核对。', 'topic_pending': 'Codex 名称已更新，Telegram 话题仍待同步。',
                  'config_pending': '两个名称已更新，本机记录仍待同步。'}
         text = '名称同步尚未完成\n' + phase.get(draft['stage'], '请核对当前名称。')
-        text += '\n目标名称：' + str(draft['new_name'] or '') + '\n点击继续时只会同步这个原会话和原话题。'
+        text += '\n目标名称：' + str(draft['new_name'] or '') + '\n点击继续时只会同步这个原会话及其入口。'
         return await self._panel(update, text,
                                  [[('继续同步名称', 'rename:resume', {'id': draft['id']})],
                                   [('返回会话管理', 'home', {})]], draft)
@@ -270,7 +280,7 @@ class SessionRenamer:
                     self._target(draft)
                     if await self._native(draft) != draft['new_name']:
                         raise RpcError('Native name readback has not confirmed the new name')
-                self._save(draft['id'], stage='topic_pending', error=None)
+                self._save(draft['id'], stage='config_pending' if binding['message_thread_id'] is None else 'topic_pending', error=None)
                 draft = self._draft(draft['id'])
             if draft['stage'] == 'topic_pending':
                 self._target(draft)
@@ -290,7 +300,11 @@ class SessionRenamer:
                 self._target(draft)
                 await self._native(draft)
                 self._target(draft)
-                result = self.router.rename_target(binding['key'], binding, draft['old_name'], draft['new_name'])
+                if binding['message_thread_id'] is None:
+                    result = self.router.rename_temporary_route(binding['key'], binding,
+                                                                draft['old_name'], draft['new_name'])
+                else:
+                    result = self.router.rename_target(binding['key'], binding, draft['old_name'], draft['new_name'])
                 if inspect.isawaitable(result):
                     await result
                 if hasattr(self.router, 'recent'):
@@ -309,7 +323,9 @@ class SessionRenamer:
                 raise BindingError('原话题已经失效，已停止同步；请从 /sessions 重建话题后核对名称。') from None
             self._save(draft['id'], error=type(error).__name__)
             return await self.pending_panel(update, self._draft(draft['id']))
-        target = self.router.targets[binding['key']]
+        target = self.router.route_targets()[binding['key']]
+        if target.get('temporary_all'):
+            return await self.picker.temporary_panel(update, target)
         return await self.picker.bound_panel(update, target)
 
     async def handle(self, update, action, data):
@@ -322,8 +338,10 @@ class SessionRenamer:
         origin = update.get('callback_query', {}).get('message') or update['message']
         draft = self._draft(data['id'], origin['chat']['id'])
         if draft['stage'] == 'done':
-            target = self.router.targets.get(json.loads(draft['binding_json'])['key'])
+            target = self.router.route_targets().get(json.loads(draft['binding_json'])['key'])
             if target:
+                if target.get('temporary_all'):
+                    return await self.picker.temporary_panel(update, target)
                 return await self.picker.bound_panel(update, target)
             raise BindingError('原会话已不在绑定列表中，请重新打开 /sessions。')
         if draft['stage'] in ('cancelled', 'blocked'):

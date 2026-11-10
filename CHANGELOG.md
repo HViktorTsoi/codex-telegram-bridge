@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — `feat/temporary-all-routes` (based on `v0.11.20`)
+
+- Add temporary All routes that reuse an existing Codex session without creating
+  or modifying a Telegram topic. Routes can be added from `/sessions`, start
+  enabled, and can be disabled or renamed from their submenu.
+- Continue session numbering after formal bindings and show temporary entries
+  as `Name 【临时】`. All dispatches require explicit target selection and route
+  replies back to All with a separate session label line.
+- Persist temporary route metadata atomically, reject duplicate native IDs and
+  formal-topic conflicts, and add regression coverage for dispatch, labeling,
+  renaming and the no-topic API guarantee.
+- Add a confirmed **取消临时绑定** action that removes the route from the
+  current Bot while preserving the original Codex session and local queue.
+
 ## 0.11.20 — 2026-11-10
 
 - 移除每条 Telegram 输入附加的 Bot 与话题路由说明，不以其他隐藏模型提示替代；原有文字、引用及附件输入流程保留，文件与图片发送仍由当前桥接客户端及冻结的持久化队列目标决定。

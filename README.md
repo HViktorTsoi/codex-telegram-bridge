@@ -42,6 +42,7 @@ All 中的普通消息先暂存，点击接收会话后直接投递，不再增�
 - 一个私聊内用不同话题连接不同 Codex 会话。
 - All 防误发：普通文字、图片、文件及相册先暂存，选择本机会话后直接发送；未选择时不调用模型。
 - `/sessions` 按钮流程：按名称和工作目录查看本机会话 → 选择 → 核对完整 ID → 确认绑定到新话题。
+- 临时 All 路由：复用已有 Codex 会话，不创建 Telegram 话题，在 All 中显式选择后发送，并在回复中显示会话标签。
 - 会话选择按最近实际使用排序；已绑定会话可用“修改名称”或 `/rename` 同步修改 Codex 会话名和 Telegram 话题名。
 - `/sessions` →“新建会话”：按钮浏览本机文件夹、输入路径或新建文件夹，填写名称并确认后创建空 Codex 会话并连接新话题。
 - 已绑定会话可通过按钮重新创建话题，恢复删除后的入口。
@@ -120,7 +121,29 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 改名进度持久保存；Codex 已改名而 Telegram 暂时同步失败时，可在 `/sessions` 首页或该会话的“修改名称”入口点击“继续同步名称”，沿用原会话与话题继续处理。绑定或名称在同步中被其他操作修改时会停止并提示核对，不改投其他会话；话题已失效时先修复绑定。
 
-`root_target` 继续提供原会话及主对话系统指令的上下文；All 普通内容在选择目标后直接投递到所选话题。话题模式、恢复策略和完整配置说明见 [TOPICS.md](TOPICS.md)。
+### 临时 All 路由（`feat/temporary-all-routes`）
+
+本地开发分支基于 `v0.11.20`。它为 Telegram 话题创建失败、话题暂时不可用或希望减少话题数量的场景提供备用入口：复用一个已有的 Codex 原生 session，在 All 中手动选择该 session 投递消息。这个功能不调用 `createForumTopic`，不创建或 fork Codex session，也不改变正式话题绑定。
+
+#### 使用方式
+
+1. 在主对话发送 `/sessions`，点击 **添加临时 All**。
+2. 按目录和会话列表选择一个已有 Codex session，核对名称、ID和目录后点击 **确认添加临时路由**。
+3. 添加确认后路由默认立即开启，并出现在 All 的接收目标选择器中。
+4. 在 All 发送文字或附件，选择该临时路由后立即投递；回复仍出现在 All，回复第一行以加粗的 `会话名 【临时】` 标记。
+5. 再次进入该条目可以关闭路由、修改名称或点击 **取消临时绑定**。关闭只会从之后的 All 选择列表隐藏；取消会从当前 Bot 的会话菜单、All 选择器和运行连接中移除这条路由，但不删除原 Codex session、历史或本地队列。修改名称会同步原生 Codex 名称和 All 标签，不涉及 Telegram 话题。
+
+正式会话编号先显示，临时路由从正式会话之后继续编号。一个原生 session 不能同时绑定正式 Telegram 话题和临时 All 路由，也不能重复添加为多个临时路由。每个 Bot 的临时路由保存在自己的私有 `config.json` 和状态目录中，不会自动同步到其他 Bot。
+
+也可以在私有配置中预置路由；`enabled` 省略时默认为 `false`：
+
+```json
+"temporary_all_routes": [
+  {"key": "temp_reid", "name": "ReID测试", "thread_id": "EXISTING_REID_ID", "enabled": false}
+]
+```
+
+`key` 只能使用小写字母、数字、下划线和连字符；`thread_id` 必须是本机可直接接收输入的已有 Codex session ID。临时路由沿用该 session 的历史、模型、权限和工作目录。完整话题模式、恢复策略和配置说明见 [TOPICS.md](TOPICS.md)。
 
 上述 BotFather 开关阻止 Telegram 客户端在主窗口发送 `/tasks`、`/sessions` 等消息时先自动创建话题。可用 `getMe` 验证 `has_topics_enabled=true`、`allows_users_to_create_topics=false`；此开关需要 Bot 所有者在 BotFather 设置，Bot Token 无法修改。它同时禁止用户手动新建、编辑和删除话题，桥接仍可通过 `/sessions` 创建和重建绑定话题。参见 [Telegram 官方说明](https://core.telegram.org/api/forum#bot-forums)。
 
