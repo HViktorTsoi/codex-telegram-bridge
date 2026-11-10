@@ -545,22 +545,6 @@ class Bridge:
     def validate_destination(self, rows):
         return True
 
-    def telegram_delivery_context(self, row):
-        """Keep outgoing attachments on the runtime-verified input bot/route."""
-        if not self.username or not re.fullmatch(r'[A-Za-z0-9_]{5,32}', self.username):
-            return None
-        topic = row['message_thread_id'] if 'message_thread_id' in row.keys() else None
-        destination = f'话题 ID {int(topic)}' if topic is not None else '主对话'
-        return (
-            '［Telegram 回传路由］\n'
-            '以下为桥接元信息，不属于用户正文。\n'
-            f'本条消息来自 @{self.username} 的{destination}。\n'
-            '需要交付受支持的本机文件或图片时，在公开回复中给出明确的本地 Markdown 链接，'
-            '例如 [下载文件](/绝对路径/文件名)。桥接会通过本条消息的 Bot 和话题自动发送附件。\n'
-            '除非本次用户明确指定其他 Bot，否则不要沿用历史中的其他 Bot 配置，'
-            '也不要自行调用 Bot API 上传文件。'
-        )
-
     async def dispatch_one(self, row):
         update_id, text, chat_id = row["id"], row["text"], row["chat_id"]
         batch = self.store.batch(row)
@@ -624,9 +608,6 @@ class Bridge:
             self.store.enqueue(f"input:{update_id}:attachment_error", chat_id, str(error))
             self.store.mark_batch(batch, "failed")
             return
-        delivery_context = self.telegram_delivery_context(row)
-        if delivery_context:
-            user_input.append({'type': 'text', 'text': delivery_context})
         if not self.owner_allowed():
             self.store.mark_batch(batch, "denied")
             return

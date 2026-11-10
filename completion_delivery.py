@@ -35,8 +35,8 @@ class CompletionDelivery:
         if self.preview_style not in ('plain', 'block', 'status-card', 'status-draft', 'status-bar'):
             raise ValueError('preview_style must be plain, block, status-card, status-draft or status-bar')
         self.preview_body_style = bridge.target.get('preview_body_style', bridge.config.get('preview_body_style', 'normal'))
-        if self.preview_body_style not in ('normal', 'quote'):
-            raise ValueError('preview_body_style must be normal or quote')
+        if self.preview_body_style not in ('normal', 'quote', 'footer'):
+            raise ValueError('preview_body_style must be normal, quote or footer')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS completion_turns(
                 turn_id TEXT,chat_id TEXT,topic_id INTEGER,native_id TEXT,
