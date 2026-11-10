@@ -1041,6 +1041,37 @@ class TopicRouter:
             bridge.store.db.close()
         return target
 
+    async def remove_target(self, key, expected_thread_id=None, expected_topic_id=None):
+        """Remove a formal topic binding while preserving its native queue."""
+        target = self.targets.get(key)
+        if target is None:
+            raise ValueError('Unknown formal topic binding')
+        if key == self.config['root_target']:
+            raise ValueError('The root target is required as the private-chat fallback')
+        if (expected_thread_id is not None and target['thread_id'] != expected_thread_id):
+            raise ValueError('Formal topic binding changed; refresh /sessions')
+        if (expected_topic_id is not None and target.get('message_thread_id') != expected_topic_id):
+            raise ValueError('Formal topic binding changed; refresh /sessions')
+        updated = {target_key: item for target_key, item in self.targets.items() if target_key != key}
+        bridge = self.bridges.get(key)
+        await self.stop_target(key)
+        try:
+            self.persist_targets(updated)
+        except Exception:
+            if bridge is not None and self.running:
+                self.start_target(bridge)
+            raise
+        self.targets = updated
+        if target.get('message_thread_id') is not None:
+            self.by_topic.pop(int(target['message_thread_id']), None)
+        bridge = self.bridges.pop(key, None)
+        if bridge is not None:
+            bridge.store.db.close()
+        # Prevent a future bind of the same native ID from reusing a deleted
+        # topic record left by the old binding.
+        self.picker.operation(target['thread_id'], target, 'unbound')
+        return target
+
     def install_temporary_route(self, target):
         key = target['key']
         if key in self.temporary_routes or key in self.targets:

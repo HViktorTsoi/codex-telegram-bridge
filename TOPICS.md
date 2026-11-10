@@ -120,6 +120,14 @@ confirmation does not create another conversation or topic. A changed binding
 or a conflicting external rename stops synchronization for review; a missing
 topic must be repaired before starting a new rename.
 
+For a non-root formal binding, the `/sessions` detail panel also provides
+**取消绑定**. After confirmation the Bot removes that topic from its local
+configuration, topic index and running workers, while preserving the native
+Codex session, history and durable queue. It does not call Telegram's delete
+API. Re-add the same native session through **添加会话** to create a fresh
+topic. The root target remains the private-chat anchor for All and global
+management commands and therefore cannot be unbound.
+
 **新建会话** opens a local filesystem browser starting at the user's home.
 Directory buttons, ten-entry pages, parent navigation and a dot-directory toggle
 work without text entry. **输入路径** accepts absolute, home-relative and current

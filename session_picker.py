@@ -582,10 +582,35 @@ class SessionPicker:
         text = (('此会话已经绑定。' if already else '已绑定，立即生效。') +
                 f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n目录：{directory}\n"
                 '在该话题发送 /status 可核对会话。')
-        await self.panel(update, text, [
+        rows = [
             [('修改名称', 'rename:start', {'thread_id': target['thread_id']})],
             [('重新创建话题', 'repair_select', {'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']})],
-            [('继续添加', 'catalog', catalog or {}), ('返回', 'home', {})]])
+        ]
+        # The configured root target is the private-chat fallback for All and
+        # global commands, so it must remain as the router's anchor. Other
+        # formal bindings can be removed without affecting the native session.
+        if target['key'] != self.router.config['root_target']:
+            rows.append([('取消绑定', 'unbind:start', {'key': target['key'],
+                                                    'thread_id': target['thread_id'],
+                                                    'topic_id': target['message_thread_id']})])
+        rows.append([('继续添加', 'catalog', catalog or {}), ('返回', 'home', {})])
+        await self.panel(update, text, rows)
+
+    async def unbind_confirm(self, update, target, expected_topic_id=None):
+        if expected_topic_id is not None and target.get('message_thread_id') != expected_topic_id:
+            raise BindingError('这个绑定已变化，请重新打开 /sessions。')
+        if target['key'] == self.router.config['root_target']:
+            raise BindingError('原始主会话是当前 Bot 的管理入口，不能取消绑定。')
+        topic_state = '话题已标记不可用' if target.get('topic_missing') else f"话题：{target['message_thread_id']}"
+        text = (f"确认取消正式话题绑定？\n\n名称：{clean_name(target['name'], 140)}\n"
+                f"ID：{target['thread_id']}\n{topic_state}\n\n"
+                '取消后会从当前 Bot 的 /sessions、话题路由和 All 选择列表移除；'
+                '不会删除或修改原 Codex 会话、历史、本地队列，也不会调用 Telegram 删除话题。')
+        await self.panel(update, text, [
+            [('确认取消绑定', 'unbind:remove', {'key': target['key'],
+                                               'thread_id': target['thread_id'],
+                                               'topic_id': target.get('message_thread_id')})],
+            [('返回会话管理', 'home', {})]])
 
     def _direct_home(self, update):
         if update.get('callback_query') or self.creator.is_reply(update) or self.renamer.is_reply(update):
@@ -658,6 +683,23 @@ class SessionPicker:
                     if target is None:
                         raise BindingError('未知临时路由，请重新打开 /sessions。')
                     await self.temporary_panel(update, target)
+                elif action == 'unbind:start':
+                    target = self.router.targets.get(data.get('key'))
+                    if (target is None or target['thread_id'] != data.get('thread_id')
+                            or target.get('message_thread_id') != data.get('topic_id')):
+                        raise BindingError('未知或已变化的正式绑定，请重新打开 /sessions。')
+                    await self.unbind_confirm(update, target, data.get('topic_id'))
+                elif action == 'unbind:remove':
+                    allow_remove = button['state'] == 'active'
+                    with self.db:
+                        self.db.execute("UPDATE ui_buttons SET state='consumed' WHERE token=?", (button['token'],))
+                    if not allow_remove:
+                        raise BindingError('这个按钮已处理，请重新打开 /sessions。')
+                    removed = await self.router.remove_target(
+                        data['key'], data.get('thread_id'), data.get('topic_id'))
+                    await self.panel(update, f"已取消「{clean_name(removed['name'], 140)}」的正式话题绑定。\n"
+                                     '原 Codex 会话、历史和本地队列均已保留。',
+                                     [[('返回会话管理', 'home', {})]])
                 elif action == 'temp:toggle':
                     current = self.router.temporary_routes.get(data.get('key'))
                     if current is None:

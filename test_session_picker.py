@@ -383,6 +383,38 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
         await self.router.picker.repair('meeting-native', 11)
         self.assertEqual(len(self.telegram.created), 1)
 
+    async def test_bound_conversation_can_cancel_formal_binding_without_deleting_native_queue(self):
+        bridge = self.router.bridges['instagram']
+        bridge.store.accept({'update_id': 1}, {
+            'chat': {'id': 123}, 'message_thread_id': 22, 'text': '保留这条队列'})
+        menu = await self.menu()
+        await self.router.picker.bound_panel({'message': menu}, self.router.targets['instagram'], already=True)
+        bound = self.telegram.messages[self.telegram.next_id]
+        self.assertIn('取消绑定', str(bound['reply_markup']))
+        confirm = await self.click(bound, '取消绑定')
+        self.assertIn('确认取消正式话题绑定', confirm['text'])
+        result = await self.click(confirm, '确认取消绑定')
+        self.assertIn('已取消', result['text'])
+        self.assertNotIn('instagram', self.router.targets)
+        self.assertNotIn(22, self.router.by_topic)
+        self.assertFalse((self.path / 'config.json').read_text().find('instagram') >= 0)
+        operation = self.router.store.db.execute(
+            'SELECT status FROM binding_ops WHERE thread_id=?', ('instagram-native',)).fetchone()
+        self.assertEqual(operation['status'], 'unbound')
+        bridge.store = __import__('sqlite3').connect(self.path / 'targets' / 'instagram' / 'bridge.sqlite')
+        try:
+            self.assertIsNotNone(bridge.store.execute(
+                "SELECT 1 FROM inbox WHERE text=?", ('保留这条队列',)).fetchone())
+        finally:
+            bridge.store.close()
+
+    async def test_root_binding_does_not_offer_or_allow_cancel(self):
+        menu = await self.menu()
+        catalog = await self.open_catalog(menu)
+        catalog = await self.click(catalog, '下个目录')
+        bound = await self.click(catalog, '已绑定 会议记录')
+        self.assertNotIn('取消绑定', str(bound['reply_markup']))
+
     async def test_missing_topic_flag_survives_restart_and_allows_rebinding(self):
         self.router.mark_topic_missing('meeting', 11)
         self.assertTrue(self.router.targets['meeting']['topic_missing'])

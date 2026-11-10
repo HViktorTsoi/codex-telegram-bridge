@@ -13,6 +13,9 @@
   renaming and the no-topic API guarantee.
 - Add a confirmed **取消临时绑定** action that removes the route from the
   current Bot while preserving the original Codex session and local queue.
+- Add a confirmed **取消绑定** action for non-root formal topic bindings;
+  removing the Bot route preserves the native session, history and queue and
+  does not delete the Telegram topic.
 
 ## 0.11.20 — 2026-11-10
 
