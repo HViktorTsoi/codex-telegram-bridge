@@ -24,6 +24,7 @@ from session_picker import topic_missing_error
 from message_format import send_output
 from activity_indicator import TopicActivity
 from native_mirror import NativeMirror
+from native_questions import NativeQuestions
 from reply_context import serialized as reply_serialized
 
 LOG = logging.getLogger("codex_telegram_topics")
@@ -145,7 +146,7 @@ class RoutedStore(Store):
             self.enqueue_at(key, chat_id, text, topic_id)
 
 
-class TargetBridge(Bridge):
+class TargetBridge(NativeQuestions, Bridge):
     def __init__(self, config, state_dir, target, sessions_text):
         # Reuse the proven one-thread dispatch/recovery implementation without a second poller.
         super().__init__({**config, "thread_id": target["thread_id"]}, state_dir)
@@ -273,6 +274,7 @@ class TargetBridge(Bridge):
 
     async def reconcile(self, replay=False):
         turns = await super().reconcile(replay=replay)
+        await self.observe_question_history(turns)
         if not self.delivery.enabled:
             return turns
         for turn in turns:
@@ -675,6 +677,10 @@ class TopicRouter:
         self.status_controls = StatusControls(self)
         from skills_menu import SkillsMenu
         self.skills = SkillsMenu(self)
+        from choice_questions import ChoiceQuestions
+        self.questions = ChoiceQuestions(self)
+        for bridge in self.bridges.values():
+            bridge.questions = self.questions
 
     def access(self):
         try:
@@ -696,6 +702,8 @@ class TopicRouter:
         return "\n".join(lines)
 
     def ingest(self, update):
+        if self.questions.ingest(update):
+            return
         if self.status_controls.ingest(update):
             return
         if self.picker.creator.is_reply(update):
@@ -873,6 +881,7 @@ class TopicRouter:
         if key in self.started_targets:
             return
         self.started_targets.add(key)
+        bridge.questions = self.questions
         bridge.telegram, bridge.username = self.telegram, self.username
         for coro in (bridge.connection_loop(False), bridge.input_loop(), bridge.event_loop(),
                      bridge.sender_loop(), bridge.maintenance_loop()):
@@ -1056,6 +1065,7 @@ class TopicRouter:
                 await self.picker.recover()
                 self.status_controls.recover()
                 self.skills.recover()
+                self.questions.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
@@ -1063,6 +1073,7 @@ class TopicRouter:
                 self.spawn(self.picker.home_loop())
                 self.spawn(self.status_controls.loop())
                 self.spawn(self.skills.loop())
+                self.spawn(self.questions.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())

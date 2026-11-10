@@ -34,7 +34,7 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['text'], '📩 你在 All 说：\n' + body)
         self.assertEqual((rows[0]['chat_id'], rows[0]['message_thread_id']), ('123', 22))
-        self.assertTrue(rows[0]['rich_text'].startswith('>'))
+        self.assertTrue(rows[0]['rich_text'].startswith('📩 你在 All 说：\n\n> '))
         self.assertIsNone(rows[0]['media_json'])
         self.assertEqual(self.copies('meeting'), [])
         self.assertEqual([(r['id'], r['text']) for r in self.inbox()], [(update['update_id'], body)])
@@ -136,9 +136,12 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
         rows = self.copies()
         self.assertGreater(len(rows), 1)
         self.assertEqual(''.join(r['text'] for r in rows), '📩 你在 All 说：\n' + body)
-        self.assertTrue(all(utf16_size(r['text']) <= 3800 and r['rich_text'].startswith('>')
+        self.assertTrue(all(utf16_size(r['text']) <= 3800 and
+                            (r['rich_text'].startswith('>') if index else
+                             r['rich_text'].startswith('📩 你在 All 说：\n\n> '))
                             and utf16_size(r['rich_text']) <= 3800
-                            and r['media_json'] is None and r['message_thread_id'] == 22 for r in rows))
+                            and r['media_json'] is None and r['message_thread_id'] == 22
+                            for index, r in enumerate(rows)))
         self.assertEqual(self.inbox()[0]['text'], body)
 
     async def test_album_copies_only_caption_text_and_keeps_all_native_attachments(self):

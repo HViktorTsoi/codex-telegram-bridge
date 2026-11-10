@@ -185,9 +185,9 @@ class Store:
                                 (f'{key}:media:{i}', str(chat_id), '', json.dumps(media), topic_id))
 
     def output_parts(self, key, text):
-        from input_echo import is_input_echo, quote_parts
+        from input_echo import is_input_echo, echo_parts
         if is_input_echo(key) and self.get('output_format', 'rich') == 'rich':
-            return quote_parts(text)
+            return echo_parts(text)
         return message_parts(text, rich=key.startswith('turn:') and self.get('output_format', 'rich') == 'rich')
 
     def routes(self, turn_id):
@@ -217,10 +217,15 @@ class Codex:
     def __init__(self, socket_path, thread_id):
         self.socket_path, self.thread_id = socket_path, thread_id
         self.pending, self.sequence = {}, 0
+        self.pending_user_inputs, self._claimed_user_inputs = {}, set()
+        self.user_input_epoch = os.urandom(12).hex()
         self.events = asyncio.Queue()
         self.session = self.ws = self.reader = None
 
     async def connect(self):
+        self.pending_user_inputs.clear()
+        self._claimed_user_inputs.clear()
+        self.user_input_epoch = os.urandom(12).hex()
         self.session = aiohttp.ClientSession(
             connector=aiohttp.UnixConnector(path=self.socket_path),
             timeout=aiohttp.ClientTimeout(total=30),
@@ -235,6 +240,7 @@ class Codex:
         return await self.call("thread/resume", {"threadId": self.thread_id, "excludeTurns": True})
 
     async def _read(self):
+        epoch = self.user_input_epoch
         try:
             async for message in self.ws:
                 if message.type != aiohttp.WSMsgType.TEXT:
@@ -251,12 +257,49 @@ class Codex:
                     params = data.get("params", {})
                     if params.get("threadId") == self.thread_id:
                         method = data["method"]
-                        if method in {"item/completed", "turn/completed"} or "id" in data:
+                        if method == 'item/tool/requestUserInput' and 'id' in data:
+                            request_id = data['id']
+                            if request_id in self._claimed_user_inputs:
+                                continue
+                            self.pending_user_inputs[request_id] = params
+                            data['_user_input_epoch'] = epoch
+                        elif method == 'serverRequest/resolved':
+                            self.pending_user_inputs.pop(params.get('requestId'), None)
+                            data['_user_input_epoch'] = epoch
+                        if method in {"item/completed", "turn/completed", 'serverRequest/resolved'} or "id" in data:
                             self.events.put_nowait(data)
         finally:
+            if epoch == self.user_input_epoch:
+                self.pending_user_inputs.clear()
             for future in list(self.pending.values()):
                 if not future.done():
                     future.set_exception(ConnectionError("Codex socket disconnected"))
+
+    async def respond_user_input(self, request_id, answers):
+        """Reply once to a question replayed on this live connection.
+
+        A JSON-RPC response has no acknowledgement of its own. Claim before
+        writing so an interrupted write cannot silently become a second answer.
+        """
+        if self.ws is None or self.ws.closed:
+            raise ConnectionError('Codex is disconnected')
+        if request_id not in self.pending_user_inputs or request_id in self._claimed_user_inputs:
+            raise RpcError('This question is no longer pending on this connection')
+        params = self.pending_user_inputs[request_id]
+        questions = params.get('questions')
+        if (not isinstance(questions, list) or not questions
+                or any(not isinstance(q, dict) or q.get('isSecret') for q in questions)):
+            raise RpcError('This question must be answered in Codex')
+        ids = [q.get('id') for q in questions]
+        if (not isinstance(answers, dict) or any(not isinstance(qid, str) for qid in ids)
+                or set(answers) != set(ids) or len(ids) != len(set(ids))
+                or any(not isinstance(answer, dict) or not isinstance(answer.get('answers'), list)
+                       or not answer['answers'] or any(not isinstance(value, str) for value in answer['answers'])
+                       for answer in answers.values())):
+            raise RpcError('Invalid question answers')
+        self.pending_user_inputs.pop(request_id)
+        self._claimed_user_inputs.add(request_id)
+        await self.ws.send_json({'id': request_id, 'result': {'answers': answers}})
 
     async def call(self, method, params):
         if self.ws is None or self.ws.closed:
@@ -306,6 +349,7 @@ class Codex:
                 break
 
     async def close(self):
+        self.pending_user_inputs.clear()
         if self.ws:
             await self.ws.close()
         if self.reader:
@@ -657,10 +701,16 @@ class Bridge:
                                           (row["client_id"],))
                 self.store.enqueue(f"input:{row['id']}:failed", row["chat_id"], "Codex 未接受这条消息，请检查会话状态后重试。")
 
+    async def handle_server_event(self, event):
+        """Allow a topic router to handle structured native interactions."""
+        return False
+
     async def event_loop(self):
         while True:
             data = await self.codex.events.get()
             async with self.dispatch_lock:
+                if await self.handle_server_event(data):
+                    continue
                 params = data["params"]
                 if data["method"] == "item/completed":
                     self.record_item(params["turnId"], params["item"], params.get("completedAtMs"))

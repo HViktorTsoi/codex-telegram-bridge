@@ -8,6 +8,7 @@ import unittest
 from markdown_it import MarkdownIt
 
 from bridge import TelegramError
+from input_echo import PREVIEW_NOTE, aggregate_parts, echo_parts, preview_pair, quote_markdown
 from message_format import send_output, utf16_size
 from topics_bridge import RoutedStore
 import test_persistent_status as fixtures
@@ -81,6 +82,10 @@ class EchoQueueTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('blockquote', [tag for tag, _ in parsed.nodes])
             self.assertIn(body.splitlines()[0], ''.join(parsed.quoted))
             self.assertIn(body.splitlines()[1], ''.join(parsed.quoted))
+            self.assertNotIn('你在 All 说', ''.join(parsed.quoted))
+            self.assertNotIn('你在 Codex 客户端说', ''.join(parsed.quoted))
+            self.assertTrue(any(title in ''.join(parsed.text) for title in
+                                ('📩 你在 All 说：', '🖥 你在 Codex 客户端说：')))
             self.assertFalse({'a', 'img', 'strong', 'em', 'code'} & {tag for tag, _ in parsed.nodes})
             await send_output(tg, chat_id=row['chat_id'], topic_id=row['message_thread_id'],
                               text=row['text'], rich_text=row['rich_text'], media_json=row['media_json'])
@@ -113,12 +118,14 @@ class EchoQueueTests(unittest.IsolatedAsyncioTestCase):
         rows = self.rows()
         self.assertGreater(len(rows), 2)
         self.assertEqual(''.join(row['text'] for row in rows), raw)
-        for row in rows:
+        for index, row in enumerate(rows):
             self.assertLessEqual(utf16_size(row['text']), 3800)
             self.assertLessEqual(utf16_size(row['rich_text']), 3800)
-            self.assertTrue(row['rich_text'].startswith('>'))
+            self.assertTrue(row['rich_text'].startswith('>') if index else
+                            row['rich_text'].startswith('📩 你在 All 说：\n\n> '))
             parsed = markdown_display(row['rich_text'])
             self.assertIn('blockquote', [tag for tag, _ in parsed.nodes])
+            self.assertNotIn('你在 All 说', ''.join(parsed.quoted))
             self.assertIsNone(row['media_json'])
 
     async def test_assistant_text_resembling_an_echo_label_is_not_reclassified(self):
@@ -165,6 +172,8 @@ class EchoCompletionTests(unittest.IsolatedAsyncioTestCase):
         message = self.messages[mid]
         parsed = markdown_display(message['rich_message']['markdown'])
         self.assertIn('**字面要求**', ''.join(parsed.quoted))
+        self.assertNotIn('你在 All 说', ''.join(parsed.quoted))
+        self.assertIn('📩 你在 All 说：', ''.join(parsed.text))
         self.assertNotIn('普通进度', ''.join(parsed.quoted))
         self.assertTrue(any(tag == 'strong' and 'blockquote' not in path for tag, path in parsed.nodes))
         self.assert_status_keyboard(message, '正在工作')
@@ -180,6 +189,7 @@ class EchoCompletionTests(unittest.IsolatedAsyncioTestCase):
         mid = self.delivery().body_preview.load(self.identity())['message_id']
         parsed = DisplayHTML(self.messages[mid]['rich_message']['html'])
         self.assertIn('**输入原文**', ''.join(parsed.quoted))
+        self.assertNotIn('你在 All 说', ''.join(parsed.quoted))
         self.assertTrue(any(tag == 'blockquote' and 'footer' not in path for tag, path in parsed.nodes))
         self.assertTrue(any(tag == 'footer' and 'blockquote' not in path for tag, path in parsed.nodes))
         self.assertFalse(any(tag == 'footer' and 'blockquote' in path for tag, path in parsed.nodes))
@@ -202,6 +212,8 @@ class EchoCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(tag == 'blockquote' for tag, _ in history.nodes), 2)
         self.assertIn('**All原文** ![图](/private/input.png)', ''.join(history.quoted))
         self.assertIn('<https://example.com> &copy;', ''.join(history.quoted))
+        self.assertNotIn('你在 All 说', ''.join(history.quoted))
+        self.assertNotIn('你在 Codex 客户端说', ''.join(history.quoted))
         final = markdown_display(calls[-1][1]['rich_message']['markdown'])
         self.assertNotIn('blockquote', [tag for tag, _ in final.nodes])
         self.assertIn('h1', [tag for tag, _ in final.nodes])
@@ -250,12 +262,15 @@ class EchoCompletionTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.drain()
         self.assertGreater(len(rows), 3)
         self.assertEqual(''.join(text for _, text, _ in rows[:-1]), raw)
-        for method, params in self.sends()[:-1]:
+        for index, (method, params) in enumerate(self.sends()[:-1]):
             self.assertEqual(method, 'sendRichMessage')
             markdown = params['rich_message']['markdown']
             self.assertLessEqual(utf16_size(markdown), 3800)
-            self.assertTrue(markdown.startswith('>'))
-            self.assertIn('blockquote', [tag for tag, _ in markdown_display(markdown).nodes])
+            self.assertTrue(markdown.startswith('>') if index else
+                            markdown.startswith('🖥 你在 Codex 客户端说：\n\n> '))
+            parsed = markdown_display(markdown)
+            self.assertIn('blockquote', [tag for tag, _ in parsed.nodes])
+            self.assertNotIn('你在 Codex 客户端说', ''.join(parsed.quoted))
             self.assertTrue(params['disable_notification'])
         self.assertFalse(self.sends()[-1][1]['disable_notification'])
 
@@ -285,4 +300,75 @@ class EchoCompletionTests(unittest.IsolatedAsyncioTestCase):
         retry = self.delivery().next_row()
         self.assertEqual(tuple(retry[field] for field in ('key', 'text', 'rich_text', 'chat_id', 'message_thread_id')), frozen)
         self.assertIn('blockquote', [tag for tag, _ in markdown_display(retry['rich_text']).nodes])
+
+
+class EchoProjectionTests(unittest.TestCase):
+    def test_only_generated_first_title_is_outside_quote(self):
+        title = '📩 你在 All 说：'
+        body = title + '\n**用户正文仍是字面文本**'
+        raw = title + '\n' + body
+        parts = list(echo_parts(raw))
+        self.assertEqual(parts[0][0], raw)
+        parsed = markdown_display(parts[0][1])
+        self.assertEqual(''.join(parsed.quoted).strip(), body)
+        self.assertEqual(''.join(parsed.text).count(title), 2)
+
+    def test_unrecognised_or_missing_title_keeps_entire_echo_quoted(self):
+        for raw in ['**没有标题的历史回显**', '用户正文\n📩 你在 All 说：\n正文',
+                    '📩 你在 All 说：相似正文']:
+            with self.subTest(raw=raw):
+                parts = list(echo_parts(raw))
+                self.assertEqual(''.join(text for text, _ in parts), raw)
+                self.assertEqual(''.join(markdown_display(parts[0][1]).quoted).strip(), raw)
+
+    def test_empty_body_and_tiny_title_budget_preserve_every_raw_character(self):
+        title = '🖥 你在 Codex 客户端说：\r\n'
+        header_parts = list(echo_parts(title, 12))
+        self.assertEqual(''.join(raw for raw, _ in header_parts), title)
+        self.assertTrue(all(not markdown_display(rich).quoted for _, rich in header_parts))
+        raw = title + '😀 *x*\n正文'
+        parts = list(echo_parts(raw, 12))
+        self.assertEqual(''.join(part for part, _ in parts), raw)
+        self.assertTrue(all(max(utf16_size(part), utf16_size(rich)) <= 12 for part, rich in parts))
+        self.assertEqual(''.join(''.join(markdown_display(rich).quoted) for _, rich in parts).replace('\n', ''),
+                         '😀 *x*正文')
+
+    def test_legacy_source_slices_rejoin_title_before_aggregate_rendering(self):
+        title = '📩 你在 All 说：\n'
+        rows = [{'key': 'main-guard-input:d:0', 'text': title[:5]},
+                {'key': 'main-guard-input:d:1', 'text': title[5:] + '**正文**'},
+                {'key': 'turn:t:answer:0', 'text': '**助手正文**'}]
+        raw, rich = list(aggregate_parts(rows, rich=True))[0]
+        parsed = markdown_display(rich)
+        self.assertEqual(raw, title + '**正文**' + SEPARATOR + '**助手正文**')
+        self.assertEqual(''.join(parsed.quoted).strip(), '**正文**')
+        self.assertIn('助手正文', ''.join(parsed.text))
+
+    def test_preview_retains_partial_title_outside_body_quote_and_exact_raw_tail(self):
+        title = '📩 你在 All 说：\n'
+        body = '**正文**'
+        earlier = '前置过程' * 35
+        rows = [{'key': 'turn:t:progress:0', 'text': earlier},
+                {'key': 'main-guard-input:d:0', 'text': title + body}]
+        original = earlier + SEPARATOR + title + body
+        # Sweep across the boundary where a trimmed tail starts in the title.
+        found_partial = False
+        for limit in range(utf16_size(PREVIEW_NOTE) + utf16_size(quote_markdown(body)) + 2,
+                           utf16_size(PREVIEW_NOTE) + utf16_size(title + body) + 7):
+            raw, rich = preview_pair(rows, limit)
+            self.assertLessEqual(max(utf16_size(raw), utf16_size(rich)), limit)
+            parsed = markdown_display(rich)
+            self.assertEqual(''.join(parsed.quoted).strip(), body)
+            self.assertTrue(raw.startswith(PREVIEW_NOTE))
+            tail = raw[len(PREVIEW_NOTE):]
+            self.assertTrue(original.endswith(tail))
+            if body != tail and title + body != tail and title.endswith(tail[:-len(body)]):
+                found_partial = True
+        self.assertTrue(found_partial)
+        long_body = '😀 *正文* ' * 100
+        long_rows = [{'key': 'main-guard-input:d:0', 'text': title + long_body}]
+        raw, rich = preview_pair(long_rows, 200)
+        self.assertTrue(raw.endswith('正文* '))
+        self.assertNotIn('你在 All 说', ''.join(markdown_display(rich).quoted))
+        self.assertLessEqual(max(utf16_size(raw), utf16_size(rich)), 200)
 

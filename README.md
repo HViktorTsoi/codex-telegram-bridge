@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.26 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.27 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -310,6 +310,18 @@ Telegram 托管 Bot API 的附件下载上限为 20MB。图片作为 `localImage
 两台机器使用同一个源码仓库，各自保留 Bot Token、白名单和运行数据库。修改通过测试后提交，再发布版本 tag，并分别更新机器；更新与回退流程见 [DEPLOYMENT.md](DEPLOYMENT.md)，功能记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 `.github/workflows/tests.yml` 为推送和 Pull Request 配置 Python 3.10 / 3.12 自动测试。GitHub 仓库建立并推送后才会实际运行该工作流。
+
+## Codex 选项按钮
+
+话题模式自动把 Codex 的原生结构化选择题显示为对应话题中的独立按钮消息，无需新建或重新绑定会话。单题点选后提交，多题逐题选择并在最后一题提交；“自行输入”会发出文字回答提示，回复该提示即可作答，回复 `/cancel` 只取消此次文字输入。普通聊天与系统指令继续按原有流程处理。
+
+问题会立即发送，不等待当前任务完成或合并正文；点击后答案回到原 Codex 会话，同步问题使用原请求响应，异步问题使用原生关联答案格式。问题查询和按钮界面由代码处理，提交后 Codex 按原会话的模型及参数继续工作。已回答、已过期或绑定变化的按钮会失效；也可以在 Codex 客户端回答，桥接会随后关闭对应按钮。首次启用不补发旧问题，普通正文中的 A/B/C 列表不会自动变成选择题。
+
+本功能不代替执行审批、权限授权或机密输入。原生接口暂不能核验的问题仍需在 Codex 客户端处理；连接或发送结果未知时不会自动重复提交。问题默认有效期 24 小时，同步问题还受原生请求生命周期限制。
+
+若在 Codex 客户端先回答了多道题中的一部分，Telegram 会关闭该组按钮以避免重复提交，其余问题请继续在 Codex 中回答。
+
+All 派单和 Codex 客户端用户输入回显中，桥接生成的“你在 All 说”“你在 Codex 客户端说”标题保持普通文字，仅用户消息正文使用引用格式。纯文本降级仍保留原文，附件与模型输入保持原流程。
 
 ## 可选提醒示例
 

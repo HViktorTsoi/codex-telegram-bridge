@@ -350,7 +350,7 @@ class SkillsMenuTests(unittest.IsolatedAsyncioTestCase):
             "SELECT text,rich_text,media_json,message_thread_id FROM outbox WHERE key LIKE 'main-guard-input:skills:%'").fetchall()
         self.assertEqual(len(echoes), 1)
         self.assertIn(original, echoes[0]['text'])
-        self.assertTrue(echoes[0]['rich_text'].startswith('>'))
+        self.assertTrue(echoes[0]['rich_text'].startswith('📩 你在 All 说：\n\n> '))
         self.assertIsNone(echoes[0]['media_json'])
         self.assertEqual(echoes[0]['message_thread_id'], 22)
         self.assertEqual(self.starts(), [])
