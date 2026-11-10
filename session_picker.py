@@ -150,7 +150,7 @@ class SessionPicker:
             lines.append(f"{number}. {clean_name(target['name'], 40)}（{status}）\n目录：{directory}")
         if len(self.router.targets) > len(targets):
             lines.append('更多会话请点击“添加会话”查看。')
-        lines.append('All 是管理入口；普通消息需选择并确认接收会话。')
+        lines.append('All 是管理入口；普通消息选择接收会话后立即发送。')
         text = '\n\n'.join(lines) + '\n\n点击“添加会话”，选择本机已有的 Codex 会话并绑定到新话题。'
         text += '\n点击已绑定会话可管理或重新创建其话题入口。'
         rows = [[(f"{number}. {clean_name(t['name'], 40)}", 'select', {'thread_id': t['thread_id']})]

@@ -325,7 +325,7 @@ class ConfirmedMainReceiptTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await picker_fixtures.PickerTests.asyncTearDown(self)
 
-    async def test_main_message_receipt_waits_for_target_confirmation_then_appears_in_that_topic(self):
+    async def test_main_message_receipt_waits_for_target_selection_then_appears_in_that_topic(self):
         self.sequence += 1
         self.router.ingest({'update_id': self.sequence, 'message': {
             'message_id': self.sequence, 'from': {'id': 123}, 'chat': {'id': 123, 'type': 'private'},
@@ -335,11 +335,6 @@ class ConfirmedMainReceiptTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.15)
         self.assertEqual(self.draft_calls, [])
         self.router.ingest(self.callback(panel, 'Instagram'))
-        await self.router.picker.handle_one()
-        review = self.telegram.messages[panel['message_id']]
-        await asyncio.sleep(0.15)
-        self.assertEqual(self.draft_calls, [])
-        self.router.ingest(self.callback(review, '确认发送'))
         await self.router.picker.handle_one()
 
         async def waiting():

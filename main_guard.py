@@ -1,4 +1,4 @@
-"""Hold ordinary All-chat messages until an exact destination is confirmed."""
+"""Hold ordinary All-chat messages until an exact destination is selected."""
 import copy
 import json
 import secrets
@@ -139,7 +139,7 @@ class MainChatGuard:
         if draft['album_id']:
             content = f'相册 · {len(members)} 条消息\n' + content
         if any(json.loads(row['reply_json']) for row in members):
-            content += '\n包含原消息引用，确认后会一起传入。'
+            content += '\n包含原消息引用，选择会话后会一起传入。'
         return content
 
     async def _panel(self, update, text, rows, draft=None):
@@ -169,11 +169,11 @@ class MainChatGuard:
         if draft['state'] in ('queued', 'cancelled'):
             return await self._closed(update, draft)
         if draft['state'] == 'releasing':
-            raise BindingError('这条消息正在投递，请稍后查看；不要重复确认。')
+            raise BindingError('这条消息正在投递，请稍后查看；不要重复选择。')
         targets = self.router.recent.ordered(t for t in self.router.targets.values() if not t.get('topic_missing'))
         pages = max(1, (len(targets) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
-        base = {'id': draft['id'], 'revision': draft['revision']}
+        base = {'id': draft['id'], 'revision': draft['revision'], 'send_on_select': True}
         rows = [[(clean_name(target['name'], 42), 'main:select', {**base, 'target': self._binding(target)})]
                 for target in targets[page * self.PAGE:(page + 1) * self.PAGE]]
         navigation = []
@@ -186,7 +186,7 @@ class MainChatGuard:
         rows.append([('取消', 'main:cancel', base), ('待发送', 'main:list', {})])
         text = ('All · 选择接收会话\n这条消息尚未发送给 Codex。\n\n' + self._preview(draft) +
                 f"\n\n{self.router.config.get('host_id', '本机')} · 第 {page + 1}/{pages} 页\n"
-                '按最近访问排序。请选择本机目标，再确认发送。')
+                '按最近访问排序。点击本机会话即发送。')
         if not targets:
             text += '\n暂无可用的已绑定会话，请先通过 /sessions 添加或修复绑定。'
         return await self._panel(update, text, rows, draft)
@@ -202,7 +202,7 @@ class MainChatGuard:
         if draft['panel_id'] and draft['presented_revision'] == draft['revision']:
             return
         if draft['state'] == 'expired':
-            return await self._panel(update, 'All · 待发送消息已过期\n原文和附件仍保留，请重新选择目标并确认。\n\n' + self._preview(draft),
+            return await self._panel(update, 'All · 待发送消息已过期\n原文和附件仍保留，请重新选择接收会话。\n\n' + self._preview(draft),
                                      [[('重新选择', 'main:choose', {'id': draft['id']})],
                                       [('取消', 'main:cancel', {'id': draft['id']})]], draft)
         return await self._selector(update, draft)
@@ -213,7 +213,7 @@ class MainChatGuard:
                                  (str(self.router.owner),)).fetchall()
         pages = max(1, (len(drafts) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
-        text, rows = [f'All · 待发送\n共 {len(drafts)} 条，确认目标后才会发送。'], []
+        text, rows = [f'All · 待发送\n共 {len(drafts)} 条，选择接收会话后发送。'], []
         for number, item in enumerate(drafts[page * self.PAGE:(page + 1) * self.PAGE], page * self.PAGE + 1):
             draft = self._draft(item['id'])
             preview = clean_name(self._preview(draft), 65)
@@ -242,7 +242,7 @@ class MainChatGuard:
         if not self.router.owner_allowed():
             raise BindingError('访问权限已变化，消息未继续投递；恢复权限后请重新选择。')
         if draft['state'] != 'releasing' or draft['selected_revision'] != draft['revision']:
-            raise BindingError('相册内容或确认步骤已变化，请重新选择并确认。')
+            raise BindingError('相册内容或所选目标已变化，请重新选择接收会话。')
         selected = json.loads(draft['selection_json'])
         target = self._validate(selected)
         bridge = self.router.bridges[target['key']]
@@ -267,7 +267,7 @@ class MainChatGuard:
                     raise BindingError('原投递标识已存在或已被拒绝，未覆盖旧任务；请核对后取消并重新发送。')
             else:
                 bridge.store.accept({'update_id': row['update_id']}, message, reply_context=context, guard_binding=binding)
-            # Mirror the confirmed user's text into the same Telegram topic,
+            # Mirror the user's text into the selected Telegram topic,
             # including on recovery after input import but before outbox commit.
             # This distinct key stays plain text and never becomes model input.
             body = message.get('text') or message.get('caption', '')
@@ -305,23 +305,31 @@ class MainChatGuard:
             raise BindingError('相册内容已变化，消息未发送；请从 /sessions → 待发送重新选择。')
         if action == 'main:select':
             selected = data['target']
-            target = self._validate(selected)
-            self._save(draft['id'], state='review', selection_json=json.dumps(selected, ensure_ascii=False, sort_keys=True),
-                       selected_revision=draft['revision'], expires_at=self.clock() + self.TTL)
-            draft = self._draft(draft['id'])
-            text = (f"确认发送到「{clean_name(target['name'])}」？\n主机：{self.router.config.get('host_id', '本机')}\n"
-                    f"会话：{target['thread_id']}\n\n" + self._preview(draft) + '\n\n确认后才会交给该会话，原文与回复显示在对应话题。')
-            base = {'id': draft['id'], 'revision': draft['revision'], 'target': selected}
-            return await self._panel(update, text, [[('确认发送', 'main:confirm', base)],
-                                                   [('重新选择', 'main:choose', {'id': draft['id']}),
-                                                    ('取消', 'main:cancel', {'id': draft['id']})]], draft)
-        if action != 'main:confirm':
+            self._validate(selected)
+            if data.get('send_on_select') is not True:
+                # A selection made on an old two-step panel was not a send
+                # action. Refresh it instead of releasing it after an upgrade.
+                self._save(draft['id'], state='held', selection_json=None, selected_revision=None,
+                           expires_at=self.clock() + self.TTL, error=None)
+                return await self._selector(update, self._draft(draft['id']))
+        elif action == 'main:confirm':
+            # Buttons already displayed by older versions can still complete
+            # their frozen selection; opening or recovering one never sends it.
+            if (draft['state'] != 'review' or draft['selected_revision'] != draft['revision']
+                    or json.loads(draft['selection_json'] or 'null') != data.get('target')):
+                raise BindingError('所选目标已变化，请重新选择接收会话。')
+            selected = data['target']
+            self._validate(selected)
+        else:
             raise BindingError('未知操作，请重新打开待发送列表。')
-        if (draft['state'] != 'review' or draft['selected_revision'] != draft['revision']
-                or json.loads(draft['selection_json'] or 'null') != data.get('target')):
-            raise BindingError('确认目标已变化，请重新选择并确认。')
-        self._validate(data['target'])
-        self._save(draft['id'], state='releasing', confirmed_at=self.clock())
+        if draft['album_id'] and self.clock() - draft['last_at'] < 2:
+            raise BindingError('相册仍在接收，消息未发送；请稍后重新选择接收会话。')
+        # The click itself is the send action. Persist the complete intent
+        # before importing any input so crash recovery keeps this exact route.
+        self._save(draft['id'], state='releasing',
+                   selection_json=json.dumps(selected, ensure_ascii=False, sort_keys=True),
+                   selected_revision=draft['revision'], expires_at=self.clock() + self.TTL,
+                   confirmed_at=self.clock())
         try:
             self._release(self._draft(draft['id']))
         except BindingError as error:

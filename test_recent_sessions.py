@@ -148,24 +148,22 @@ class MainGuardRecentTests(unittest.IsolatedAsyncioTestCase):
                     targets.append(json.loads(saved['data'])['target']['thread_id'])
         return targets
 
-    async def test_main_selector_uses_access_order_and_cancelled_selection_does_not_change_it(self):
+    async def test_main_selector_uses_access_order_and_cancel_does_not_change_it(self):
         self.router.recent.record('meeting-native', 'seed:meeting', 200)
         self.router.recent.record('instagram-native', 'seed:instagram', 100)
         _, panel = await self.send('先不要发送')
         self.assertEqual(self.choices(panel), ['meeting-native', 'instagram-native'])
-        review = await self.click(panel, 'Instagram')
         self.assertEqual(self.router.recent.last('instagram-native'), 100)
-        await self.click(review, '取消')
+        await self.click(panel, '取消')
         _, next_panel = await self.send('仍按真正访问顺序')
         self.assertEqual(self.choices(next_panel), ['meeting-native', 'instagram-native'])
 
-    async def test_confirmed_handoff_moves_session_to_top_and_recovery_does_not_bump_it(self):
+    async def test_target_click_handoff_moves_session_to_top_and_recovery_does_not_bump_it(self):
         self.router.recent.record('meeting-native', 'seed:meeting', self.now - 20)
         _, panel = await self.send('确认后才算访问')
-        review = await self.click(panel, 'Instagram')
         self.assertEqual(self.router.recent.last('instagram-native'), 0)
         confirmed = self.now
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assertEqual(self.router.recent.last('instagram-native'), confirmed)
         self.now += 100
         self.router.picker.guard.recover()
@@ -175,10 +173,9 @@ class MainGuardRecentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recording_failure_after_child_commit_recovers_original_confirmation_time_once(self):
         _, panel = await self.send('恢复同一次确认')
-        review = await self.click(panel, 'Instagram')
         confirmed = self.now
         with patch.object(self.router.recent, 'record', side_effect=OSError('interrupted metadata commit')):
-            await self.click(review, '确认发送')
+            await self.click(panel, 'Instagram')
         self.assertEqual(len(self.inbox()), 1)
         self.assertEqual(self.router.recent.last('instagram-native'), 0)
         self.now += 100
@@ -187,15 +184,14 @@ class MainGuardRecentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.inbox()), 1)
         self.assertEqual(self.router.recent.last('instagram-native'), confirmed)
 
-    async def test_bot_output_and_failed_confirmation_do_not_make_a_session_recent(self):
+    async def test_bot_output_and_failed_selection_do_not_make_a_session_recent(self):
         self.router.recent.record('meeting-native', 'seed:meeting', 200)
         self.router.recent.record('instagram-native', 'seed:instagram', 100)
         self.router.bridges['instagram'].store.enqueue_at('turn:bot:reply', '123', '后台回复', 22)
         self.assertEqual(self.router.recent.last('instagram-native'), 100)
         _, panel = await self.send('旧目标不能确认')
-        review = await self.click(panel, 'Instagram')
         self.router.targets['instagram']['message_thread_id'] = 99
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assertEqual(self.router.recent.last('instagram-native'), 100)
         self.assertEqual(self.inbox(), [])
 

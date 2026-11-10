@@ -59,22 +59,34 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not self.inbox(key) for key in self.router.bridges))
 
     async def confirm(self, panel, name='Instagram'):
-        review = await self.click(panel, name)
-        self.assert_held()
-        await self.click(review, '确认发送')
-        return review
+        # Selecting a destination is the send action; no review page follows.
+        return await self.click(panel, name)
 
-    async def test_plain_main_message_requires_selection_and_final_confirmation_without_native_calls(self):
+    async def legacy_review(self, panel, name='Instagram'):
+        """Persist a pre-upgrade review and its real callback binding."""
+        selection = self.callback(panel, name)
+        token = selection['callback_query']['data'][3:]
+        data = json.loads(self.router.store.db.execute(
+            'SELECT data FROM ui_buttons WHERE token=?', (token,)).fetchone()[0])
+        data.pop('send_on_select', None)  # Old review callbacks predate one-click delivery.
+        guard = self.router.picker.guard
+        guard._save(data['id'], state='review', selection_json=json.dumps(data['target']),
+                    selected_revision=data['revision'], expires_at=self.now + guard.TTL)
+        return await guard._panel(selection, '旧版待确认消息', [
+            [('确认发送', 'main:confirm', data)],
+            [('重新选择', 'main:choose', {'id': data['id']}),
+             ('取消', 'main:cancel', {'id': data['id']})]], guard._draft(data['id']))
+
+    async def test_plain_main_message_sends_on_selection_without_a_confirmation_page_or_native_calls(self):
         update, panel = await self.send('请检查这个项目')
         self.assert_held()
         self.assertIn('All', panel['text'])
         self.assertNotIn('message_thread_id', panel)
         self.assertEqual(self.router.picker.guard.pending_count(), 1)
-        review = await self.click(panel, 'Instagram')
-        self.assert_held()
-        self.assertIn('Instagram', review['text'])
-        self.assertIn('请检查这个项目', review['text'])
-        await self.click(review, '确认发送')
+        result = await self.click(panel, 'Instagram')
+        self.assertIn('Instagram', result['text'])
+        self.assertIn('已加入', result['text'])
+        self.assertNotIn('确认发送', str(result['reply_markup']))
         row = self.inbox()[0]
         self.assertEqual((row['id'], row['text'], row['message_thread_id']),
                          (update['update_id'], '请检查这个项目', 22))
@@ -91,13 +103,12 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inbox('meeting')[0]['text'], '发给 Manager 的内容')
         self.assertEqual(self.inbox(), [])
 
-    async def test_duplicate_message_and_confirmation_enqueue_exact_original_input_once(self):
+    async def test_duplicate_message_and_target_click_enqueue_exact_original_input_once(self):
         update, panel = await self.send('只发送一次')
         self.router.ingest(copy.deepcopy(update))
         await self.router.picker.handle_one()
         self.assertEqual(self.router.picker.guard.pending_count(), 1)
-        review = await self.click(panel, 'Instagram')
-        click = self.callback(review, '确认发送')
+        click = self.callback(panel, 'Instagram')
         self.router.ingest(click)
         await self.router.picker.handle_one()
         self.sequence += 1
@@ -110,11 +121,10 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inbox()[0]['id'], update['update_id'])
         self.assertEqual(self.inbox('meeting'), [])
 
-    async def test_cancellation_and_stale_confirmation_do_not_send_or_select_a_default(self):
+    async def test_cancellation_and_stale_target_click_do_not_send_or_select_a_default(self):
         _, panel = await self.send('发错了，不要执行')
-        review = await self.click(panel, 'Instagram')
-        stale = self.callback(review, '确认发送')
-        await self.click(review, '取消')
+        stale = self.callback(panel, 'Instagram')
+        await self.click(panel, '取消')
         self.router.ingest(stale)
         await self.router.picker.handle_one()
         self.assert_held()
@@ -124,10 +134,8 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         first, first_panel = await self.send('第一条')
         second, second_panel = await self.send('第二条')
         self.assertEqual(self.router.picker.guard.pending_count(), 2)
-        first_review = await self.click(first_panel, 'Instagram')
-        second_review = await self.click(second_panel, '会议记录')
-        await self.click(first_review, '确认发送')
-        await self.click(second_review, '确认发送')
+        await self.click(first_panel, 'Instagram')
+        await self.click(second_panel, '会议记录')
         self.assertEqual([(r['id'], r['text']) for r in self.inbox()], [(first['update_id'], '第一条')])
         self.assertEqual([(r['id'], r['text']) for r in self.inbox('meeting')], [(second['update_id'], '第二条')])
         third, _ = await self.send('第三条仍需重新选择')
@@ -142,9 +150,8 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
             _, panel = await self.send('', **extra)
             self.assertEqual(self.router.store.db.execute('SELECT COUNT(*) FROM cc_jobs').fetchone()[0], 0)
             self.assertEqual(sum(len(self.inbox(key)) for key in self.router.bridges), index)
-            review = await self.click(panel, 'Instagram')
-            self.assertEqual(sum(len(self.inbox(key)) for key in self.router.bridges), index)
-            await self.click(review, '确认发送')
+            await self.click(panel, 'Instagram')
+            self.assertEqual(sum(len(self.inbox(key)) for key in self.router.bridges), index + 1)
             row = self.inbox()[-1]
             self.assertEqual(row['text'], extra['caption'])
             self.assertEqual(json.loads(row['message_json'])[kind], extra[kind])
@@ -178,23 +185,20 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.router.ingest(forged)
         await self.router.picker.handle_one()
         self.assert_held()
-        review = await self.click(panel, 'Instagram')
         (self.path / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': []}))
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assert_held()
 
-    async def test_changed_binding_after_selection_is_blocked_before_confirmation(self):
+    async def test_changed_binding_since_selector_render_is_blocked_before_handoff(self):
         _, panel = await self.send('不要投给变更后的会话')
-        review = await self.click(panel, 'Instagram')
         self.router.targets['instagram']['thread_id'] = 'different-native'
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assert_held()
 
     async def test_repaired_topic_after_selection_requires_selecting_again(self):
         _, panel = await self.send('话题改变后不能自动跟随')
-        review = await self.click(panel, 'Instagram')
         self.router.targets['instagram']['message_thread_id'] = 999
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assert_held()
 
     async def test_confirmed_guard_validates_binding_before_any_native_dispatch(self):
@@ -236,9 +240,8 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params['input'], [{'type': 'text', 'text': '确认后执行这个任务'}])
         self.assertEqual(params['clientUserMessageId'], 'telegram-' + str(update['update_id']))
 
-    async def test_restart_keeps_pending_message_and_exact_confirmation_destination(self):
+    async def test_restart_keeps_unselected_message_and_sends_only_on_target_click(self):
         update, panel = await self.send('重启后仍保留这一条')
-        review = await self.click(panel, 'Instagram')
         original = self.router
         reloaded = TopicRouter(copy.deepcopy(self.config), self.path)
         reloaded.bot_id, reloaded.telegram = 444, self.telegram
@@ -246,7 +249,8 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.router = reloaded
         try:
             await reloaded.picker.recover()
-            await self.click(review, '确认发送')
+            self.assert_held()
+            await self.click(panel, 'Instagram')
             rows = self.inbox()
             self.assertEqual(len(rows), 1)
             self.assertEqual((rows[0]['id'], rows[0]['text'], rows[0]['message_thread_id']),
@@ -264,11 +268,10 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('尚未确定发给谁', pending['text'] + str(pending['reply_markup']))
         self.assert_held()
 
-    async def test_expired_draft_cannot_be_confirmed_or_fall_back_to_root(self):
+    async def test_expired_draft_cannot_be_selected_or_fall_back_to_root(self):
         _, panel = await self.send('过期后不要执行')
-        review = await self.click(panel, 'Instagram')
         self.now += 901
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assert_held()
 
     async def test_thread_messages_commands_aliases_and_force_reply_flows_bypass_main_guard(self):
@@ -318,7 +321,7 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         row = self.router.store.db.execute('SELECT payload FROM cc_requests').fetchone()
         self.assertEqual(json.loads(row[0])['text'], '明确回复派单提示')
 
-    async def test_album_is_one_confirmation_and_all_original_parts_are_preserved(self):
+    async def test_album_is_one_target_selection_and_all_original_parts_are_preserved(self):
         first, panel = await self.send('', caption='相册说明', media_group_id='album', photo=[{'file_id': 'one'}])
         second, _ = await self.send('', media_group_id='album', photo=[{'file_id': 'two'}])
         self.assert_held()
@@ -332,22 +335,20 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([json.loads(r['message_json'])['photo'][0]['file_id'] for r in rows], ['one', 'two'])
         self.assertTrue(all(r['media_group_id'] == 'album' and r['message_thread_id'] == 22 for r in rows))
 
-    async def test_late_album_part_invalidates_review_and_parts_after_send_need_new_confirmation(self):
+    async def test_late_album_part_invalidates_target_click_and_parts_after_send_need_new_selection(self):
         await self.send('', caption='第一部分', media_group_id='album', photo=[{'file_id': 'one'}])
         self.now += 3
         await self.pump()
         panel = self.telegram.messages[self.telegram.next_id]
-        review = await self.click(panel, 'Instagram')
-        old_confirm = self.callback(review, '确认发送')
+        stale_selection = self.callback(panel, 'Instagram')
         await self.send('', media_group_id='album', photo=[{'file_id': 'two'}])
-        self.router.ingest(old_confirm)
+        self.router.ingest(stale_selection)
         await self.router.picker.handle_one()
         self.assert_held()
         self.now += 3
         await self.pump()
         panel = self.telegram.messages[self.telegram.next_id]
-        review = await self.click(panel, 'Instagram')
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assertEqual(len(self.inbox()), 2)
         await self.send('', media_group_id='album', photo=[{'file_id': 'three'}])
         self.now += 3
@@ -361,7 +362,6 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.now += 3
         await self.pump()
         panel = self.telegram.messages[self.telegram.next_id]
-        review = await self.click(panel, 'Instagram')
         child = self.router.bridges['instagram']
         accept = child.store.accept
         count = 0
@@ -374,7 +374,7 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
             return accept(*args, **kwargs)
 
         with patch.object(child.store, 'accept', side_effect=interrupted):
-            await self.click(review, '确认发送')
+            await self.click(panel, 'Instagram')
         self.assertEqual([r['id'] for r in self.inbox()], [first['update_id']])
         self.router.picker.guard.recover()
         self.router.picker.guard.recover()
@@ -396,13 +396,49 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('额外会话8', str(first['reply_markup']))
         second = await self.click(first, '下一页')
         self.assertIn('额外会话8', str(second['reply_markup']))
-        review = await self.click(second, '额外会话8')
-        self.assert_held()
-        await self.click(review, '确认发送')
+        await self.click(second, '额外会话8')
         row = self.inbox('extra8')[0]
         self.assertEqual((row['text'], row['message_thread_id']), ('请选择列表后面的会话', 108))
         self.assertEqual(self.inbox(), [])
         self.assertEqual(self.inbox('meeting'), [])
+
+    async def test_legacy_review_is_not_sent_on_restart_and_its_confirmation_still_works_once(self):
+        update, panel = await self.send('升级前已经选好了目标')
+        review = await self.legacy_review(panel)
+        confirmation = self.callback(review, '确认发送')
+        self.assert_held()
+        original = self.router
+        reloaded = TopicRouter(copy.deepcopy(self.config), self.path)
+        reloaded.bot_id, reloaded.telegram = 444, self.telegram
+        reloaded.picker.guard.clock = lambda: self.now
+        self.router = reloaded
+        try:
+            await reloaded.picker.recover()
+            self.assert_held()
+            self.router.ingest(confirmation)
+            await self.pump()
+            self.assertEqual([(r['id'], r['text'], r['message_thread_id']) for r in self.inbox()],
+                             [(update['update_id'], '升级前已经选好了目标', 22)])
+            self.sequence += 1
+            confirmation['update_id'] = self.sequence
+            self.router.ingest(confirmation)
+            await self.pump()
+            self.assertEqual(len(self.inbox()), 1)
+        finally:
+            for child in reloaded.bridges.values():
+                child.store.db.close()
+            reloaded.store.db.close()
+            self.router = original
+
+    async def test_legacy_review_can_be_cancelled_without_sending_its_old_confirmation(self):
+        _, panel = await self.send('旧版确认页也允许取消')
+        review = await self.legacy_review(panel)
+        stale = self.callback(review, '确认发送')
+        await self.click(review, '取消')
+        self.router.ingest(stale)
+        await self.pump()
+        self.assert_held()
+        self.assertEqual(self.router.picker.guard.pending_count(), 0)
 
     async def test_quoted_old_photo_is_context_only_and_only_new_photo_downloads_after_confirmation(self):
         from test_outgoing_images import PNG
