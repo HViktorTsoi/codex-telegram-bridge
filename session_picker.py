@@ -148,6 +148,12 @@ class SessionPicker:
             ready = self.router.bridges[target['key']].ready.is_set()
             status = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
             lines.append(f"{number}. {clean_name(target['name'], 40)}（{status}）\n目录：{directory}")
+        temporary = list(self.router.temporary_routes.values())
+        if temporary:
+            lines.append('临时 All 路由：')
+            for number, target in enumerate(temporary, len(targets) + 1):
+                state = '已开启' if target.get('enabled') else '已关闭'
+                lines.append(f"{number}. {clean_name(target['name'], 40)} 【临时】（{state}，回复回到 All）")
         if len(self.router.targets) > len(targets):
             lines.append('更多会话请点击“添加会话”查看。')
         lines.append('All 是管理入口；普通消息选择接收会话后立即发送。')
@@ -155,7 +161,12 @@ class SessionPicker:
         text += '\n点击已绑定会话可管理或重新创建其话题入口。'
         rows = [[(f"{number}. {clean_name(t['name'], 40)}", 'select', {'thread_id': t['thread_id']})]
                 for number, t in enumerate(targets, 1)]
-        rows.extend([[('➕ 添加会话', 'catalog', {}), ('🆕 新建会话', 'new:start', {})]])
+        for number, target in enumerate(temporary, len(targets) + 1):
+            rows.append([(f"{number}. {clean_name(target['name'], 40)} 【临时】",
+                          'temp:select', {'key': target['key']})])
+        # Keep session entries above; management actions stay together at the bottom.
+        rows.extend([[('➕ 添加会话', 'catalog', {}), ('➕ 添加临时 All', 'temp:catalog', {})],
+                     [('🆕 新建会话', 'new:start', {})]])
         count = self.guard.pending_count()
         if count:
             rows.append([(f'📨 待发送（{count}）', 'main:list', {})])
@@ -271,6 +282,7 @@ class SessionPicker:
         return catalog_id, payload
 
     async def catalog(self, update, data):
+        temporary = bool(data.get('temporary'))
         catalog_id = data.get('catalog_id')
         if catalog_id:
             saved = self.db.execute('SELECT payload FROM ui_catalogs WHERE id=? AND expires_at>?',
@@ -286,22 +298,27 @@ class SessionPicker:
             group_index = next((i for i, g in enumerate(groups) if 'directory' in data and g['cwd'] == data['directory']), 0)
         host = self.router.config.get('host_id', '本机')
         if not groups:
-            return await self.panel(update, f'{host} · 添加会话\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。',
-                                    [[('重新加载', 'catalog', {}), ('返回', 'home', {})]])
+            reload_data = {'temporary': True} if temporary else {}
+            return await self.panel(update, f'{host} · ' + ('添加临时 All 路由' if temporary else '添加会话')
+                                    + '\n未找到可用会话；可先在电脑上创建会话，再点“重新加载”。',
+                                    [[('重新加载', 'catalog', reload_data), ('返回', 'home', {})]])
         if 'group' not in data and 'directory' not in data:
-            return await self.directory_index(update, catalog_id, groups, data.get('dir_page', 0))
+            return await self.directory_index(update, catalog_id, groups, data.get('dir_page', 0), temporary)
         group = groups[group_index]
         threads = group['threads']
         page_count = (len(threads) + 11) // 12
         page = max(0, min(int(data.get('page', 0)), page_count - 1))
         position = {'catalog_id': catalog_id, 'group': group_index, 'page': page}
+        if temporary:
+            position['temporary'] = True
         bound = {t['thread_id']: t for t in self.router.targets.values()}
         rows = []
         for number, thread in enumerate(threads[page * 12:(page + 1) * 12], page * 12 + 1):
             label = clean_name(thread.get('name') or '未命名会话', 32) + ' · ' + thread['id'][-6:]
             if thread['id'] in bound:
                 label = ('⚠ 话题失效 ' if bound[thread['id']].get('topic_missing') else '✓ 已绑定 ') + label
-            rows.append([(f'{number}. {label}', 'select', {'thread_id': thread['id'], 'catalog': position})])
+            rows.append([(f'{number}. {label}', 'select', {'thread_id': thread['id'], 'catalog': position,
+                                                           'temporary': temporary})])
         navigation = []
         if page:
             navigation.append(('上一页', 'catalog', {**position, 'page': page - 1}))
@@ -316,53 +333,117 @@ class SessionPicker:
             directories.append(('下个目录 ▶', 'catalog', {**position, 'group': group_index + 1, 'page': 0}))
         if directories:
             rows.append(directories)
-        rows.append([('返回目录列表', 'catalog', {'catalog_id': catalog_id, 'dir_page': group_index // 12}),
-                     ('重新加载', 'catalog', {'directory': group['cwd']})])
-        text = (f'{host} · 添加会话\n目录 {group_index + 1}/{len(groups)}\n'
+        rows.append([('返回目录列表', 'catalog', {'catalog_id': catalog_id, 'dir_page': group_index // 12,
+                                                  **({'temporary': True} if temporary else {})}),
+                     ('重新加载', 'catalog', {'directory': group['cwd'], **({'temporary': True} if temporary else {})})])
+        text = (f'{host} · ' + ('添加临时 All 路由' if temporary else '添加会话')
+                + f'\n目录 {group_index + 1}/{len(groups)}\n'
                 f"📁 {directory_text(group, 1200)}\n\n本目录 {len(threads)} 个会话，最近使用在前；未使用的按原生更新时间排序。")
         if page_count > 1:
             text += f'\n会话第 {page + 1}/{page_count} 页。'
         text += '\n请选择要接入的原会话：'
         await self.panel(update, text, rows)
 
-    async def directory_index(self, update, catalog_id, groups, page=0):
+    async def directory_index(self, update, catalog_id, groups, page=0, temporary=False):
         page_count = (len(groups) + 11) // 12
         page = max(0, min(int(page), page_count - 1))
         rows = []
         for index, group in enumerate(groups[page * 12:(page + 1) * 12], page * 12):
             label = f"{index + 1}. 📁 {directory_text(group, 36)} · {len(group['threads'])}个"
-            rows.append([(label, 'catalog', {'catalog_id': catalog_id, 'group': index, 'page': 0})])
+            rows.append([(label, 'catalog', {'catalog_id': catalog_id, 'group': index, 'page': 0,
+                                             **({'temporary': True} if temporary else {})})])
         navigation = []
         if page:
-            navigation.append(('上一页目录', 'catalog', {'catalog_id': catalog_id, 'dir_page': page - 1}))
+            navigation.append(('上一页目录', 'catalog', {'catalog_id': catalog_id, 'dir_page': page - 1,
+                                                         **({'temporary': True} if temporary else {})}))
         if page + 1 < page_count:
-            navigation.append(('下一页目录', 'catalog', {'catalog_id': catalog_id, 'dir_page': page + 1}))
+            navigation.append(('下一页目录', 'catalog', {'catalog_id': catalog_id, 'dir_page': page + 1,
+                                                         **({'temporary': True} if temporary else {})}))
         if navigation:
             rows.append(navigation)
-        rows.append([('重新加载', 'catalog', {'dir_page': page}), ('返回', 'home', {})])
+        rows.append([('重新加载', 'catalog', {'dir_page': page, **({'temporary': True} if temporary else {})}),
+                     ('返回', 'home', {})])
         host = self.router.config.get('host_id', '本机')
-        text = (f'{host} · 添加会话\n本机会话目录\n\n'
+        text = (f'{host} · ' + ('添加临时 All 路由' if temporary else '添加会话')
+                + '\n本机会话目录\n\n'
                 f"共 {len(groups)} 个目录，{sum(len(g['threads']) for g in groups)} 个会话。\n请选择目录，查看该目录的会话。")
         if page_count > 1:
             text += f'\n目录列表第 {page + 1}/{page_count} 页。'
         await self.panel(update, text, rows)
 
-    async def selected(self, update, thread_id, catalog=None):
-        existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
-        if existing:
-            if existing.get('topic_missing'):
-                return await self.repair_selected(update, thread_id, existing['message_thread_id'])
-            return await self.bound_panel(update, existing, already=True, catalog=catalog)
+    async def selected(self, update, thread_id, catalog=None, temporary=False):
+        if temporary:
+            existing = next((t for t in self.router.temporary_routes.values() if t['thread_id'] == thread_id), None)
+            if existing:
+                return await self.temporary_panel(update, existing, catalog=catalog)
+            if any(t['thread_id'] == thread_id for t in self.router.targets.values()):
+                raise BindingError('这个会话已经绑定正式 Telegram 话题，不能重复添加为临时 All 路由。')
+        else:
+            existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
+            if existing:
+                if existing.get('topic_missing'):
+                    return await self.repair_selected(update, thread_id, existing['message_thread_id'])
+                return await self.bound_panel(update, existing, already=True, catalog=catalog)
         result = await self.router.catalog_call('thread/read', {'threadId': thread_id})
         thread = result['thread']
         if thread['id'] != thread_id or thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False:
             raise BindingError('所选会话当前不可绑定，请重新选择。')
         self.cache_directory(thread)
-        text = (f"确认接入这个原会话？\n\n名称：{clean_name(thread.get('name') or '未命名会话', 140)}\n"
-                f"主机：{self.router.config.get('host_id', '本机')}\nID：{thread_id}\n"
-                f"目录：{directory_text(thread)}\n\n确认后会创建新 Telegram 话题，沿用此会话的历史和设置。")
-        await self.panel(update, text, [[('确认绑定到新话题', 'confirm', {'thread_id': thread_id, 'catalog': catalog})],
-                                        [('返回会话列表', 'catalog', catalog or {}), ('取消', 'home', {})]])
+        if temporary:
+            text = (f"确认添加临时 All 路由？\n\n名称：{clean_name(thread.get('name') or '未命名会话', 140)}\n"
+                    f"主机：{self.router.config.get('host_id', '本机')}\nID：{thread_id}\n"
+                    f"目录：{directory_text(thread)}\n\n不会创建 Telegram 话题；添加后立即在 All 启用此路由，回复会回到 All 并标注此会话名称。")
+            rows = [[('确认添加临时路由', 'temp:confirm', {'thread_id': thread_id, 'catalog': catalog})],
+                    [('返回会话列表', 'catalog', catalog or {'temporary': True}), ('取消', 'home', {})]]
+        else:
+            text = (f"确认接入这个原会话？\n\n名称：{clean_name(thread.get('name') or '未命名会话', 140)}\n"
+                    f"主机：{self.router.config.get('host_id', '本机')}\nID：{thread_id}\n"
+                    f"目录：{directory_text(thread)}\n\n确认后会创建新 Telegram 话题，沿用此会话的历史和设置。")
+            rows = [[('确认绑定到新话题', 'confirm', {'thread_id': thread_id, 'catalog': catalog})],
+                    [('返回会话列表', 'catalog', catalog or {}), ('取消', 'home', {})]]
+        await self.panel(update, text, rows)
+
+    async def temporary_panel(self, update, target, catalog=None):
+        enabled = bool(target.get('enabled'))
+        text = (f"临时 All 路由已存在。\n\n名称：{clean_name(target['name'], 140)}\n"
+                f"标签：{clean_name(target['name'], 140)} 【临时】\n"
+                f"ID：{target['thread_id']}\n状态：{'已开启' if enabled else '已关闭'}\n"
+                '不会创建 Telegram 话题；开启后 All 选择此路由，回复回到 All 并带有该名称标签。')
+        await self.panel(update, text, [
+            [(('关闭' if enabled else '开启') + '临时路由', 'temp:toggle',
+              {'key': target['key'], 'enabled': enabled})],
+            [('修改名称', 'temp:rename', {'key': target['key'], 'thread_id': target['thread_id']})],
+            [('取消临时绑定', 'temp:cancel', {'key': target['key'], 'thread_id': target['thread_id'],
+                                               'enabled': enabled})],
+            [('继续添加', 'temp:catalog', {}), ('返回', 'home', {})]])
+
+    async def temporary_cancel(self, update, target, expected_enabled=None):
+        enabled = bool(target.get('enabled'))
+        if expected_enabled is not None and enabled != bool(expected_enabled):
+            raise BindingError('这个临时路由状态已变化，请重新打开 /sessions。')
+        text = (f"确认取消临时绑定？\n\n名称：{clean_name(target['name'], 140)}\n"
+                f"ID：{target['thread_id']}\n状态：{'已开启' if enabled else '已关闭'}\n\n"
+                '取消后会从当前 Bot 的 /sessions 和 All 选择列表移除；不会删除或修改原 Codex 会话、历史或本地队列。')
+        await self.panel(update, text, [
+            [('确认取消临时绑定', 'temp:remove', {'key': target['key'],
+                                                   'thread_id': target['thread_id'],
+                                                   'enabled': enabled})],
+            [('返回临时路由', 'temp:select', {'key': target['key']})]])
+
+    async def add_temporary(self, thread_id):
+        existing = next((t for t in self.router.temporary_routes.values() if t['thread_id'] == thread_id), None)
+        if existing:
+            return existing
+        if any(t['thread_id'] == thread_id for t in self.router.targets.values()):
+            raise BindingError('这个会话已经绑定正式 Telegram 话题，不能重复添加为临时 All 路由。')
+        thread = await self.router.verify_existing(thread_id)
+        self.cache_directory(thread)
+        name = clean_name(thread.get('name') or 'Codex ' + thread_id[-8:])
+        if any(t['name'].casefold() == name.casefold() for t in self.router.temporary_routes.values()):
+            name += ' · ' + thread_id[-6:]
+        target = {'key': 'temp_' + hashlib.sha256(thread_id.encode()).hexdigest()[:32],
+                  'name': name, 'thread_id': thread_id, 'enabled': True, 'label': name}
+        return self.router.install_temporary_route(target)
 
     def operation(self, thread_id, target, status, error=None):
         with self.db:
@@ -466,8 +547,13 @@ class SessionPicker:
         text = (f"重新创建这个会话的 Telegram 话题？\n\n名称：{clean_name(thread.get('name') or target['name'])}\n"
                 f"ID：{thread_id}\n旧话题：{topic_id}\n\n新话题仍连接这个原会话，保留其历史和设置。"
                 '旧话题的待回传消息不会被自动重发；已执行的请求也不会重复执行。')
-        await self.panel(update, text, [[('确认重新创建话题', 'repair_confirm', {'thread_id': thread_id, 'topic_id': topic_id})],
-                                        [('取消', 'home', {})]])
+        rows = [[('确认重新创建话题', 'repair_confirm', {'thread_id': thread_id, 'topic_id': topic_id})]]
+        if target['key'] != self.router.config['root_target']:
+            rows.append([('取消绑定', 'unbind:start', {'key': target['key'],
+                                                    'thread_id': target['thread_id'],
+                                                    'topic_id': target['message_thread_id']})])
+        rows.append([('取消', 'home', {})])
+        await self.panel(update, text, rows)
 
     async def repair(self, thread_id, topic_id, allow_create=True):
         existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
@@ -501,10 +587,35 @@ class SessionPicker:
         text = (('此会话已经绑定。' if already else '已绑定，立即生效。') +
                 f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n目录：{directory}\n"
                 '在该话题发送 /status 可核对会话。')
-        await self.panel(update, text, [
+        rows = [
             [('修改名称', 'rename:start', {'thread_id': target['thread_id']})],
             [('重新创建话题', 'repair_select', {'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']})],
-            [('继续添加', 'catalog', catalog or {}), ('返回', 'home', {})]])
+        ]
+        # The configured root target is the private-chat fallback for All and
+        # global commands, so it must remain as the router's anchor. Other
+        # formal bindings can be removed without affecting the native session.
+        if target['key'] != self.router.config['root_target']:
+            rows.append([('取消绑定', 'unbind:start', {'key': target['key'],
+                                                    'thread_id': target['thread_id'],
+                                                    'topic_id': target['message_thread_id']})])
+        rows.append([('继续添加', 'catalog', catalog or {}), ('返回', 'home', {})])
+        await self.panel(update, text, rows)
+
+    async def unbind_confirm(self, update, target, expected_topic_id=None):
+        if expected_topic_id is not None and target.get('message_thread_id') != expected_topic_id:
+            raise BindingError('这个绑定已变化，请重新打开 /sessions。')
+        if target['key'] == self.router.config['root_target']:
+            raise BindingError('原始主会话是当前 Bot 的管理入口，不能取消绑定。')
+        topic_state = '话题已标记不可用' if target.get('topic_missing') else f"话题：{target['message_thread_id']}"
+        text = (f"确认取消正式话题绑定？\n\n名称：{clean_name(target['name'], 140)}\n"
+                f"ID：{target['thread_id']}\n{topic_state}\n\n"
+                '取消后会从当前 Bot 的 /sessions、话题路由和 All 选择列表移除；'
+                '不会删除或修改原 Codex 会话、历史、本地队列，也不会调用 Telegram 删除话题。')
+        await self.panel(update, text, [
+            [('确认取消绑定', 'unbind:remove', {'key': target['key'],
+                                               'thread_id': target['thread_id'],
+                                               'topic_id': target.get('message_thread_id')})],
+            [('返回会话管理', 'home', {})]])
 
     def _direct_home(self, update):
         if update.get('callback_query') or self.creator.is_reply(update) or self.renamer.is_reply(update):
@@ -572,12 +683,79 @@ class SessionPicker:
                     await self.renamer.handle(update, action, data)
                 elif action.startswith('main:'):
                     await self.guard.handle(update, action, data)
+                elif action == 'temp:select':
+                    target = self.router.temporary_routes.get(data.get('key'))
+                    if target is None:
+                        raise BindingError('未知临时路由，请重新打开 /sessions。')
+                    await self.temporary_panel(update, target)
+                elif action == 'unbind:start':
+                    target = self.router.targets.get(data.get('key'))
+                    if (target is None or target['thread_id'] != data.get('thread_id')
+                            or target.get('message_thread_id') != data.get('topic_id')):
+                        raise BindingError('未知或已变化的正式绑定，请重新打开 /sessions。')
+                    await self.unbind_confirm(update, target, data.get('topic_id'))
+                elif action == 'unbind:remove':
+                    allow_remove = button['state'] == 'active'
+                    with self.db:
+                        self.db.execute("UPDATE ui_buttons SET state='consumed' WHERE token=?", (button['token'],))
+                    if not allow_remove:
+                        raise BindingError('这个按钮已处理，请重新打开 /sessions。')
+                    removed = await self.router.remove_target(
+                        data['key'], data.get('thread_id'), data.get('topic_id'))
+                    await self.panel(update, f"已取消「{clean_name(removed['name'], 140)}」的正式话题绑定。\n"
+                                     '原 Codex 会话、历史和本地队列均已保留。',
+                                     [[('返回会话管理', 'home', {})]])
+                elif action == 'temp:toggle':
+                    current = self.router.temporary_routes.get(data.get('key'))
+                    if current is None:
+                        raise BindingError('未知临时路由，请重新打开 /sessions。')
+                    expected = data.get('enabled')
+                    if bool(current.get('enabled')) != bool(expected):
+                        raise BindingError('这个开关已更新，请重新打开 /sessions。')
+                    self.router.toggle_temporary_route(data['key'], not bool(expected), expected)
+                    if expected:
+                        await self.router.stop_target(data['key'])
+                    await self.home(update)
+                elif action == 'temp:cancel':
+                    target = self.router.temporary_routes.get(data.get('key'))
+                    if target is None or target['thread_id'] != data.get('thread_id'):
+                        raise BindingError('未知临时路由，请重新打开 /sessions。')
+                    await self.temporary_cancel(update, target, data.get('enabled'))
+                elif action == 'temp:remove':
+                    allow_remove = button['state'] == 'active'
+                    with self.db:
+                        self.db.execute("UPDATE ui_buttons SET state='consumed' WHERE token=?", (button['token'],))
+                    if not allow_remove:
+                        raise BindingError('这个按钮已处理，请重新打开 /sessions。')
+                    removed = await self.router.remove_temporary_route(
+                        data['key'], data.get('thread_id'), data.get('enabled'))
+                    await self.panel(update, f"已取消「{clean_name(removed['name'], 140)}」的临时绑定。\n"
+                                     '原 Codex 会话、历史和本地队列均已保留。',
+                                     [[('返回会话管理', 'home', {})]])
+                elif action == 'temp:rename':
+                    target = self.router.temporary_routes.get(data.get('key'))
+                    if target is None:
+                        target = next((item for item in self.router.temporary_routes.values()
+                                       if item['thread_id'] == data.get('thread_id')), None)
+                    if target is None:
+                        raise BindingError('未知临时路由，请重新打开 /sessions。')
+                    await self.renamer.start(update, target['thread_id'])
+                elif action == 'temp:catalog':
+                    await self.catalog(update, {**data, 'temporary': True})
+                elif action == 'temp:confirm':
+                    allow_create = button['state'] == 'active'
+                    with self.db:
+                        self.db.execute("UPDATE ui_buttons SET state='consumed' WHERE token=?", (button['token'],))
+                    if not allow_create:
+                        raise BindingError('这个按钮已处理，请重新打开 /sessions。')
+                    target = await self.add_temporary(data['thread_id'])
+                    await self.temporary_panel(update, target)
                 elif action == 'home':
                     await self.home(update)
                 elif action == 'catalog':
                     await self.catalog(update, data)
                 elif action == 'select':
-                    await self.selected(update, data['thread_id'], data.get('catalog'))
+                    await self.selected(update, data['thread_id'], data.get('catalog'), data.get('temporary', False))
                 elif action == 'confirm':
                     allow_create = button['state'] == 'active'
                     with self.db:

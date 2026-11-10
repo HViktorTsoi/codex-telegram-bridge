@@ -31,6 +31,17 @@ DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
 GLOBAL_COMMANDS = {'/start', '/help', '/sessions', '/tasks', '/inbox', '/to', '/aliases'}
 
 
+def clean_route_name(value, limit=90):
+    return ' '.join(str(value).split())[:limit]
+
+
+def temporary_route_label(name):
+    """Make temporary All replies identifiable without changing the native name."""
+    clean = clean_route_name(name)
+    suffix = ' 【临时】'
+    return clean if clean.endswith(suffix) else clean + suffix
+
+
 def command_of(message):
     if payload_from(message):
         return ""
@@ -81,9 +92,10 @@ class ExactCodex(Codex):
 class RoutedStore(Store):
     """Reply to the original topic, with global command panels in the main chat."""
 
-    def __init__(self, path, thread_id):
+    def __init__(self, path, thread_id, output_label=None):
         super().__init__(path)
         self.on_input = None
+        self.output_label = output_label
         for table, name, kind in (("inbox", "message_thread_id", "INTEGER"),
                                   ("inbox", "source_message_id", "INTEGER"),
                                   ("inbox", "main_guard_json", "TEXT"),
@@ -122,6 +134,10 @@ class RoutedStore(Store):
             "WHERE turn_id=? GROUP BY chat_id,message_thread_id", (turn_id,)).fetchall()
 
     def enqueue_at(self, key, chat_id, text, topic_id):
+        # Temporary All routes share the normal durable queue, but their replies
+        # must remain identifiable after they are delivered to the main chat.
+        if self.output_label and not key.startswith('main-guard-input:') and text:
+            text = '**' + self.output_label + '**\n\n' + text
         self.enqueue_parts(f'{key}:topic:{topic_id or 0}', chat_id, text, topic_id)
 
     def enqueue(self, key, chat_id, text):
@@ -148,7 +164,8 @@ class TargetBridge(Bridge):
         # Reuse the proven one-thread dispatch/recovery implementation without a second poller.
         super().__init__({**config, "thread_id": target["thread_id"]}, state_dir)
         self.store.db.close()
-        self.store = RoutedStore(Path(state_dir) / "bridge.sqlite", self.thread_id)
+        self.store = RoutedStore(Path(state_dir) / "bridge.sqlite", self.thread_id,
+                                 output_label=target.get('all_route_label'))
         self.codex = ExactCodex(config["socket_path"], self.thread_id)
         self.target, self.sessions_text = target, sessions_text
         self.on_missing_topic = None
@@ -583,6 +600,7 @@ class TopicRouter:
         self.root_target = self.targets[config["root_target"]]
         if self.root_target['thread_id'] != config['thread_id']:
             raise ValueError("Original private-chat binding must match root target")
+        self.temporary_routes = self._load_temporary_routes(config.get('temporary_all_routes', []))
         self.store = RouterStore(self.state_dir / "topics.sqlite", config.get("initial_telegram_offset", 0))
         self.bridges = {}
         for key, target in self.targets.items():
@@ -590,13 +608,18 @@ class TopicRouter:
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.bridges[key] = TargetBridge(config, path, target, self.sessions_text)
             self.bridges[key].on_missing_topic = self.mark_topic_missing
+        self.temporary_bridges = {}
+        for key, target in self.temporary_routes.items():
+            path = self.state_dir / "targets" / key
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.temporary_bridges[key] = TargetBridge(config, path, target, self.sessions_text)
         from recent_sessions import RecentSessions
         self.recent = RecentSessions(self.store.db)
         self.recent.bootstrap(self.bridges.values())
         self.username, self.last_poll_at, self.last_error = None, None, None
         self.telegram = None
         self.bot_id = None
-        self.tasks, self.started_targets = [], set()
+        self.tasks, self.started_targets, self.target_tasks = [], set(), {}
         self.running, self.stopping, self.failure = False, False, None
         from session_picker import SessionPicker
         self.picker = SessionPicker(self)
@@ -604,6 +627,77 @@ class TopicRouter:
         self.control = ControlCenter(self)
         from status_controls import StatusControls
         self.status_controls = StatusControls(self)
+
+    def _load_temporary_routes(self, entries):
+        if entries is None:
+            entries = []
+        if not isinstance(entries, list):
+            raise ValueError('temporary_all_routes must be a list')
+        routes = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError('temporary_all_routes entries must be objects')
+            target = self._normalise_temporary_route(entry, routes)
+            routes[target['key']] = target
+        return routes
+
+    def _normalise_temporary_route(self, entry, existing=None):
+        existing = existing or {}
+        key = entry.get('key')
+        thread_id = entry.get('thread_id')
+        name = entry.get('name')
+        if (not isinstance(key, str) or not re.fullmatch(r'[a-z0-9_-]{1,40}', key)
+                or key in self.targets or key in existing):
+            raise ValueError('Invalid or duplicate temporary route key')
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ValueError('Temporary route requires a native thread_id')
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError('Temporary route requires a name')
+        clean = clean_route_name(name)
+        label = entry.get('label')
+        if label is not None and not isinstance(label, str):
+            raise ValueError('Temporary route label must be text')
+        label = temporary_route_label(label or clean)
+        return {'key': key, 'name': clean, 'thread_id': thread_id,
+                'message_thread_id': None, 'enabled': bool(entry.get('enabled', False)),
+                'temporary_all': True, 'all_route_label': label,
+                'notification_mode': 'all', 'activity_indicator': False,
+                'native_mirror': False}
+
+    def route_targets(self):
+        return {**self.targets, **self.temporary_routes}
+
+    def route_bridges(self):
+        return {**self.bridges, **self.temporary_bridges}
+
+    def temporary_route_entries(self):
+        entries = []
+        for target in self.temporary_routes.values():
+            entry = {'key': target['key'], 'name': target['name'], 'thread_id': target['thread_id'],
+                     'enabled': bool(target.get('enabled'))}
+            if target.get('all_route_label') and target['all_route_label'] != target['name']:
+                entry['label'] = target['all_route_label']
+            entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _temporary_entry_signature(entry):
+        """Compare persisted routes by normalized values for old config compatibility."""
+        if not isinstance(entry, dict):
+            return None
+        key, name, thread_id = entry.get('key'), entry.get('name'), entry.get('thread_id')
+        if not all(isinstance(value, str) and value for value in (key, name, thread_id)):
+            return None
+        clean = clean_route_name(name)
+        label = temporary_route_label(entry.get('label') or clean)
+        return key, clean, thread_id, bool(entry.get('enabled')), label
+
+    @classmethod
+    def _temporary_entries_match(cls, left, right):
+        if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+            return False
+        return all(cls._temporary_entry_signature(a) == cls._temporary_entry_signature(b)
+                   and cls._temporary_entry_signature(a) is not None for a, b in zip(left, right))
 
     def access(self):
         try:
@@ -621,6 +715,9 @@ class TopicRouter:
             ready = self.bridges.get(key) and self.bridges[key].ready.is_set()
             state = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
             lines.append(f"• {target['name']}（{state}）")
+        for target in self.temporary_routes.values():
+            state = '已开启' if target.get('enabled') else '已关闭'
+            lines.append(f"• {target['name']}（临时 All：{state}）")
         lines.append("All 是管理入口；普通消息选择接收会话后立即发送。")
         return "\n".join(lines)
 
@@ -734,12 +831,15 @@ class TopicRouter:
     def write_health(self):
         counts = {key: 0 for key in ("pending_inputs", "running_inputs", "unsent_messages")}
         targets = {}
-        for key, bridge in self.bridges.items():
+        all_bridges = list(self.bridges.items()) + list(self.temporary_bridges.items())
+        for key, bridge in all_bridges:
             local_counts = bridge.store.counts()
             for name, count in local_counts.items():
                 counts[name] += count
             targets[key] = {"name": bridge.target['name'], "thread_id": bridge.thread_id,
                             "message_thread_id": bridge.target['message_thread_id'],
+                            "temporary_all": bool(bridge.target.get('temporary_all')),
+                            "enabled": bool(bridge.target.get('enabled', True)),
                             "topic_missing": bool(bridge.target.get('topic_missing')),
                             "notification_mode": 'completion' if bridge.delivery.enabled else 'all',
                             "preview_style": bridge.delivery.preview_style,
@@ -748,8 +848,10 @@ class TopicRouter:
         counts['pending_inputs'] += pending
         counts['unsent_messages'] += self.store.db.execute("SELECT COUNT(*) FROM notices WHERE message_id IS NULL").fetchone()[0]
         ui_pending = self.store.db.execute("SELECT COUNT(*) FROM ui_jobs WHERE state IN ('pending','processing')").fetchone()[0]
+        active_bridges = list(self.bridges.values()) + [bridge for bridge in self.temporary_bridges.values()
+                                                         if bridge.target.get('enabled')]
         data = {"pid": os.getpid(), "updated_at": time.time(), "mode": "topics", "bot_username": self.username,
-                "thread_id": self.config['thread_id'], "connected": all(b.ready.is_set() for b in self.bridges.values()),
+                "thread_id": self.config['thread_id'], "connected": all(b.ready.is_set() for b in active_bridges),
                 "last_poll_at": self.last_poll_at, "last_error": self.last_error,
                 "blocked_inputs": self.store.db.execute("SELECT COUNT(*) FROM jobs WHERE state='blocked'").fetchone()[0],
                 "targets": targets, "ui_pending": ui_pending,
@@ -792,6 +894,7 @@ class TopicRouter:
             if self.failure and not self.failure.done():
                 self.failure.set_exception(error)
         task.add_done_callback(completed)
+        return task
 
     def start_target(self, bridge):
         key = bridge.target['key']
@@ -799,11 +902,12 @@ class TopicRouter:
             return
         self.started_targets.add(key)
         bridge.telegram, bridge.username = self.telegram, self.username
-        for coro in (bridge.connection_loop(False), bridge.input_loop(), bridge.event_loop(),
-                     bridge.sender_loop(), bridge.maintenance_loop()):
-            self.spawn(coro)
+        workers = [self.spawn(coro) for coro in
+                   (bridge.connection_loop(False), bridge.input_loop(), bridge.event_loop(),
+                    bridge.sender_loop(), bridge.maintenance_loop())]
         if bridge.delivery.enabled:
-            self.spawn(bridge.preview_loop())
+            workers.append(self.spawn(bridge.preview_loop()))
+        self.target_tasks[key] = workers
 
     def persist_targets(self, updated):
         """Compare and atomically persist additions, repairs and unavailable flags."""
@@ -840,6 +944,171 @@ class TopicRouter:
                 finally:
                     os.close(directory)
         self.config.update(current)
+
+    def persist_temporary_routes(self, updated):
+        """Atomically persist temporary All route switches without touching topics."""
+        config_path = self.state_dir / 'config.json'
+        desired = []
+        for target in updated.values():
+            entry = {'key': target['key'], 'name': target['name'], 'thread_id': target['thread_id'],
+                     'enabled': bool(target.get('enabled'))}
+            if target.get('all_route_label') and target['all_route_label'] != target['name']:
+                entry['label'] = target['all_route_label']
+            desired.append(entry)
+        with (self.state_dir / 'config.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            original = config_path.read_bytes()
+            current = json.loads(original)
+            for field in ('owner_id', 'socket_path', 'telegram_state_dir', 'thread_id', 'root_target', 'expected_bot_username'):
+                if current.get(field) != self.config.get(field):
+                    raise ValueError('Configuration changed; reload before switching temporary routes')
+            persisted_targets = {t['key']: t for t in current['targets']}
+            if persisted_targets != self.targets:
+                raise ValueError('Target configuration changed; reload before switching temporary routes')
+            current_entries = current.get('temporary_all_routes', [])
+            if (not self._temporary_entries_match(current_entries, self.temporary_route_entries())
+                    and not self._temporary_entries_match(current_entries, desired)):
+                raise ValueError('Temporary route configuration changed; reload before switching')
+            if current_entries != desired:
+                current['temporary_all_routes'] = desired
+                backups = self.state_dir / 'binding-config-backups'
+                backups.mkdir(exist_ok=True, mode=0o700)
+                backup = backups / (str(time.time_ns()) + '.json')
+                fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, 'wb') as output:
+                    output.write(original)
+                tmp = self.state_dir / ('config.json.temporary-route.' + str(time.time_ns()) + '.tmp')
+                fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, 'w') as output:
+                    json.dump(current, output, ensure_ascii=False, indent=2)
+                    output.write('\n')
+                    output.flush()
+                    os.fsync(output.fileno())
+                tmp.replace(config_path)
+                directory = os.open(self.state_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        self.config.update(current)
+
+    def toggle_temporary_route(self, key, enabled, expected_enabled=None):
+        target = self.temporary_routes.get(key)
+        if target is None:
+            raise ValueError('Unknown temporary All route')
+        current_enabled = bool(target.get('enabled'))
+        if expected_enabled is not None and current_enabled != bool(expected_enabled):
+            raise ValueError('Temporary route switch changed; refresh /sessions')
+        updated = {**target, 'enabled': bool(enabled)}
+        self.persist_temporary_routes({**self.temporary_routes, key: updated})
+        self.temporary_routes[key] = updated
+        self.temporary_bridges[key].target = updated
+        if updated['enabled'] and self.running:
+            self.start_target(self.temporary_bridges[key])
+
+    async def stop_target(self, key):
+        """Stop workers for a removable temporary route without deleting its queue."""
+        tasks = self.target_tasks.pop(key, [])
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        bridge = self.route_bridges().get(key)
+        if bridge is not None:
+            await bridge.codex.close()
+            bridge.ready.clear()
+        self.started_targets.discard(key)
+
+    async def remove_temporary_route(self, key, expected_thread_id=None, expected_enabled=None):
+        """Remove one temporary route while preserving its native session and queue."""
+        target = self.temporary_routes.get(key)
+        if target is None:
+            raise ValueError('Unknown temporary All route')
+        if (expected_thread_id is not None and target['thread_id'] != expected_thread_id):
+            raise ValueError('Temporary route binding changed; refresh /sessions')
+        if (expected_enabled is not None and bool(target.get('enabled')) != bool(expected_enabled)):
+            raise ValueError('Temporary route switch changed; refresh /sessions')
+        if target.get('enabled'):
+            self.toggle_temporary_route(key, False, expected_enabled=True)
+        await self.stop_target(key)
+        updated = {route_key: route for route_key, route in self.temporary_routes.items()
+                   if route_key != key}
+        self.persist_temporary_routes(updated)
+        self.temporary_routes = updated
+        bridge = self.temporary_bridges.pop(key, None)
+        if bridge is not None:
+            bridge.store.db.close()
+        return target
+
+    async def remove_target(self, key, expected_thread_id=None, expected_topic_id=None):
+        """Remove a formal topic binding while preserving its native queue."""
+        target = self.targets.get(key)
+        if target is None:
+            raise ValueError('Unknown formal topic binding')
+        if key == self.config['root_target']:
+            raise ValueError('The root target is required as the private-chat fallback')
+        if (expected_thread_id is not None and target['thread_id'] != expected_thread_id):
+            raise ValueError('Formal topic binding changed; refresh /sessions')
+        if (expected_topic_id is not None and target.get('message_thread_id') != expected_topic_id):
+            raise ValueError('Formal topic binding changed; refresh /sessions')
+        updated = {target_key: item for target_key, item in self.targets.items() if target_key != key}
+        bridge = self.bridges.get(key)
+        await self.stop_target(key)
+        try:
+            self.persist_targets(updated)
+        except Exception:
+            if bridge is not None and self.running:
+                self.start_target(bridge)
+            raise
+        self.targets = updated
+        if target.get('message_thread_id') is not None:
+            self.by_topic.pop(int(target['message_thread_id']), None)
+        bridge = self.bridges.pop(key, None)
+        if bridge is not None:
+            bridge.store.db.close()
+        # Prevent a future bind of the same native ID from reusing a deleted
+        # topic record left by the old binding.
+        self.picker.operation(target['thread_id'], target, 'unbound')
+        return target
+
+    def install_temporary_route(self, target):
+        key = target['key']
+        if key in self.temporary_routes or key in self.targets:
+            raise ValueError('Temporary route key already exists')
+        if any(item['thread_id'] == target['thread_id'] for item in self.temporary_routes.values()):
+            raise ValueError('This native session already has a temporary All route')
+        if any(item['thread_id'] == target['thread_id'] for item in self.targets.values()):
+            raise ValueError('This native session already has a normal topic binding')
+        target = self._normalise_temporary_route(target, self.temporary_routes)
+        self.persist_temporary_routes({**self.temporary_routes, key: target})
+        path = self.state_dir / 'targets' / key
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        bridge = TargetBridge(self.config, path, target, self.sessions_text)
+        self.temporary_routes[key] = target
+        self.temporary_bridges[key] = bridge
+        if self.running and target.get('enabled'):
+            self.start_target(bridge)
+        return target
+
+    def rename_temporary_route(self, key, binding, old_name, new_name):
+        """Commit a temporary All route name without touching Telegram topics."""
+        target = self.temporary_routes.get(key)
+        bridge = self.temporary_bridges.get(key)
+        expected = {'key': key, 'thread_id': target['thread_id'],
+                    'message_thread_id': target['message_thread_id']} if target else None
+        if (not target or not bridge or expected != binding
+                or bridge.thread_id != binding['thread_id']
+                or target['name'] not in (old_name, new_name)):
+            raise ValueError('Temporary route binding or name changed before metadata commit')
+        if any(t['key'] != key and t['name'].casefold() == new_name.casefold()
+               for t in self.route_targets().values()):
+            raise ValueError('Another session already uses that name')
+        updated = {**target, 'name': new_name, 'all_route_label': temporary_route_label(new_name)}
+        self.persist_temporary_routes({**self.temporary_routes, key: updated})
+        self.temporary_routes[key] = updated
+        bridge.target = updated
+        bridge.store.output_label = updated['all_route_label']
 
     def mark_topic_missing(self, key, topic_id):
         target = self.targets[key]
@@ -979,6 +1248,9 @@ class TopicRouter:
                 self.status_controls.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
+                for bridge in self.temporary_bridges.values():
+                    if bridge.target.get('enabled'):
+                        self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
                     self.spawn(coro)
                 self.spawn(self.picker.home_loop())
@@ -993,6 +1265,9 @@ class TopicRouter:
                     task.cancel()
                 await asyncio.gather(*self.tasks, return_exceptions=True)
                 for bridge in self.bridges.values():
+                    await bridge.codex.close()
+                    bridge.ready.clear()
+                for bridge in self.temporary_bridges.values():
                     await bridge.codex.close()
                     bridge.ready.clear()
                 refresh_health_snapshot(self)

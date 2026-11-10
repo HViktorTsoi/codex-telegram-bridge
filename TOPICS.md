@@ -1,5 +1,9 @@
 # One Bot, multiple local Codex conversations
 
+The temporary All route work in branch `feat/temporary-all-routes` is based on
+`v0.11.20`. It is an additive fallback for an existing native conversation and
+does not change the normal Telegram topic bindings.
+
 `topics_bridge.py` reuses the single-thread bridge's native socket, attachment
 handling and durable recovery. One Telegram poller routes the owner's private
 topics to separate target queues and Codex subscriptions. Binding and repairing
@@ -116,6 +120,14 @@ confirmation does not create another conversation or topic. A changed binding
 or a conflicting external rename stops synchronization for review; a missing
 topic must be repaired before starting a new rename.
 
+For a non-root formal binding, the `/sessions` detail panel also provides
+**取消绑定**. After confirmation the Bot removes that topic from its local
+configuration, topic index and running workers, while preserving the native
+Codex session, history and durable queue. It does not call Telegram's delete
+API. Re-add the same native session through **添加会话** to create a fresh
+topic. The root target remains the private-chat anchor for All and global
+management commands and therefore cannot be unbound.
+
 **新建会话** opens a local filesystem browser starting at the user's home.
 Directory buttons, ten-entry pages, parent navigation and a dot-directory toggle
 work without text entry. **输入路径** accepts absolute, home-relative and current
@@ -190,6 +202,50 @@ target button only refreshes the selector; choose a target again in the new list
 to send. Already displayed legacy **确认发送** buttons can still complete their
 original handoff. Confirmations in
 session binding, creation, renaming and explicit dispatch keep their existing flows.
+
+Temporary All routes are separate from formal topic bindings. Add one from
+`/sessions` → **添加临时 All**, select any existing native session, and confirm
+the route. The route is persisted with its native ID and starts enabled. On
+the `/sessions` home page, temporary routes continue the formal session numbers
+and are shown as `Name 【临时】`; selecting one opens a submenu for enabling,
+disabling or renaming it. When enabled, it appears in the All selector;
+selected inputs use the original session without creating a Telegram topic,
+and all replies are sent to All with the route name as a label. Disabling it
+hides it from future selections while preserving the native session and its
+durable queue. The optional top-level `temporary_all_routes` list uses the
+same fields: `key`, `name`, `thread_id` and `enabled`.
+
+The interactive flow is: open `/sessions`, choose **添加临时 All**, select a
+native session from the directory catalog, review its name, ID and working
+directory, and choose **确认添加临时路由**. Open the new `Name 【临时】`
+entry. It is enabled immediately after confirmation. In All, select that route
+for a held message; the input is dispatched immediately to the original native ID and
+the reply remains in All with a separate bold `Name 【临时】` title line.
+The submenu also provides **关闭临时路由**, **修改名称** and
+**取消临时绑定**. Renaming updates the native session name and the All label,
+but never calls a Telegram topic API. Disabling hides the route from future All
+selections without deleting its history or durable queue. Cancelling removes
+the route from this Bot's configuration, menus, All selector and running
+workers; it keeps the native session, history and local queue. Re-adding the
+same native ID can reuse that local queue.
+
+Routes are private to each Bot instance. A native ID cannot be both a formal
+topic target and a temporary All route, and it cannot be added twice as a
+temporary route. The route's `message_thread_id` is always `null`; no topic is
+created, repaired or deleted by this feature. A static configuration entry
+can be prepared as follows (routes default to disabled when `enabled` is
+omitted):
+
+```json
+"temporary_all_routes": [
+  {
+    "key": "temp_reid",
+    "name": "ReID测试",
+    "thread_id": "EXISTING_REID_ID",
+    "enabled": false
+  }
+]
+```
 
 Set `native_mirror: true` globally or per target to mirror new user inputs and public
 agent replies from native client turns. It defaults to off and

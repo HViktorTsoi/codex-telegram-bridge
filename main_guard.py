@@ -157,12 +157,20 @@ class MainChatGuard:
     def _binding(target):
         return {key: target[key] for key in ('key', 'thread_id', 'message_thread_id')}
 
+    def _target(self, key):
+        return self.router.route_targets().get(key)
+
+    def _bridge(self, key):
+        return self.router.route_bridges().get(key)
+
     def _validate(self, selected):
-        target = self.router.targets.get(selected.get('key'))
-        bridge = self.router.bridges.get(selected.get('key'))
+        target = self._target(selected.get('key'))
+        bridge = self._bridge(selected.get('key'))
         if (not target or target.get('topic_missing') or self._binding(target) != selected
                 or not bridge or bridge.thread_id != selected.get('thread_id')):
             raise BindingError('目标绑定已变化，消息已保留；请到 /sessions → 待发送，重新选择会话。')
+        if target.get('temporary_all') and not target.get('enabled'):
+            raise BindingError('这个临时 All 路由已关闭，消息已保留；请重新选择接收会话。')
         return target
 
     async def _selector(self, update, draft, page=0):
@@ -170,7 +178,10 @@ class MainChatGuard:
             return await self._closed(update, draft)
         if draft['state'] == 'releasing':
             raise BindingError('这条消息正在投递，请稍后查看；不要重复选择。')
-        targets = self.router.recent.ordered(t for t in self.router.targets.values() if not t.get('topic_missing'))
+        targets = list(self.router.recent.ordered(
+            t for t in self.router.targets.values() if not t.get('topic_missing')))
+        targets.extend(self.router.recent.ordered(
+            t for t in self.router.temporary_routes.values() if t.get('enabled')))
         pages = max(1, (len(targets) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
         base = {'id': draft['id'], 'revision': draft['revision'], 'send_on_select': True}
@@ -232,8 +243,13 @@ class MainChatGuard:
     async def _closed(self, update, draft):
         if draft['state'] == 'queued':
             selected = json.loads(draft['selection_json'])
-            target = self.router.targets.get(selected['key'], {})
-            text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n原文与回复会出现在该会话的话题中。'
+            target = self._target(selected['key']) or {}
+            if target.get('temporary_all'):
+                text = ('已加入「' + clean_name(target.get('name') or selected['key'])
+                        + '」的临时 All 队列。\n回复会回到 All，并标注「'
+                        + clean_name(target.get('all_route_label') or target.get('name') or selected['key']) + '」。')
+            else:
+                text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n原文与回复会出现在该会话的话题中。'
         else:
             text = '已取消，这条消息不会交给 Codex。'
         return await self._panel(update, text, [[('待发送', 'main:list', {}), ('返回会话管理', 'home', {})]], draft)
@@ -245,7 +261,7 @@ class MainChatGuard:
             raise BindingError('相册内容或所选目标已变化，请重新选择接收会话。')
         selected = json.loads(draft['selection_json'])
         target = self._validate(selected)
-        bridge = self.router.bridges[target['key']]
+        bridge = self._bridge(target['key'])
         binding = {'draft_id': draft['id'], 'target_key': target['key'],
                    'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']}
         for row in self._members(draft['id']):
@@ -253,7 +269,10 @@ class MainChatGuard:
             if not self.router.owner_allowed():
                 raise BindingError('访问权限已变化，消息未继续投递。')
             message = copy.deepcopy(json.loads(row['payload'])['message'])
-            message['message_thread_id'] = target['message_thread_id']
+            if target['message_thread_id'] is None:
+                message.pop('message_thread_id', None)
+            else:
+                message['message_thread_id'] = target['message_thread_id']
             context = json.loads(row['reply_json'])
             existing = bridge.store.db.execute('SELECT text,message_json,media_group_id,message_thread_id,source_message_id,'
                                               'reply_json,main_guard_json,state FROM inbox WHERE id=?', (row['update_id'],)).fetchone()
