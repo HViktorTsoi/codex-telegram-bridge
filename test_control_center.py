@@ -140,6 +140,113 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request['text'], '检查引用')
         self.assertEqual((request['target_host'], request['thread_id']), ('A', 'A-paper'))
 
+    async def test_empty_bound_session_has_generated_alias_and_dispatches_without_catalog(self):
+        node = self.nodes['A']
+        node.targets['paper']['name'] = 'Skyrim'
+        node.targets['paper'].pop('aliases')
+        write_json(node.state_dir / 'control/local.json',
+                   {'host': 'A', 'generated': time.time(), 'entries': []})
+        node.catalog_call = AsyncMock(side_effect=AssertionError('Aliases must not wait for native catalog'))
+
+        _, panel = await self.send('A', '/aliases', topic=None)
+        self.assertIn('@skyrim → Skyrim', panel['text'])
+        entry = node.control.resolve('skyrim')
+        self.assertEqual((entry['target_key'], entry['thread_id'], entry['topic_id']), ('paper', 'A-paper', 22))
+        await self.send('A', '@skyrim 检查启动配置', topic=None)
+        request = json.loads(node.store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
+        self.assertEqual((request['target_host'], request['target_key'], request['thread_id'], request['topic_id']),
+                         ('A', 'paper', 'A-paper', 22))
+        self.assertEqual(request['text'], '检查启动配置')
+        await self.sync()
+        self.assertTrue(node.control.deliver_one())
+        self.assertEqual(node.bridges['paper'].store.pending()['text'], '检查启动配置')
+        self.assertFalse(node.control.deliver_one())
+        node.catalog_call.assert_not_awaited()
+
+    async def test_alias_uses_current_topic_after_repair_before_next_refresh(self):
+        node = self.nodes['A']
+        path = node.state_dir / 'control/local.json'
+        local = json.loads(path.read_text())
+        cached = next(e for e in local['entries'] if e['thread_id'] == 'A-paper')
+        cached.update(target_key='obsolete-key', topic_id=8997, topic_missing=True)
+        write_json(path, local)
+        node.targets['paper'].update(message_thread_id=9004, topic_missing=False)
+
+        entry = node.control.resolve('paper')
+        self.assertEqual((entry['target_key'], entry['topic_id'], entry['topic_missing']), ('paper', 9004, False))
+        await self.send('A', '@paper 修复后的派单', topic=None)
+        request = json.loads(node.store.db.execute('SELECT payload FROM cc_requests').fetchone()[0])
+        self.assertEqual((request['thread_id'], request['target_key'], request['topic_id']), ('A-paper', 'paper', 9004))
+
+    async def test_unbound_cached_session_is_not_advertised_or_dispatchable(self):
+        node = self.nodes['A']
+        del node.targets['paper']
+        entry = node.control.find({'host': 'A', 'thread_id': 'A-paper'})
+        self.assertIsNotNone(entry)
+        self.assertFalse(entry.get('target_key'))
+        self.assertFalse(entry.get('topic_id'))
+        with self.assertRaises(ValueError):
+            node.control.resolve('paper')
+        _, panel = await self.send('A', '/aliases', topic=None)
+        self.assertNotIn('@paper', panel['text'])
+        _, overview = await self.send('A', '/tasks', topic=None)
+        self.assertIn('1 个已绑定', overview['text'])
+
+    async def test_alias_overlay_rebuilds_configured_name_and_key_aliases(self):
+        node = self.nodes['A']
+        path = node.state_dir / 'control/local.json'
+        local = json.loads(path.read_text())
+        next(e for e in local['entries'] if e['thread_id'] == 'A-paper')['metadata_name'] = '论文'
+        write_json(path, local)
+        node.targets['paper'].update(name='Skyrim Notes', aliases=[' Dragon ', 'DRAGON', '', '  '])
+        entry = node.control.resolve('dragon')
+        self.assertEqual(entry['aliases'].count('dragon'), 1)
+        self.assertNotIn('', entry['aliases'])
+        for name in ('skyrim_notes', '论文', 'paper'):
+            self.assertEqual(node.control.resolve(name)['thread_id'], 'A-paper')
+        node.targets['paper']['aliases'] = []
+        with self.assertRaises(ValueError):
+            node.control.resolve('dragon')
+
+    async def test_generated_alias_collision_requires_explicit_target_choice(self):
+        node = self.nodes['A']
+        for target in node.targets.values():
+            target.update(name='Skyrim', aliases=[])
+        write_json(node.state_dir / 'control/local.json',
+                   {'host': 'A', 'generated': time.time(), 'entries': []})
+        with self.assertRaisesRegex(ValueError, '重名'):
+            node.control.resolve('skyrim')
+        self.assertEqual(node.control.resolve('paper')['thread_id'], 'A-paper')
+
+    async def test_foreign_cache_matching_bound_id_does_not_leak_metadata_or_aliases(self):
+        node = self.nodes['A']
+        write_json(node.state_dir / 'control/local.json', {'host': 'A', 'generated': time.time(), 'entries': [
+            {'host': 'B', 'thread_id': 'A-paper', 'name': 'Foreign secret', 'cwd': '/other-machine',
+             'target_key': 'paper', 'topic_id': 999, 'aliases': ['foreign'], 'status': {'type': 'idle'},
+             'last_status': 'completed', 'latest_reply': 'FOREIGN PRIVATE REPLY',
+             'questions': [{'id': 'private', 'kind': 'question', 'question': 'FOREIGN PRIVATE QUESTION'}]}]})
+        entry = node.control.resolve('paper')
+        self.assertEqual((entry['host'], entry['thread_id'], entry['topic_id']), ('A', 'A-paper', 22))
+        self.assertNotIn('FOREIGN PRIVATE', json.dumps(entry))
+        self.assertNotEqual(entry.get('cwd'), '/other-machine')
+        self.assertEqual(entry['status'].get('type'), 'unknown')
+        self.assertEqual(entry.get('questions', []), [])
+        with self.assertRaises(ValueError):
+            node.control.resolve('foreign')
+
+    async def test_bound_session_without_metadata_is_shown_as_pending_not_idle(self):
+        node = self.nodes['A']
+        (node.state_dir / 'control/local.json').unlink()
+        entry = node.control.resolve('paper')
+        self.assertEqual(entry['status'].get('type'), 'unknown')
+        self.assertFalse(entry.get('latest_input'))
+        self.assertFalse(entry.get('latest_reply'))
+        self.assertEqual(entry.get('questions', []), [])
+        _, panel = await self.send('A', '/tasks', topic=None)
+        self.assertIn('状态待同步', panel['text'])
+        self.assertNotIn('空闲', panel['text'])
+        self.assertNotIn('上轮完成', panel['text'])
+
     async def test_local_dispatch_and_reply_are_durable_and_deduplicated(self):
         await self.send('A', '@paper 检查引用')
         await self.sync();await self.sync()
@@ -340,12 +447,111 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         node.catalog_call = catalog
         await node.control.refresh()
         local = json.loads((node.state_dir / 'control/local.json').read_text())
-        self.assertEqual(len(local['entries']), 2)
+        self.assertEqual(len(local['entries']), 3)
         self.assertEqual(local['entries'][0]['cwd'], '/work/manager')
         self.assertIsNone(local['entries'][1]['cwd'])
         self.assertNotIn('PRIVATE REASONING', json.dumps(local))
         self.assertEqual(local['entries'][0]['questions'][0]['kind'], 'question')
         self.assertTrue(all(c in ('thread/list', 'thread/turns/list') for c in calls))
+
+    async def test_empty_catalog_refresh_persists_all_bound_sessions_without_model_calls(self):
+        node = self.nodes['A']
+        write_json(node.state_dir / 'control/local.json',
+                   {'host': 'A', 'generated': time.time(), 'entries': []})
+        node.catalog_call = AsyncMock(return_value={'data': []})
+        await node.control.refresh()
+        local = json.loads((node.state_dir / 'control/local.json').read_text())
+        self.assertEqual({e['thread_id'] for e in local['entries']}, {'A-native', 'A-paper'})
+        for entry in local['entries']:
+            self.assertEqual(entry['status'].get('type'), 'unknown')
+            self.assertFalse(entry.get('latest_input'))
+            self.assertFalse(entry.get('latest_reply'))
+            self.assertEqual(entry.get('questions', []), [])
+            self.assertEqual(node.control.resolve(entry['aliases'][0])['thread_id'], entry['thread_id'])
+        node.catalog_call.assert_awaited_once()
+        self.assertEqual(node.catalog_call.call_args.args[0], 'thread/list')
+
+    async def test_first_native_metadata_replaces_placeholder_even_when_updated_is_zero(self):
+        node = self.nodes['A']
+        write_json(node.state_dir / 'control/local.json',
+                   {'host': 'A', 'generated': time.time(), 'entries': []})
+        node.catalog_call = AsyncMock(return_value={'data': []})
+        await node.control.refresh()
+        self.assertEqual(node.control.resolve('paper')['updated'], 0)
+        self.assertTrue(node.control.resolve('paper').get('metadata_pending'))
+
+        node.catalog_call = AsyncMock(side_effect=[
+            {'data': [{'id': 'A-paper', 'name': 'Native Skyrim', 'cwd': '/work/skyrim',
+                       'updatedAt': 0, 'status': {'type': 'idle'}}]},
+            {'data': [{'id': 'first-turn', 'status': 'completed', 'items': [
+                {'type': 'userMessage', 'content': [{'type': 'text', 'text': '真实输入'}]},
+                {'type': 'agentMessage', 'text': '真实回复'}]}]}])
+        await node.control.refresh()
+        entry = node.control.resolve('native_skyrim')
+        self.assertFalse(entry.get('metadata_pending'))
+        self.assertEqual(entry['status'], {'type': 'idle'})
+        self.assertEqual((entry['name'], entry['metadata_name'], entry['cwd']),
+                         ('论文', 'Native Skyrim', '/work/skyrim'))
+        self.assertEqual((entry['last_status'], entry['latest_input'], entry['latest_reply']),
+                         ('completed', '真实输入', '真实回复'))
+        self.assertEqual(node.catalog_call.await_args_list[1].args[0], 'thread/turns/list')
+
+    async def test_router_rename_removes_cached_native_name_alias_immediately(self):
+        node = self.nodes['A']
+        path = node.state_dir / 'control/local.json'
+        local = json.loads(path.read_text())
+        cached = next(e for e in local['entries'] if e['thread_id'] == 'A-paper')
+        cached.update(name='Native Skyrim', metadata_name='Native Skyrim')
+        write_json(path, local)
+        self.assertEqual(node.control.resolve('native_skyrim')['target_key'], 'paper')
+
+        target = node.targets['paper']
+        binding = {field: target[field] for field in ('key', 'thread_id', 'message_thread_id')}
+        node.rename_target('paper', binding, target['name'], 'Skyrim 新标题')
+        self.assertEqual(node.control.resolve('skyrim_新标题')['thread_id'], 'A-paper')
+        with self.assertRaises(ValueError):
+            node.control.resolve('native_skyrim')
+        # Explicit configured aliases remain valid after a name-only change.
+        self.assertEqual(node.control.resolve('paper')['thread_id'], 'A-paper')
+
+    async def test_duplicate_catalog_pages_cannot_make_bound_alias_ambiguous(self):
+        node = self.nodes['A']
+        calls = []
+
+        async def catalog(method, params):
+            calls.append((method, params))
+            if method == 'thread/list':
+                return {'data': [{'id': 'A-paper', 'name': 'Skyrim', 'updatedAt': 123,
+                                  'status': {'type': 'idle'}}],
+                        'nextCursor': None if params.get('cursor') else 'next-page'}
+            return {'data': []}
+
+        node.catalog_call = catalog
+        await node.control.refresh()
+        local = json.loads((node.state_dir / 'control/local.json').read_text())
+        self.assertEqual(sum(e['thread_id'] == 'A-paper' for e in local['entries']), 1)
+        self.assertEqual(node.control.resolve('skyrim')['thread_id'], 'A-paper')
+        self.assertEqual(node.control.resolve('paper')['topic_id'], 22)
+        self.assertEqual(len([c for c in calls if c[0] == 'thread/list']), 2)
+
+    async def test_refresh_never_reuses_foreign_history_for_matching_native_id(self):
+        node = self.nodes['A']
+        write_json(node.state_dir / 'control/local.json', {'host': 'A', 'generated': time.time(), 'entries': [
+            {'host': 'B', 'thread_id': 'A-paper', 'name': 'Foreign secret', 'updated': 123,
+             'cwd': '/other-machine', 'aliases': ['foreign'], 'latest_reply': 'FOREIGN PRIVATE REPLY',
+             'last_status': 'completed', 'questions': [{'id': 'private', 'kind': 'question',
+                                                        'question': 'FOREIGN PRIVATE QUESTION'}]}]})
+        node.catalog_call = AsyncMock(side_effect=[
+            {'data': [{'id': 'A-paper', 'name': 'Skyrim', 'updatedAt': 123, 'status': {'type': 'idle'}}]},
+            {'data': []}])
+        await node.control.refresh()
+        local = json.loads((node.state_dir / 'control/local.json').read_text())
+        self.assertNotIn('FOREIGN PRIVATE', json.dumps(local))
+        entry = node.control.resolve('skyrim')
+        self.assertIsNone(entry.get('cwd'))
+        self.assertEqual(entry.get('questions'), [])
+        self.assertFalse(entry.get('latest_reply'))
+        self.assertEqual(node.catalog_call.await_args_list[1].args[0], 'thread/turns/list')
 
     async def test_pending_order_uses_acceptance_time_for_negative_dispatch_ids(self):
         store = self.nodes['A'].bridges['paper'].store
