@@ -115,7 +115,7 @@ class BlockPreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.delivery.state()['since'], since)
         self.assertTrue(self.block_text().endswith('阶段一'))
 
-    async def test_preview_style_defaults_to_plain_and_target_override_wins(self):
+    async def test_explicit_plain_preview_and_target_override_remain_supported(self):
         await self.delivery.update(self.telegram, turns=[self.turn()])
         first_id = self.calls[-1][1]['draft_id']
         self.assertEqual(self.calls[-1][0], 'sendMessageDraft')

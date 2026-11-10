@@ -54,6 +54,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.path = Path(self.tmp.name)
         (self.path / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': ['123']}))
         self.config = {
+            'notification_mode': 'all',
             'owner_id': '123', 'telegram_state_dir': str(self.path),
             'socket_path': str(self.path / 'test.sock'), 'thread_id': 'native-meeting',
             'root_target': 'meeting', 'initial_telegram_offset': 100,

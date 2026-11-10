@@ -746,8 +746,8 @@ class StatusDraftTests(unittest.IsolatedAsyncioTestCase):
                   if p.get('disable_notification') is not True]
         self.assertEqual(len(finals), 2)
 
-    async def test_default_plain_mode_keeps_body_in_draft_and_creates_no_preview_message(self):
-        self.bridges['a'].config.pop('preview_style')
+    async def test_explicit_plain_mode_keeps_body_in_draft_and_creates_no_preview_message(self):
+        self.bridges['a'].config['preview_style'] = 'plain'
         self.restart()
         self.output('旧模式正文')
         await self.update()

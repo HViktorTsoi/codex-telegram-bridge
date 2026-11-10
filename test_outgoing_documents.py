@@ -174,7 +174,8 @@ class DocumentDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.file.write_bytes(SCRIPT)
         (self.path / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': ['123']}))
         self.config = {'thread_id': 'same-native-manager', 'owner_id': '123', 'socket_path': '/unused',
-                       'telegram_state_dir': str(self.path), 'expected_bot_username': 'default_bot'}
+                       'telegram_state_dir': str(self.path), 'expected_bot_username': 'default_bot',
+                       'notification_mode': 'all'}
         (self.path / 'default').mkdir()
         self.bridge = TargetBridge(self.config, self.path / 'default',
                                    {'key': 'manager', 'name': 'Manager', 'thread_id': 'same-native-manager',

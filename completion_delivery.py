@@ -30,8 +30,8 @@ class CompletionDelivery:
         self.preview_lock = asyncio.Lock()
         self._preview_status = None
         self._preview_status_turn_id = None
-        self.enabled = bridge.target.get('notification_mode', bridge.config.get('notification_mode', 'all')) == 'completion'
-        self.preview_style = bridge.target.get('preview_style', bridge.config.get('preview_style', 'plain'))
+        self.enabled = bridge.target.get('notification_mode', bridge.config.get('notification_mode', 'completion')) == 'completion'
+        self.preview_style = bridge.target.get('preview_style', bridge.config.get('preview_style', 'status-bar'))
         if self.preview_style not in ('plain', 'block', 'status-card', 'status-draft', 'status-bar'):
             raise ValueError('preview_style must be plain, block, status-card, status-draft or status-bar')
         self.preview_body_style = bridge.target.get('preview_body_style', bridge.config.get('preview_body_style', 'normal'))

@@ -136,7 +136,8 @@ class ImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.image = self.path / 'qr.png'
         self.image.write_bytes(PNG)
         (self.path / 'access.json').write_text(json.dumps({'dmPolicy': 'allowlist', 'allowFrom': ['123']}))
-        self.config = {'thread_id': 'native', 'owner_id': '123', 'socket_path': '/unused', 'telegram_state_dir': str(self.path)}
+        self.config = {'thread_id': 'native', 'owner_id': '123', 'socket_path': '/unused',
+                       'telegram_state_dir': str(self.path), 'notification_mode': 'all'}
         self.bridge = TargetBridge(self.config, self.path, {'thread_id': 'native', 'key': 'test', 'name': 'test', 'message_thread_id': 42}, lambda: '')
         self.bridge.store.enqueue_at('turn:t:a', '123', f'![QR](<{self.image}>)', 42)
         self.row = self.bridge.store.db.execute('SELECT * FROM outbox').fetchone()

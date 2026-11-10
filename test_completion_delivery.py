@@ -21,7 +21,8 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.now = 1000
         self.bridge = SimpleNamespace(store=self.store, thread_id='native', owner='123',
                                       target={'key': 'target', 'thread_id': 'native', 'message_thread_id': 42},
-                                      config={'notification_mode': 'completion'}, owner_allowed=lambda: True)
+                                      config={'notification_mode': 'completion', 'preview_style': 'plain'},
+                                      owner_allowed=lambda: True)
         self.delivery = CompletionDelivery(self.bridge, clock=lambda: self.now)
         self.calls, self.error = [], None
         test = self
@@ -53,7 +54,7 @@ class CompletionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         return self.store.db.execute('SELECT * FROM outbox ORDER BY rowid').fetchall()
 
     async def test_disabled_mode_preserves_immediate_delivery(self):
-        self.bridge.config = {}
+        self.bridge.config = {'notification_mode': 'all'}
         delivery = CompletionDelivery(self.bridge, clock=lambda: self.now)
         self.output()
         self.assertIsNotNone(delivery.next_row())
