@@ -39,7 +39,7 @@ Add these fields (the IDs below are placeholders):
 
 The original top-level `thread_id` must match `root_target`, which retains the
 original session and main-chat system-command context. Ordinary topic-less All
-messages are held for explicit target selection and final confirmation, rather
+messages are held until explicit target selection, which sends them immediately, rather
 than automatically using that root or the most recent session.
 `initial_telegram_offset` must come from the
 old collector's database after a clean stop with an empty queue; it is used only
@@ -89,7 +89,7 @@ sessions by recorded use and directories by their most recently used session;
 native updated-at order remains the stable fallback for sessions without a use
 record. Catalog pages retain their saved ordering until explicitly reloaded.
 The private `session_access_events` and `session_recent_access` tables record
-accepted Telegram topic input and session commands, confirmed All deliveries,
+accepted Telegram topic input and session commands, selected All deliveries,
 delivered dispatches and completed renames under the original native ID.
 Original event times and IDs prevent replays from changing the order. Bot API
 does not report merely opening a topic; menu rendering, cancelled choices, bot
@@ -159,11 +159,12 @@ output and activity indicators keep their original topics; already queued output
 retains its stored destination.
 
 All's ordinary text and media use a durable held-message selector. Each text
-message is independent; an album is grouped after two seconds of quiet. Selecting
-a local bound target shows a preview; only **确认发送** imports the original
-message(s) into that exact native thread/topic queue. No attachment download or
-model request occurs before confirmation. A pre-confirmation late album member
-invalidates the preview; post-confirmation late members require a fresh choice.
+message is independent; an album is grouped after two seconds of quiet. The
+selector shows the message preview. Choosing a local bound target immediately
+imports the original message(s) into that exact native thread/topic queue, with
+no second confirmation page. No attachment download or model request occurs
+before selection. A late album member arriving before selection invalidates
+the old selection buttons; members arriving after handoff require a fresh choice.
 The original content and reply snapshot are retained before rewriting the
 destination topic. Replies stay in the selected topic, without main-chat relay.
 Find held content under `/sessions` → **待发送**. Cancelled, expired or stale UI
@@ -171,19 +172,24 @@ never falls back to the root session. Creator and dispatch ForceReply inputs,
 plain-text explicit aliases and slash commands retain their existing paths.
 Main-chat media captions cannot run slash or alias commands.
 
-Confirmation also queues the original text or media caption in the selected
+Selection also queues the original text or media caption in the selected
 Telegram topic, prefixed with `📩 你在 All 说：` and followed by the saved readable
 reply context. This plain-text copy uses a durable, deduplicated outbox key;
 recovery can complete it after input import without importing the native input
 again or starting another model turn. It copies text only, leaving attachment
-delivery to Codex on the existing path. Unconfirmed/cancelled drafts do not send
+delivery to Codex on the existing path. Unselected/cancelled drafts do not send
 copies, and previously completed records are not backfilled.
 
 The receiver validates guarded input's frozen native thread, target key and topic
 before dispatch and again after attachment preparation. A changed/missing binding
-fails closed. Confirmed import intent is persisted before handoff; original update
+fails closed. The selected import intent is persisted before handoff; original update
 IDs and immutable binding metadata prevent repeat imports after a crash. This
-does not add Telegram tabs or move the client's built-in All entry.
+does not add Telegram tabs or move the client's built-in All entry. Existing held
+or review drafts are not sent automatically on upgrade. Clicking a valid legacy
+target button only refreshes the selector; choose a target again in the new list
+to send. Already displayed legacy **确认发送** buttons can still complete their
+original handoff. Confirmations in
+session binding, creation, renaming and explicit dispatch keep their existing flows.
 
 Set `native_mirror: true` globally or per target to mirror new user inputs and public
 agent replies from native client turns. It defaults to off and
@@ -221,8 +227,8 @@ uncertain deliveries receive accurate waiting/checking labels. Existing active
 progress remains visible when more input arrives, and the real turn takes over
 the receipt's draft identity. Receipt and ordinary preview updates share a send
 lock to prevent an older response from overwriting newer progress. Direct topic
-input, confirmed All input and imported dispatches follow this path; commands,
-empty or unauthorized input and unconfirmed All drafts do not. The first attempt
+input, selected All input and imported dispatches follow this path; commands,
+empty or unauthorized input and unselected All drafts do not. The first attempt
 is independent of model output, while visible latency still depends on Telegram
 and the network. Subsequent refreshes keep the 15-second cadence and existing
 completion-only notification rule.

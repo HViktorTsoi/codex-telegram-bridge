@@ -25,13 +25,11 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
         return self.router.bridges[key].store.db.execute(
             "SELECT * FROM outbox WHERE key LIKE 'main-guard-input:%' ORDER BY rowid").fetchall()
 
-    async def test_confirmation_copies_exact_user_text_only_to_the_selected_topic(self):
+    async def test_target_selection_copies_exact_user_text_only_to_the_selected_topic(self):
         body = '  请检查这个项目\n**保留原文** ![图](/private/user.png)\n'
         update, panel = await self.send(body)
         self.assertEqual(self.copies(), [])
-        review = await self.click(panel, 'Instagram')
-        self.assertEqual(self.copies(), [])
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         rows = self.copies()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['text'], '📩 你在 All 说：\n' + body)
@@ -42,37 +40,34 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(r['id'], r['text']) for r in self.inbox()], [(update['update_id'], body)])
         self.assertEqual(self.native_calls, [])
 
-    async def test_cancel_and_old_confirmation_never_copy_user_text(self):
+    async def test_cancel_and_stale_target_selection_never_copy_user_text(self):
         _, panel = await self.send('这条取消')
-        review = await self.click(panel, 'Instagram')
-        stale = self.callback(review, '确认发送')
-        await self.click(review, '取消')
+        stale = self.callback(panel, 'Instagram')
+        await self.click(panel, '取消')
         self.router.ingest(stale)
         await self.pump()
         self.assertEqual(self.copies(), [])
         self.assertEqual(self.copies('meeting'), [])
         self.assert_held()
 
-    async def test_binding_changed_before_confirmation_does_not_copy_to_either_topic(self):
+    async def test_binding_changed_before_selection_does_not_copy_to_either_topic(self):
         _, panel = await self.send('不能跟随改变后的目标')
-        review = await self.click(panel, 'Instagram')
         self.router.targets['instagram']['message_thread_id'] = 999
-        await self.click(review, '确认发送')
+        await self.click(panel, 'Instagram')
         self.assertEqual(self.copies(), [])
         self.assertEqual(self.copies('meeting'), [])
         self.assert_held()
 
-    async def test_duplicate_confirmation_and_recovery_preserve_the_already_sent_copy(self):
+    async def test_duplicate_target_click_and_recovery_preserve_the_already_sent_copy(self):
         update, panel = await self.send('只出现一次')
-        review = await self.click(panel, 'Instagram')
-        confirmation = self.callback(review, '确认发送')
-        self.router.ingest(confirmation)
+        selection = self.callback(panel, 'Instagram')
+        self.router.ingest(selection)
         await self.pump()
         store = self.router.bridges['instagram'].store
         with store.db:
             store.db.execute('UPDATE outbox SET message_id=777 WHERE key=?', (self.copies()[0]['key'],))
         self.sequence += 1
-        duplicate = copy.deepcopy(confirmation)
+        duplicate = copy.deepcopy(selection)
         duplicate['update_id'] = self.sequence
         self.router.ingest(duplicate)
         self.router.ingest(copy.deepcopy(update))
@@ -85,10 +80,9 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_after_child_accept_before_copy_recovers_one_copy_without_new_input(self):
         _, panel = await self.send('输入已落盘，显示尚未落盘')
-        review = await self.click(panel, 'Instagram')
         child = self.router.bridges['instagram']
         with patch.object(child.store, 'enqueue_at', side_effect=OSError('copy interrupted')):
-            await self.click(review, '确认发送')
+            await self.click(panel, 'Instagram')
         self.assertEqual(len(self.inbox()), 1)
         self.assertEqual(self.copies(), [])
         self.assertEqual(self.router.store.db.execute('SELECT state FROM main_guard_drafts').fetchone()[0], 'releasing')
@@ -111,9 +105,8 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_after_copy_commit_does_not_queue_it_again(self):
         _, panel = await self.send('显示已落盘，确认步骤中断')
-        review = await self.click(panel, 'Instagram')
         with patch.object(self.router.recent, 'record', side_effect=OSError('confirmation interrupted')):
-            await self.click(review, '确认发送')
+            await self.click(panel, 'Instagram')
         self.assertEqual(len(self.copies()), 1)
         self.router.picker.guard.recover()
         self.router.picker.guard.recover()

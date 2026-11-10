@@ -300,7 +300,7 @@ class TargetBridge(Bridge):
         reply = None
         if command in {"/help", "/start", "/sessions"}:
             reply = (self.sessions_text() + "\n\n进入对应话题即可继续原会话。\n"
-                     "All 普通消息先选择接收会话，再确认发送；/sessions → 待发送可找回未发内容。\n"
+                     "All 普通消息选择接收会话即发送；/sessions → 待发送可找回未发内容。\n"
                      "/sessions 查看会话并添加绑定\n"
                      "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
                      "/status 查看此会话及完整 ID\n/model 查看或切换此会话模型\n"
@@ -621,7 +621,7 @@ class TopicRouter:
             ready = self.bridges.get(key) and self.bridges[key].ready.is_set()
             state = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
             lines.append(f"• {target['name']}（{state}）")
-        lines.append("All 是管理入口；普通消息需选择并确认接收会话。")
+        lines.append("All 是管理入口；普通消息选择接收会话后立即发送。")
         return "\n".join(lines)
 
     def ingest(self, update):
