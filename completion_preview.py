@@ -234,15 +234,26 @@ class CompletionPreview:
             route['reply_markup'] = reply_markup
         if body_format == 'rich':
             markdown = normalize_local_links(text)
+            applied_style = body_style
+            rich_message = {'markdown': markdown}
             if body_style == 'quote':
-                markdown = '\n'.join('> ' + line for line in markdown.split('\n'))
+                rich_message = {'markdown': '\n'.join('> ' + line for line in markdown.split('\n'))}
+            elif body_style == 'footer':
+                try:
+                    from preview_footer import render_footer_markdown
+                    rich_message = {'html': render_footer_markdown(markdown)}
+                except Exception:
+                    # This boundary only formats local text, before any API
+                    # request. A renderer failure must not become an unknown
+                    # message creation or block ordinary output.
+                    applied_style = 'normal'
             try:
                 result = await telegram.call('editMessageText' if message_id else 'sendRichMessage',
-                                             **route, rich_message={'markdown': markdown})
-                return result, body_style, request
+                                             **route, rich_message=rich_message)
+                return result, applied_style, request
             except Exception as error:
                 if self._not_modified(error, message_id):
-                    return True, body_style, request
+                    return True, applied_style, request
                 # Only a known formatting rejection permits a second request.
                 if not formatting_error(error) or (message_id and getattr(error, 'code', None) == 404):
                     raise

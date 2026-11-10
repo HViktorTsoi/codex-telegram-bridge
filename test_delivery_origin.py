@@ -33,25 +33,19 @@ class DeliveryOriginTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.store.accept({'update_id': 7}, message)
         return self.bridge.store.pending()
 
-    async def test_verified_bot_and_frozen_topic_are_separate_from_user_request(self):
-        row = self.accept()
+    async def test_verified_bot_and_topic_do_not_add_text_to_user_input(self):
+        text = '文件发给我\n\n请保留这段原文。'
+        row = self.accept(text)
         await self.bridge.dispatch_one(row)
         method, params = self.bridge.codex.call.call_args.args
         self.assertEqual((method, params['threadId']), ('turn/start', 'shared-native'))
-        self.assertEqual(params['input'][0], {'type': 'text', 'text': '文件发给我'})
-        origin = params['input'][-1]['text']
-        self.assertIn('@hvt_claude_zbox_bot', origin)
-        self.assertIn('6305', origin)
-        self.assertNotIn('@hvt_zbox_codex_bot', origin)
-        self.assertIn('不属于用户正文', origin)
-        self.assertIn('Markdown 链接', origin)
-        self.assertIn('不要沿用历史中的其他 Bot 配置', origin)
-        self.assertNotIn('/.claude/', origin)
-        self.assertEqual(self.bridge.store.db.execute('SELECT text FROM inbox').fetchone()[0], '文件发给我')
+        self.assertEqual(params['input'], [{'type': 'text', 'text': text}])
+        self.assertEqual(self.bridge.store.db.execute('SELECT text FROM inbox').fetchone()[0], text)
 
-    async def test_two_bots_sharing_native_session_get_their_actual_origin(self):
+    async def test_two_bots_sharing_native_session_preserve_each_original_input(self):
         await self.bridge.dispatch_one(self.accept())
-        primary = self.bridge.codex.call.call_args.args[1]['input'][-1]['text']
+        primary = self.bridge.codex.call.call_args.args[1]['input']
+        self.assertEqual(primary, [{'type': 'text', 'text': '文件发给我'}])
         other_path = self.path / 'secondary'
         other_path.mkdir()
         secondary = Bridge(self.config, other_path)
@@ -64,31 +58,29 @@ class DeliveryOriginTests(unittest.IsolatedAsyncioTestCase):
             await secondary.dispatch_one(secondary.store.pending())
             params = secondary.codex.call.call_args.args[1]
             self.assertEqual(params['threadId'], self.bridge.thread_id)
-            origin = params['input'][-1]['text']
-            self.assertIn('@hvt_zbox_codex_bot', origin)
-            self.assertIn('主对话', origin)
-            self.assertNotIn('@hvt_claude_zbox_bot', origin)
-            self.assertNotEqual(primary, origin)
+            self.assertEqual(params['input'], [{'type': 'text', 'text': '发送脚本'}])
         finally:
             secondary.store.db.close()
 
-    async def test_unverified_runtime_does_not_guess_origin_from_old_configuration(self):
+    async def test_missing_runtime_identity_also_leaves_user_input_unchanged(self):
         self.bridge.username = None
         self.bridge.config['expected_bot_username'] = 'old_history_bot'
         await self.bridge.dispatch_one(self.accept('普通任务'))
         self.assertEqual(self.bridge.codex.call.call_args.args[1]['input'], [{'type': 'text', 'text': '普通任务'}])
 
-    async def test_multimodal_input_and_quote_are_preserved_before_route_context(self):
+    async def test_multimodal_quote_and_real_attachment_metadata_are_preserved_without_extra_context(self):
         row = self.accept('处理引用中的新附件', photo=[{'file_id': 'photo', 'file_size': 20}])
-        contents = [{'type': 'text', 'text': '处理引用中的新附件\n\n［引用内容］\n> 原文'},
+        text = ('处理引用中的新附件\n\n［引用内容］\n> 原文\n\n'
+                'Telegram附件已保存至本机，以下是文件元数据（JSON）：\n'
+                '[{"kind":"photo","path":"/private/inbox/photo.jpg","mime_type":"image/jpeg"}]')
+        contents = [{'type': 'text', 'text': text},
                     {'type': 'localImage', 'path': '/private/inbox/photo.jpg'}]
         with patch('bridge.inputs_for', AsyncMock(return_value=copy.deepcopy(contents))):
             await self.bridge.dispatch_one(row)
         supplied = self.bridge.codex.call.call_args.args[1]['input']
-        self.assertEqual(supplied[:2], contents)
-        self.assertIn('［Telegram 回传路由］', supplied[2]['text'])
+        self.assertEqual(supplied, contents)
 
-    async def test_system_command_and_changed_guard_route_do_not_start_model_or_add_context(self):
+    async def test_system_command_and_changed_guard_route_do_not_start_model(self):
         await self.bridge.dispatch_one(self.accept('/not-a-command'))
         self.bridge.codex.call.assert_not_awaited()
         with self.bridge.store.db:
