@@ -13,6 +13,7 @@ from completion_batch import CompletionBatches, ITEM_SEPARATOR
 from completion_status import CompletionStatus
 from completion_preview import CompletionPreview
 from draft_position import StatusDraftPosition
+from input_echo import has_echo, preview_pair
 
 
 TERMINAL = ('completed', 'failed', 'interrupted')
@@ -349,23 +350,29 @@ class CompletionDelivery:
                                 "(SELECT notice_key FROM completion_turns WHERE notice_state='sending')")
                 self.db.execute("UPDATE completion_turns SET notice_state='uncertain' WHERE notice_state='sending'")
 
-    def _body(self, group):
-        parts, previous = [], None
+    def _body_rows(self, group):
+        rows = []
         for row in self.db.execute('SELECT o.* FROM outbox o JOIN completion_rows c ON c.key=o.key '
                                    'WHERE c.turn_id=? AND c.chat_id=? AND c.topic_id=? ORDER BY o.rowid',
                                    (group['turn_id'], group['chat_id'], group['topic_id'])):
-            base = row['key'].rsplit(':', 1)[0]
-            text = row['text']
+            row = dict(row)
             if row['media_json']:
                 media = json.loads(row['media_json'])
                 kind = '文件' if media.get('kind') == 'document' else '图片'
-                text = '［' + kind + '：' + (media.get('caption') or media.get('name') or kind) + '，将在完成后发送］'
-            if text:
-                # Match the completed transcript while it is still being
-                # edited; source chunks of one native item remain contiguous.
-                parts.append((ITEM_SEPARATOR if parts and base != previous else '') + text)
-                previous = base
-        return ''.join(parts)
+                row['text'] = '［' + kind + '：' + (media.get('caption') or media.get('name') or kind) + '，将在完成后发送］'
+            rows.append(row)
+        return rows
+
+    def _body(self, group):
+        return self.batches.body(self._body_rows(group))
+
+    def _preview_body(self, group, heading, started):
+        rows = self._body_rows(group)
+        if (self.preview_style in ('status-bar', 'status-draft')
+                and self.store.get('output_format', 'rich') == 'rich' and has_echo(rows)):
+            header = self._preview_text(heading, started, '')
+            return preview_pair(rows, self.LIMIT - utf16_size(header + '\n\n') - 32)
+        return self.batches.body(rows), None
 
     @staticmethod
     def _tail(text, budget):
@@ -454,7 +461,7 @@ class CompletionDelivery:
             text = header + note + self._tail(body, self.LIMIT - utf16_size(header + note))
         return text
 
-    async def _send_preview(self, telegram, identity, text):
+    async def _send_preview(self, telegram, identity, text, rich_body=None):
         if not self.bridge.owner_allowed() or not self._current(identity):
             return False
         if self.preview_style in ('status-draft', 'status-bar') and self.status_card._stale(identity):
@@ -462,13 +469,13 @@ class CompletionDelivery:
         try:
             if self.preview_style == 'status-bar':
                 status, _, body = text.partition('\n\n')
-                return await self.body_preview.update_status(telegram, identity, status, body)
+                return await self.body_preview.update_status(telegram, identity, status, body, rich_body=rich_body)
             card_shown = False
             if self.preview_style == 'status-draft':
                 status, _, body = text.partition('\n\n')
                 # The iPad has one live draft per topic. Reserve it for the
                 # short status, after editing the separate ordinary body.
-                await self.body_preview.update(telegram, identity, body)
+                await self.body_preview.update(telegram, identity, body, rich_body=rich_body)
                 if (not self.bridge.owner_allowed() or not self._current(identity)
                         or self.status_card._stale(identity)):
                     return False
@@ -630,17 +637,19 @@ class CompletionDelivery:
             self.store.set(self.RECEIPT_KEY, json.dumps(receipt))
             if group is not None:
                 self._sync_rows()
-                body, started = self._body(group), group['started_at']
+                started = group['started_at']
+                body, rich_body = self._preview_body(group, heading, started)
                 with self.db:
                     self.db.execute('UPDATE completion_turns SET next_preview=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
                                     (receipt['next_preview'], group['turn_id'], group['chat_id'], group['topic_id']))
             else:
                 body, started = '', receipt['received_at']
+                rich_body = None
             identity = {'native_id': self.bridge.thread_id, 'chat_id': str(self.bridge.owner),
                         'topic_id': self.bridge.target['message_thread_id'], 'draft_id': draft_id,
                         'turn_id': group['turn_id'] if group is not None else None,
                         'source_id': source['id']}
-            return await self._send_preview(telegram, identity, self._preview_text(heading, started, body))
+            return await self._send_preview(telegram, identity, self._preview_text(heading, started, body), rich_body=rich_body)
 
     async def update(self, telegram, *, turns=None, status=None, connected=True):
         async with self.preview_lock:
@@ -684,7 +693,7 @@ class CompletionDelivery:
             heading = '🙋 需要你处理 · 去 Codex'
         else:
             heading = '⏳ 正在工作'
-        body = self._body(group)
+        body, rich_body = self._preview_body(group, heading, group['started_at'])
         text = self._preview_text(heading, group['started_at'], body)
         # Keep one ID per task. Client animation is not reliably disabled by
         # rotating IDs; on supported iPads the rich thinking blocks display
@@ -692,7 +701,7 @@ class CompletionDelivery:
         with self.db:
             self.db.execute('UPDATE completion_turns SET next_preview=? WHERE turn_id=? AND chat_id=? AND topic_id=?',
                             (self.clock() + self.INTERVAL, group['turn_id'], group['chat_id'], group['topic_id']))
-        return await self._send_preview(telegram, dict(group), text)
+        return await self._send_preview(telegram, dict(group), text, rich_body=rich_body)
 
     async def _flush_status(self, telegram):
         try:

@@ -34,7 +34,7 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['text'], '📩 你在 All 说：\n' + body)
         self.assertEqual((rows[0]['chat_id'], rows[0]['message_thread_id']), ('123', 22))
-        self.assertIsNone(rows[0]['rich_text'])
+        self.assertTrue(rows[0]['rich_text'].startswith('>'))
         self.assertIsNone(rows[0]['media_json'])
         self.assertEqual(self.copies('meeting'), [])
         self.assertEqual([(r['id'], r['text']) for r in self.inbox()], [(update['update_id'], body)])
@@ -129,14 +129,15 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['text'], '翻译选中部分')
         self.assertEqual(len(self.inbox()), 1)
 
-    async def test_long_unicode_copy_splits_without_truncating_or_formatting(self):
+    async def test_long_unicode_copy_preserves_raw_and_quotes_every_continuation(self):
         body = '第一行\n' + '😀 **原文** ' * 900 + '\n最后一行\n'
         _, panel = await self.send(body)
         await self.confirm(panel)
         rows = self.copies()
         self.assertGreater(len(rows), 1)
         self.assertEqual(''.join(r['text'] for r in rows), '📩 你在 All 说：\n' + body)
-        self.assertTrue(all(utf16_size(r['text']) <= 3800 and r['rich_text'] is None
+        self.assertTrue(all(utf16_size(r['text']) <= 3800 and r['rich_text'].startswith('>')
+                            and utf16_size(r['rich_text']) <= 3800
                             and r['media_json'] is None and r['message_thread_id'] == 22 for r in rows))
         self.assertEqual(self.inbox()[0]['text'], body)
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 
 from message_format import message_parts, utf16_size
+from input_echo import ITEM_SEPARATOR, aggregate_parts, has_echo
 
 
 STATUS = {
@@ -14,7 +15,6 @@ STATUS = {
     'failed': '❌ 本轮任务执行失败，请查看上方过程和 Codex 会话。',
     'interrupted': '⏹ 本轮任务已停止。',
 }
-ITEM_SEPARATOR = '\n\n────────────\n\n'
 LEGACY_SUCCESS = '✅ 本轮任务已完成。'
 
 
@@ -174,7 +174,10 @@ class CompletionBatches:
         rich = self.delivery.store.get('output_format', 'rich') == 'rich'
         footer = STATUS[group['status']] if final_mutable else ''
         limit = self.delivery.LIMIT - utf16_size('\n\n' + footer) if footer else self.delivery.LIMIT
-        parts = list(message_parts(text, rich=rich, limit=limit))
+        parts = list(aggregate_parts(sources, rich=rich, limit=limit,
+                                    prefix=ITEM_SEPARATOR if not rebuild and final_mutable and final else '')
+                     if has_echo(sources)
+                     else message_parts(text, rich=rich, limit=limit))
         # Do not route through Store.enqueue_at here: its context manager would
         # commit the handoff before all packet/source updates are durable.
         with self.db:
@@ -243,7 +246,7 @@ class CompletionBatches:
                                 "AND state='queued' AND begun=0", self.identity(group))
             final_sources = [row for row in sources if row['key'].rsplit(':', 1)[0] == final_base] if rebuild else []
             history = [row for row in sources if row not in final_sources]
-            history_parts = list(message_parts(self.body(history), rich=rich, limit=self.delivery.LIMIT))
+            history_parts = list(aggregate_parts(history, rich=rich, limit=self.delivery.LIMIT))
             index = 0
             for raw, formatted in history_parts:
                 self._insert_packet(group, generation, index, raw, formatted, retry_at)

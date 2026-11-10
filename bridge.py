@@ -185,6 +185,9 @@ class Store:
                                 (f'{key}:media:{i}', str(chat_id), '', json.dumps(media), topic_id))
 
     def output_parts(self, key, text):
+        from input_echo import is_input_echo, quote_parts
+        if is_input_echo(key) and self.get('output_format', 'rich') == 'rich':
+            return quote_parts(text)
         return message_parts(text, rich=key.startswith('turn:') and self.get('output_format', 'rich') == 'rich')
 
     def routes(self, turn_id):

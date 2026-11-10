@@ -87,7 +87,7 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.update_native_mirror([self.turn()])
         self.assertEqual(len(self.output()), 1)
         self.assertIn('桌面端输入', self.output()[0]['text'])
-        self.assertIsNone(self.output()[0]['rich_text'])
+        self.assertTrue(self.output()[0]['rich_text'].startswith('>'))
         self.bridge.record_item('new', self.agent())
         self.items['new'] = [self.user(), self.agent()]
         await self.bridge.update_native_mirror([self.turn(status='completed')])
