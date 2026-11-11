@@ -85,6 +85,7 @@ class RoutedStore(Store):
     def __init__(self, path, thread_id):
         super().__init__(path)
         self.on_input = None
+        self.on_task_input = None
         for table, name, kind in (("inbox", "message_thread_id", "INTEGER"),
                                   ("inbox", "source_message_id", "INTEGER"),
                                   ("inbox", "main_guard_json", "TEXT"),
@@ -116,8 +117,15 @@ class RoutedStore(Store):
                 ).rowcount)
             self.db.execute("INSERT OR REPLACE INTO kv VALUES('offset',?)",
                             (str(max(int(self.get("offset", 0)), update["update_id"] + 1)),))
-        if inserted and self.on_input is not None:
-            self.on_input()
+        if inserted:
+            if self.on_task_input is not None and not command_of(message).startswith('/'):
+                try:
+                    self.on_task_input(message, update['update_id'], guard_binding)
+                except Exception as error:
+                    # A display hint must never prevent durable input dispatch.
+                    LOG.warning('Input preview interaction failed: %s', type(error).__name__)
+            if self.on_input is not None:
+                self.on_input()
 
     def turn_routes(self, turn_id):
         return self.db.execute(
@@ -161,11 +169,46 @@ class TargetBridge(NativeQuestions, Bridge):
         self.delivery = CompletionDelivery(self)
         self.receipt_event = asyncio.Event()
         self.store.on_input = self.receipt_event.set
+        self.store.on_task_input = self.note_task_input
         self.store.db.execute('''CREATE TABLE IF NOT EXISTS completion_ready_items(
             turn_id TEXT,fingerprint TEXT,pending INTEGER DEFAULT 1,PRIMARY KEY(turn_id,fingerprint))''')
         if 'pending' not in {r[1] for r in self.store.db.execute('PRAGMA table_info(completion_ready_items)')}:
             self.store.db.execute('ALTER TABLE completion_ready_items ADD COLUMN pending INTEGER DEFAULT 1')
         self.store.db.commit()
+
+    def note_user_interaction(self, marker, *, chat_id=None, topic_id=None):
+        """Wake a route-local preview without changing accepted model input."""
+        chat_id = str(self.owner) if chat_id is None else str(chat_id)
+        topic_id = self.target['message_thread_id'] if topic_id is None else topic_id
+        if (not self.delivery.enabled or not self.owner_allowed() or self.target.get('topic_missing')
+                or self.target.get('thread_id') != self.thread_id
+                or chat_id != str(self.owner) or topic_id != self.target['message_thread_id']):
+            return False
+        note = getattr(self.delivery, 'note_interaction', None)
+        if note is None:
+            return False
+        try:
+            changed = note(marker, chat_id=chat_id, topic_id=topic_id)
+        except Exception as error:
+            LOG.warning('Preview interaction failed: %s', type(error).__name__)
+            return False
+        if changed:
+            self.receipt_event.set()
+        return bool(changed)
+
+    def note_task_input(self, message, update_id, guard_binding=None):
+        """Only newly accepted owner content, including imported All tasks."""
+        if (not permitted(message, self.access(), self.owner)
+                or command_of(message).startswith('/')
+                or not (payload_from(message) or (message.get('text') or message.get('caption', '')).strip())):
+            return False
+        if guard_binding is not None and (not isinstance(guard_binding, dict)
+                or guard_binding.get('target_key') != self.target['key']
+                or guard_binding.get('thread_id') != self.thread_id
+                or guard_binding.get('topic_id') != self.target['message_thread_id']):
+            return False
+        return self.note_user_interaction('telegram:' + str(update_id),
+                                          chat_id=message['chat']['id'], topic_id=topic_of(message))
 
     def validate_destination(self, rows):
         for row in rows:
@@ -425,6 +468,10 @@ class TargetBridge(NativeQuestions, Bridge):
                                  reply_markup=self.delivery.final_markup(row))
         self.store.images.sent(row, sent['message_id'])
         self.delivery.sent(row, sent['message_id'])
+        from input_echo import is_input_echo
+        if is_input_echo(row['key']):
+            self.note_user_interaction('echo:' + row['key'], chat_id=row['chat_id'],
+                                       topic_id=row['message_thread_id'])
         if self.delivery.enabled and row['key'].startswith('completion-notice:'):
             await self.delivery.complete_status(self.telegram, row)
         if self.delivery.enabled and (row['key'].startswith('completion-notice:')

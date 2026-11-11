@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from bridge import RpcError
 from native_mirror import NativeMirror
@@ -58,6 +59,22 @@ class NativeMirrorTests(unittest.IsolatedAsyncioTestCase):
     async def enable(self):
         await self.bridge.update_native_mirror([self.turn('old', 'completed', 900)])
         self.now = 1001
+
+    async def test_new_native_user_input_repositions_once_without_replaying_history_or_telegram_input(self):
+        await self.enable()
+        self.bridge.note_user_interaction = Mock(return_value=True)
+        self.items['new'] = [self.user(), self.agent()]
+        await self.bridge.update_native_mirror([self.turn()])
+        self.now += 16
+        await self.bridge.update_native_mirror([self.turn()])
+        self.bridge.note_user_interaction.assert_called_once()
+        args, kwargs = self.bridge.note_user_interaction.call_args
+        self.assertTrue(args[0].startswith('native:new:'))
+        self.assertEqual(kwargs, {'chat_id': '123', 'topic_id': 42})
+        self.now += 1
+        self.items['telegram'] = [self.user('Telegram 已经确认的输入', client_id='telegram-123')]
+        await self.bridge.update_native_mirror([self.turn('telegram', started=self.now)])
+        self.bridge.note_user_interaction.assert_called_once()
 
     async def test_initial_boundary_does_not_publish_completed_or_active_history(self):
         self.items['active'] = [self.user(), self.agent()]

@@ -273,6 +273,102 @@ class CompletionPreview:
             result = True
         return result, 'normal', request
 
+    @staticmethod
+    def _creation_id(result, identity):
+        mid = result.get('message_id') if isinstance(result, dict) else None
+        if (not isinstance(mid, int) or isinstance(mid, bool) or mid <= 0
+                or ('message_thread_id' in result and result['message_thread_id'] != identity['topic_id'])
+                or ('chat' in result and str(result['chat'].get('id')) != identity['chat_id'])):
+            raise ConnectionError('Preview creation acknowledgement unavailable')
+        return mid
+
+    def _record_sent(self, state, text, rich_body, request, applied_style, reply_markup, status_bar):
+        state.update(delivery='sent', sent_text=text, retry_at=0, updated_at=self.delivery.clock(),
+                     sent_body_style=applied_style, sent_body_style_requested=request[0],
+                     sent_body_format_requested=request[1],
+                     sent_display_text=rich_body if rich_body is not None and request[1] == 'rich' else text)
+        if status_bar:
+            state['sent_markup'] = reply_markup
+
+    async def _cleanup_retired(self, telegram, identity, state, limit=5):
+        """Retire only known replaced previews; canonical outputs are immutable."""
+        attempted = 0
+        if not self._current(identity):
+            return attempted
+        for entry in state.get('retired', []):
+            mid = entry.get('message_id')
+            if (entry.get('state') not in ('queued', 'deleting')
+                    or self.delivery.clock() < entry.get('retry_at', 0)):
+                continue
+            if (not isinstance(mid, int) or isinstance(mid, bool) or mid <= 0
+                    or mid == state.get('message_id') or self.store.db.execute(
+                        'SELECT 1 FROM outbox WHERE chat_id=? AND message_thread_id=? AND message_id=? LIMIT 1',
+                        (identity['chat_id'], identity['topic_id'], mid)).fetchone()):
+                entry.update(state='failed', retry_at=0)
+                self._save(state, identity)
+                continue
+            if attempted >= limit:
+                return attempted
+            attempted += 1
+            entry['state'] = 'deleting'
+            self._save(state, identity)
+            try:
+                result = await telegram.call('deleteMessage', chat_id=int(identity['chat_id']), message_id=mid)
+                if result is not True:
+                    raise ConnectionError('Retired preview deletion acknowledgement unavailable')
+            except Exception as error:
+                code = getattr(error, 'code', None)
+                absent = code == 400 and any(s in str(error).lower() for s in
+                    ('message to delete not found', 'message_id_invalid'))
+                entry['state'] = 'deleted' if absent else 'failed' if code in (400, 403, 404) else 'queued'
+                entry['retry_at'] = (self.delivery.clock() + self._delay(error)
+                                     if entry['state'] == 'queued' else 0)
+            else:
+                entry.update(state='deleted', retry_at=0)
+            self._save(state, identity)
+        return attempted
+
+    async def _relocate(self, telegram, identity, state, text, rich_body, reply_markup, request, status_bar):
+        """Create the replacement before switching IDs or retiring the old one."""
+        generation = self.delivery.interaction_sequence()
+        if (not state.get('message_id') or generation <= state.get('interaction_sequence', 0)
+                or state.get('closed') or state.get('finished')):
+            return None
+        replacement = state.get('replacement', {})
+        if replacement.get('state') in ('creating', 'uncertain', 'failed'):
+            if replacement['state'] == 'creating':
+                replacement['state'] = 'uncertain'
+                self._save(state, identity)
+            return None  # Keep updating the known old ID; never guess a new ACK.
+        if self.delivery.clock() < replacement.get('retry_at', 0):
+            return False
+        old_id = state['message_id']
+        intent = {'state': 'creating', 'generation': generation, 'old_message_id': old_id, 'retry_at': 0}
+        state['replacement'] = intent
+        self._save(state, identity)
+        pending = dict(state, message_id=None)
+        try:
+            result, applied_style, request = await self._render(
+                telegram, identity, pending, text, reply_markup, request)
+            new_id = self._creation_id(result, identity)
+            if new_id == old_id:
+                raise ConnectionError('Replacement preview did not receive a distinct message ID')
+        except Exception as error:
+            code = getattr(error, 'code', None)
+            intent.update(state='queued' if code == 429 else 'failed' if code in (400, 403, 404) else 'uncertain',
+                          retry_at=self.delivery.clock() + self._delay(error))
+            self._save(state, identity)
+            return False
+        retired = state.setdefault('retired', [])
+        if not any(entry.get('message_id') == old_id for entry in retired):
+            retired.append({'message_id': old_id, 'state': 'queued', 'retry_at': 0})
+        state.update(message_id=new_id, interaction_sequence=generation)
+        state.pop('replacement', None)
+        self._record_sent(state, text, rich_body, request, applied_style, reply_markup, status_bar)
+        self._save(state, identity)  # Switch Stop validation only after the new ACK.
+        await self._cleanup_retired(telegram, identity, state)
+        return bool(self._allowed(identity))
+
     async def update(self, telegram, identity, body, *, reply_markup=None, _status_bar=False, rich_body=None):
         """Create quietly once, then edit only the known preview message ID."""
         try:
@@ -306,6 +402,10 @@ class CompletionPreview:
             if self.delivery.clock() < state.get('retry_at', 0):
                 return False
             request = self._render_request(telegram)
+            moved = await self._relocate(telegram, identity, state, text, rich_body, reply_markup,
+                                         request, _status_bar)
+            if moved is not None:
+                return moved
             display = rich_body if rich_body is not None and request[1] == 'rich' else text
             same_body = (message_id and state.get('sent_text') == text
                          and state.get('sent_display_text', state.get('sent_text')) == display
@@ -314,6 +414,7 @@ class CompletionPreview:
             if same_body and (not _status_bar or state.get('sent_markup') == reply_markup):
                 return True
             state['delivery'] = 'editing' if message_id else 'creating'
+            creation_sequence = self.delivery.interaction_sequence() if not message_id else None
             self._save(state, identity)  # Unknown creation must never be replayed.
             applied_style = state.get('sent_body_style', 'normal')
             try:
@@ -324,12 +425,8 @@ class CompletionPreview:
                     result, applied_style, request = await self._render(telegram, identity, state, text,
                                                                        reply_markup, request)
                 if not message_id:
-                    mid = result.get('message_id') if isinstance(result, dict) else None
-                    if (not isinstance(mid, int) or isinstance(mid, bool) or mid <= 0
-                            or ('message_thread_id' in result and result['message_thread_id'] != identity['topic_id'])
-                            or ('chat' in result and str(result['chat'].get('id')) != identity['chat_id'])):
-                        raise ConnectionError('Preview creation acknowledgement unavailable')
-                    state['message_id'] = mid
+                    state['message_id'] = self._creation_id(result, identity)
+                    state['interaction_sequence'] = creation_sequence
                 elif result is not True and (not isinstance(result, dict) or result.get('message_id') != message_id):
                     raise ConnectionError('Preview edit acknowledgement unavailable')
             except Exception as error:
@@ -341,12 +438,7 @@ class CompletionPreview:
                                  retry_at=self.delivery.clock() + self._delay(error))
                     self._save(state, identity)
                     return False
-            state.update(delivery='sent', sent_text=text, retry_at=0, updated_at=self.delivery.clock())
-            state.update(sent_body_style=applied_style, sent_body_style_requested=request[0],
-                         sent_body_format_requested=request[1],
-                         sent_display_text=rich_body if rich_body is not None and request[1] == 'rich' else text)
-            if _status_bar:
-                state['sent_markup'] = reply_markup
+            self._record_sent(state, text, rich_body, request, applied_style, reply_markup, _status_bar)
             self._save(state, identity)
             return bool(self._allowed(identity))
         except Exception:
@@ -398,6 +490,9 @@ class CompletionPreview:
                 if (not identity or key != self._key(identity) or state.get('route') != self._route(identity)
                         or state.get('transferred_to') or not self._current(identity)):
                     continue
+                attempted += await self._cleanup_retired(telegram, identity, state, max(0, 5 - attempted))
+                if attempted >= 5:
+                    return
                 if not identity.get('turn_id'):
                     source = self._source(identity)
                     if state.get('closed') or source is None or not source['turn_id']:
