@@ -519,6 +519,9 @@ class Bridge:
                         LOG.info("Accepted Telegram update %s", update["update_id"])
             except TelegramError as error:
                 if error.code in {401, 409}:
+                    from recovery_fault import record_poll_failure
+                    record_poll_failure(self, error.code)
+                    refresh_health_snapshot(self)
                     LOG.error("Telegram polling stopped: %s", error)
                     raise  # Do not compete with another process using this bot.
                 self.last_error = str(error)
