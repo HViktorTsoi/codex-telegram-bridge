@@ -156,6 +156,11 @@ class NativeMirror:
             return
         if body:
             self.store.enqueue_at(key, bridge.owner, text, row['topic_id'])
+            if kind == 'userMessage':
+                note = getattr(bridge, 'note_user_interaction', None)
+                if callable(note):
+                    note('native:' + turn_id + ':' + identity,
+                         chat_id=bridge.owner, topic_id=row['topic_id'])
             with self.store.db:
                 self.store.db.execute('INSERT OR REPLACE INTO native_mirror_seen VALUES(?,?,?,?,1)',
                                       (turn_id, identity, row['topic_id'], fingerprint))

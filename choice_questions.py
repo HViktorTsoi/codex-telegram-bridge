@@ -392,6 +392,12 @@ class ChoiceQuestions:
                 self.db.execute("UPDATE choice_prompt_claims SET state='closed' WHERE question_id=?", (question['id'],))
         if not changed:
             raise ChoiceError('这个问题已处理。')
+        note = getattr(bridge, 'note_user_interaction', None)
+        if note is not None:
+            try:
+                note('choice:' + question['id'] + ':' + str(question['position']))
+            except Exception as error:
+                LOG.warning('Question preview interaction failed: %s', type(error).__name__)
         if not final:
             return
         try:

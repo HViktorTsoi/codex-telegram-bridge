@@ -49,6 +49,10 @@ class CompletionDelivery:
                 key TEXT PRIMARY KEY,turn_id TEXT,chat_id TEXT,topic_id INTEGER);
             CREATE INDEX IF NOT EXISTS completion_receipt_inbox_route
                 ON inbox(chat_id,message_thread_id,received_ms DESC,id DESC);
+            CREATE TABLE IF NOT EXISTS completion_interactions(
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,marker TEXT,native_id TEXT,
+                chat_id TEXT,topic_id INTEGER,created_at REAL,
+                UNIQUE(native_id,chat_id,topic_id,marker));
         ''')
         self.batches = CompletionBatches(self)
         self.status_card = CompletionStatus(self)
@@ -78,6 +82,34 @@ class CompletionDelivery:
 
     def state(self):
         return json.loads(self.store.get(self.KEY, '{}'))
+
+    def interaction_sequence(self):
+        row = self.db.execute('SELECT MAX(sequence) FROM completion_interactions '
+                              'WHERE native_id=? AND chat_id=? AND topic_id=?', self.route()).fetchone()
+        return row[0] or 0
+
+    def note_interaction(self, marker, *, chat_id=None, topic_id=None):
+        """Request one quiet reposition for an accepted, idempotent user event."""
+        if (not self.enabled or self.preview_style not in ('status-bar', 'status-draft')
+                or not isinstance(marker, str) or not marker or len(marker) > 512
+                or not self.bridge.owner_allowed() or self.bridge.target.get('topic_missing')
+                or self.bridge.target.get('thread_id') != self.bridge.thread_id
+                or (chat_id is not None and str(chat_id) != str(self.bridge.owner))
+                or (topic_id is not None and topic_id != self.bridge.target['message_thread_id'])):
+            return False
+        with self.db:
+            inserted = self.db.execute('INSERT OR IGNORE INTO completion_interactions '
+                '(marker,native_id,chat_id,topic_id,created_at) VALUES(?,?,?,?,?)',
+                (marker, *self.route(), self.clock())).rowcount
+            if inserted:
+                self.db.execute('UPDATE completion_turns SET next_preview=0 WHERE native_id=? '
+                                "AND chat_id=? AND topic_id=? AND stage IN ('active','closing')", self.route())
+                receipt = self._receipt_state()
+                if receipt.get('route') == self.route():
+                    receipt['next_preview'] = 0
+                    self.db.execute('INSERT OR REPLACE INTO kv VALUES(?,?)',
+                                    (self.RECEIPT_KEY, json.dumps(receipt)))
+        return bool(inserted)
 
     def _new_window(self):
         # Re-enabling must not announce turns completed while this policy was

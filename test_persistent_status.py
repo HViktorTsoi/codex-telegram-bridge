@@ -214,19 +214,24 @@ class PersistentStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assert_status_keyboard(self.messages[mid], '正在工作')
         self.assert_no_drafts()
 
-    async def test_pending_input_burst_reuses_one_placeholder_then_adopts_it(self):
+    async def test_new_pending_input_moves_placeholder_once_then_adopts_it(self):
         self.accept(7)
         await self.delivery().receipt(self.telegram)
+        first_mid = self.delivery().body_preview.load(self.pending_identity(7))['message_id']
         self.now += 1
         self.accept(8)
         await self.delivery().receipt(self.telegram)
-        self.assertEqual(len(self.sends()), 1)
+        current_mid = self.delivery().body_preview.load(self.pending_identity(8))['message_id']
+        self.assertGreater(current_mid, first_mid)
+        self.assertNotIn(first_mid, self.messages)
+        self.assertEqual(len(self.sends()), 2)
         self.bridges['a'].store.mark(7, 'running', 'a-work')
         self.bridges['a'].store.mark(8, 'running', 'a-work')
         self.output()
         self.now += 1
         await self.update()
-        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(len(self.sends()), 2)
+        self.assertEqual(self.delivery().body_preview.load(self.identity())['message_id'], current_mid)
         self.assertIn('第一段工作文本', self.body_text(next(iter(self.messages.values()))))
         self.assert_status_keyboard(next(iter(self.messages.values())), '正在工作')
         self.assert_no_drafts()
@@ -239,13 +244,16 @@ class PersistentStatusTests(unittest.IsolatedAsyncioTestCase):
         self.now += 1
         self.accept(8)
         await delivery.receipt(self.telegram)
-        self.assertEqual(delivery.body_preview.load(self.pending_identity(8))['message_id'], mid)
+        old_mid = mid
+        mid = delivery.body_preview.load(self.pending_identity(8))['message_id']
+        self.assertGreater(mid, old_mid)
+        self.assertNotIn(old_mid, self.messages)
         store.mark(7, 'running', 'a-work')
         self.output('任务 A 的正式结果')
         self.now += 1
         await self.update(started=1000)
         await delivery.receipt(self.telegram)
-        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(len(self.sends()), 2)
         self.assertFalse(delivery.body_preview.load(self.identity()).get('message_id'))
         self.assertEqual(delivery.body_preview.load(self.pending_identity(8))['message_id'], mid)
         delivery.seal(self.turn(status='completed', started=1000))
@@ -256,7 +264,7 @@ class PersistentStatusTests(unittest.IsolatedAsyncioTestCase):
         self.now += 1
         await self.update(tid='a-next', started=1002)
         self.assertEqual(delivery.body_preview.load(self.identity('a-next'))['message_id'], mid)
-        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(len(self.sends()), 2)
         self.assertIn('任务 B 的工作文本', self.body_text(self.messages[mid]))
         b_markup = copy.deepcopy(self.messages[mid]['reply_markup'])
         async with delivery.preview_lock:
@@ -264,7 +272,7 @@ class PersistentStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(mid, self.messages)
         self.assertEqual(self.messages[mid]['reply_markup'], b_markup)
         self.assert_status_keyboard(self.messages[mid], '正在工作')
-        self.assertEqual(self.calls_for('deleteMessage'), [])
+        self.assertEqual([p['message_id'] for _, p in self.calls_for('deleteMessage')], [old_mid])
         self.assertEqual(sum(p.get('disable_notification') is not True for _, p in self.sends()), 1)
         self.assert_no_drafts()
 

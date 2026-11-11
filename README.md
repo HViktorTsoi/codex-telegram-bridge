@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.27 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.28 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -322,6 +322,8 @@ Telegram 托管 Bot API 的附件下载上限为 20MB。图片作为 `localImage
 若在 Codex 客户端先回答了多道题中的一部分，Telegram 会关闭该组按钮以避免重复提交，其余问题请继续在 Codex 中回答。
 
 All 派单和 Codex 客户端用户输入回显中，桥接生成的“你在 All 说”“你在 Codex 客户端说”标题保持普通文字，仅用户消息正文使用引用格式。纯文本降级仍保留原文，附件与模型输入保持原流程。
+
+使用 `status-bar` 或 `status-draft` 累计预览时，任务运行中接受新的普通输入或每道选项回答后，后续预览会静音重建到最新位置，显示在新回复之后，保留累计内容并继续编辑新消息；All 派单和本机客户端用户回显成功发送后也会更新位置。系统查询、取消和重复点击不触发移动。新预览确认成功后才清理旧预览，重启保留位置水位；创建结果未知时不会盲目重发。静音使用 Telegram 的 `disable_notification`，不保证客户端完全不出现通知横幅。
 
 ## 可选提醒示例
 
