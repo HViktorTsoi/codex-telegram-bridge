@@ -417,9 +417,9 @@ class TargetBridge(NativeQuestions, Bridge):
                      "/sessions 查看会话并添加绑定\n"
                      "/skills 查看本机会话可用技能并选择使用\n"
                      "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
-                     "/status 查看此会话及完整 ID\n/model 查看或切换此会话模型\n"
-                     "/effort 查看或修改此会话强度\n/stop 停止此会话的当前任务\n"
-                     "/format rich 开启 Markdown 排版；/format plain 使用纯文本\n"
+                     "/status 查看此会话及完整 ID\n/model 按钮选择此会话模型\n"
+                     "/effort 按钮选择此会话强度\n/stop 停止此会话的当前任务\n"
+                     "/format 按钮选择回复格式；也支持 /format rich 或 /format plain\n"
                      "支持图片、文件和相册；附件上限20MB。语音视频暂按文件接收。\n"
                      "未绑定话题不会创建或改用其他 Codex 会话。")
         elif command == "/status":
@@ -726,6 +726,8 @@ class TopicRouter:
         self.skills = SkillsMenu(self)
         from choice_questions import ChoiceQuestions
         self.questions = ChoiceQuestions(self)
+        from settings_menu import SettingsMenu
+        self.settings_menu = SettingsMenu(self)
         for bridge in self.bridges.values():
             bridge.questions = self.questions
 
@@ -749,6 +751,8 @@ class TopicRouter:
         return "\n".join(lines)
 
     def ingest(self, update):
+        if self.settings_menu.ingest(update):
+            return
         if self.questions.ingest(update):
             return
         if self.status_controls.ingest(update):
@@ -1113,6 +1117,7 @@ class TopicRouter:
                 self.status_controls.recover()
                 self.skills.recover()
                 self.questions.recover()
+                self.settings_menu.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
@@ -1121,6 +1126,7 @@ class TopicRouter:
                 self.spawn(self.status_controls.loop())
                 self.spawn(self.skills.loop())
                 self.spawn(self.questions.loop())
+                self.spawn(self.settings_menu.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())

@@ -303,6 +303,13 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         reply = await self.command("/effort careful")
         self.assertIn("effort：careful", reply)
 
+    async def test_effort_preserves_catalog_case_and_accepts_a_unique_case_insensitive_match(self):
+        self.codex.catalog[0]['supportedReasoningEfforts'].append({'reasoningEffort': 'CarefulV2'})
+        await self.command('/effort carefulv2')
+        self.assertEqual(self.codex.updates[-1], {'threadId': 'thread', 'effort': 'CarefulV2'})
+        await self.command('/effort CarefulV2')
+        self.assertEqual(self.codex.updates[-1]['effort'], 'CarefulV2')
+
     async def test_success_is_not_claimed_when_settings_readback_does_not_match(self):
         self.codex.apply = False
         reply = await self.command("/effort high")

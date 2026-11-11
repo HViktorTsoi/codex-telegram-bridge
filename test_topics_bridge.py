@@ -303,9 +303,9 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         child = self.router.bridges['instagram']
         child.codex = StubCodex()
-        commands = ['/status', '/stop', '/model', '/effort', '/format', '/model unavailable',
-                    '/effort invalid', '/format invalid', '/model alternate-model', '/effort low',
-                    '/model@test_bot', '/unknown']
+        commands = ['/status', '/stop', '/model unavailable',
+                    '/effort invalid', '/format invalid', '/model@test_bot alternate-model', '/effort low',
+                    '/unknown']
         for i, text in enumerate(commands, 100):
             self.accept(self.message(i, 22, text=text))
             await child.dispatch_one(child.store.pending())

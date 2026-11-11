@@ -439,9 +439,14 @@ class SkillsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(row['skill_json'])
         self.assertEqual(self.starts(), [])
         await self.send('/model')
+        self.assertFalse(self.router.forward_one())
+        menu = self.router.store.db.execute("SELECT * FROM settings_jobs WHERE state='pending'").fetchone()
+        self.assertIsNotNone(menu)
+        self.assertEqual(menu['target_key'], 'meeting')
+        await self.send('/model test-model')
         self.assertTrue(self.router.forward_one())
         rows = self.router.bridges['meeting'].store.db.execute('SELECT text,skill_json FROM inbox ORDER BY id').fetchall()
-        self.assertEqual([r['text'] for r in rows], ['普通消息不属于技能向导', '/model'])
+        self.assertEqual([r['text'] for r in rows], ['普通消息不属于技能向导', '/model test-model'])
         self.assertFalse(rows[-1]['skill_json'])
 
     async def test_media_caption_is_not_a_skills_command_and_does_not_run_a_model(self):

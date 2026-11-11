@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.28 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.29 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -312,6 +312,10 @@ Telegram 托管 Bot API 的附件下载上限为 20MB。图片作为 `localImage
 `.github/workflows/tests.yml` 为推送和 Pull Request 配置 Python 3.10 / 3.12 自动测试。GitHub 仓库建立并推送后才会实际运行该工作流。
 
 ## Codex 选项按钮
+
+话题模式中，发送 `/model`、`/effort` 或 `/format` 可打开设置按钮菜单，三类菜单之间也可直接切换。当前选中项带勾，模型列表支持分页，推理强度只列出当前模型支持的级别；点击选项直接保存并回读确认。模型及强度取自当前机器的实时 Codex 目录，修改用于后续轮次，不启动或中断当前任务；回复格式切换当前会话的 Rich Markdown 或纯文本偏好。仍可直接发送 `/model 模型ID`、`/effort 级别` 和 `/format rich` 等文字命令。
+
+菜单及操作结果留在输入所在话题，绑定原 Codex 会话；在 All 打开时明确显示并操作原 Manager 根会话。菜单过期、原绑定变化或当前模型已变更时会提示刷新，不把旧强度选择应用到另一个模型。重复按钮、重启及未知修改结果不会自动重复覆盖设置，设置菜单本身不调用模型。
 
 话题模式自动把 Codex 的原生结构化选择题显示为对应话题中的独立按钮消息，无需新建或重新绑定会话。单题点选后提交，多题逐题选择并在最后一题提交；“自行输入”会发出文字回答提示，回复该提示即可作答，回复 `/cancel` 只取消此次文字输入。普通聊天与系统指令继续按原有流程处理。
 
