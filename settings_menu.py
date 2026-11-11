@@ -202,6 +202,9 @@ class SettingsMenu:
             for row in rows:
                 keys = []
                 for name, action, value in row:
+                    if action == 'tab' and value == mode:
+                        keys.append({'text': label(name), 'disabled': {}})
+                        continue
                     token = secrets.token_urlsafe(12)
                     tokens.append(token)
                     self.db.execute('INSERT INTO settings_buttons(token,panel_id,revision,action,value) VALUES(?,?,?,?,?)',
@@ -336,6 +339,8 @@ class SettingsMenu:
             pass
         button, panel = self._button(update)
         action, value = button['action'], json.loads(button['value'])
+        if action == 'tab' and value == panel['mode']:
+            return  # Older menus must not reload the current page or reset pagination.
         if action == 'close':
             with self.db:
                 self.db.execute("UPDATE settings_panels SET state='closed' WHERE id=?", (panel['id'],))

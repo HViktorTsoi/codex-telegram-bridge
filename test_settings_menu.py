@@ -138,7 +138,8 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('native-B', self.labels(panel))
         self.assertEqual(self.updates, [])
         self.assertTrue(all(tid == 'other-native' for _, tid in self.native_reads))
-        self.assertTrue(all(len(button['callback_data']) < 64 for row in panel['reply_markup']['inline_keyboard'] for button in row))
+        self.assertTrue(all(len(button['callback_data']) < 64 for row in panel['reply_markup']['inline_keyboard']
+                            for button in row if 'callback_data' in button))
 
     async def test_all_operates_explicit_root_and_keeps_menu_in_all(self):
         panel = await self.send('/effort', topic=None)
@@ -254,6 +255,42 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.panel()['message_id'], mid)
         await self.click(self.panel(), '关闭')
         self.assertEqual(self.messages[mid]['reply_markup'], {'inline_keyboard': []})
+        self.assertEqual(self.updates, [])
+
+    async def test_current_navigation_tab_is_disabled_in_each_settings_page(self):
+        panel = await self.send('/model')
+        for current, next_tab in [('模型', '强度'), ('强度', '格式'), ('格式', '模型')]:
+            buttons = {button['text']: button for row in panel['reply_markup']['inline_keyboard']
+                       for button in row if button['text'] in ('模型', '强度', '格式')}
+            self.assertEqual(buttons[current], {'text': current, 'disabled': {}})
+            self.assertTrue(all('callback_data' in button and 'disabled' not in button
+                                for title, button in buttons.items() if title != current))
+            await self.click(panel, next_tab)
+            panel = self.panel()
+        self.assertEqual(self.updates, [])
+
+    async def test_legacy_current_tab_callback_does_not_reload_or_reset_the_current_page(self):
+        self.catalog = [self.model('model-' + str(index), ['custom'], 'custom') for index in range(12)]
+        panel = await self.send('/model')
+        await self.click(panel, '下一页')
+        panel = self.panel()
+        stored = self.ui.db.execute('SELECT * FROM settings_panels ORDER BY rowid DESC LIMIT 1').fetchone()
+        token = 'legacy-current-model-tab'
+        with self.ui.db:
+            self.ui.db.execute('INSERT INTO settings_buttons(token,panel_id,revision,action,value,state) '
+                               'VALUES(?,?,?,?,?,?)', (token, stored['id'], stored['revision'], 'tab',
+                                                      json.dumps('model'), 'active'))
+        update = self.callback(panel, '刷新')
+        update['callback_query']['data'] = 'sm:' + token
+        reads = len(self.native_reads)
+        edits = sum(method == 'editMessageText' for method, _ in self.calls)
+        self.assertTrue(self.ui.ingest(update))
+        await self.ui.handle_one()
+        actual = self.ui._panel_row(stored['id'])
+        self.assertEqual(actual['page'], 1)
+        self.assertEqual(actual['revision'], stored['revision'])
+        self.assertEqual(len(self.native_reads), reads)
+        self.assertEqual(sum(method == 'editMessageText' for method, _ in self.calls), edits)
         self.assertEqual(self.updates, [])
 
     async def test_native_identity_mismatch_is_rejected_without_a_settings_write(self):
