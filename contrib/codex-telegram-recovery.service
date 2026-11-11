@@ -1,0 +1,18 @@
+[Unit]
+Description=Codex Telegram independent fault alerts
+StartLimitIntervalSec=60
+StartLimitBurst=6
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Code/codex-telegram-bridge
+ExecStart=/usr/bin/python3 %h/Code/codex-telegram-bridge/recovery_service.py run --state-dir %h/.local/state/codex-telegram
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+KillMode=process
+
+[Install]
+WantedBy=default.target

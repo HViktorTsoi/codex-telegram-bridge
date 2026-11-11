@@ -835,6 +835,9 @@ class TopicRouter:
                     self.ingest(update)
             except TelegramError as error:
                 if error.code in {401, 409}:
+                    from recovery_fault import record_poll_failure
+                    record_poll_failure(self, error.code)
+                    refresh_health_snapshot(self)
                     raise
                 self.last_error = f"Telegram poll: {error.code}"
                 await asyncio.sleep(max(3, error.retry_after))

@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.30 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.31 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -330,6 +330,26 @@ Telegram 托管 Bot API 的附件下载上限为 20MB。图片作为 `localImage
 All 派单和 Codex 客户端用户输入回显中，桥接生成的“你在 All 说”“你在 Codex 客户端说”标题保持普通文字，仅用户消息正文使用引用格式。纯文本降级仍保留原文，附件与模型输入保持原流程。
 
 使用 `status-bar` 或 `status-draft` 累计预览时，任务运行中接受新的普通输入或每道选项回答后，后续预览会静音重建到最新位置，显示在新回复之后，保留累计内容并继续编辑新消息；All 派单和本机客户端用户回显成功发送后也会更新位置。系统查询、取消和重复点击不触发移动。新预览确认成功后才清理旧预览，重启保留位置水位；创建结果未知时不会盲目重发。静音使用 Telegram 的 `disable_notification`，不保证客户端完全不出现通知横幅。
+
+## 独立故障提示
+
+可选的 `recovery_service.py` 使用独立用户服务监控消息接收器，不接收 Telegram 更新、不调用模型、不改写输入队列，也不自动重启接收器。遇到 `getUpdates` 轮询冲突等退出时，原程序先保存故障原因和受影响话题；独立服务在这些原话题发送故障提示及待处理消息、附件数量。接收恢复后更新同一条提示。没有可定位的工作话题时才回到原 Manager 根话题。
+
+在本机原有状态目录下另建 `recovery/config.json`，不要替换主 `config.json`：
+
+```json
+{
+  "enabled": true,
+  "mode": "alerts-only",
+  "interval_seconds": 5
+}
+```
+
+前台运行 `python3 recovery_service.py run --state-dir ~/.local/state/codex-telegram`；长期运行可将 [独立用户服务示例](contrib/codex-telegram-recovery.service) 安装为 `~/.config/systemd/user/codex-telegram-recovery.service`，按实际克隆目录修改路径，再执行 `systemctl --user daemon-reload` 和 `systemctl --user enable --now codex-telegram-recovery.service`。服务及其配置目录应仅对本机用户可读，使用主桥接已有 Bot 身份与白名单，不复制凭据。
+
+可用 `python3 recovery_service.py status` 查看独立健康状态，`journalctl --user -u codex-telegram-recovery.service` 查看日志。`python3 recovery_service.py probe --target 会话key` 会向当前绑定话题发送明确标记的测试提示并原地更新，不中断任务；测试不是实际故障。`manage.py` 另支持显式 `--state-dir` 和 `--session-name`，手动停止时写入短期维护标记，避免部署期间误报。
+
+仅告警模式不监听 HTTP 端口，不提供网页恢复按钮，也不启用 Funnel。轮询冲突持续时保持停止，由维护者查明重复接收器后恢复；不能用无限重启争抢同一个 Bot。机器停机、网络不可用或 Bot 凭据失效时，Telegram 提示可能无法送达，应同时检查本机独立服务健康状态。发送结果未知时保留记录、不盲目重复发送。
 
 ## 可选提醒示例
 
