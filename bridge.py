@@ -562,10 +562,9 @@ class Bridge:
         if len(argument.split()) != 1:
             return f"用法：{command} <{'模型 ID' if command == '/model' else '级别'}>。每次只设置一个参数。"
 
-        argument = argument.lower()
         note = ""
         if command == "/model":
-            selected = lookup.get(argument)
+            selected = lookup.get(argument.lower())
             if selected is None:
                 return f"模型不可用：{argument}\n发送 /model 查看当前可选模型。"
             choices = self.efforts(selected)
@@ -581,6 +580,10 @@ class Bridge:
             if current is None:
                 return "当前模型不在可选列表中，请先发送 /model 查看可用模型。"
             choices = self.efforts(current)
+            if argument not in choices:
+                matches = [choice for choice in choices if choice.casefold() == argument.casefold()]
+                if len(matches) == 1:
+                    argument = matches[0]
             if argument not in choices:
                 return f"当前模型不支持 effort：{argument}\n可选值：{', '.join(choices) or '默认'}"
             changes = {"effort": argument}
