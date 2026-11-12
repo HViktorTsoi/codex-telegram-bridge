@@ -1,4 +1,5 @@
 """Native question observation and exact-session answer submission."""
+import asyncio
 import hashlib
 import json
 import re
@@ -10,6 +11,7 @@ from bridge import RpcError, now_ms
 
 ANSWER_START = '<send_user_message_question_reply>'
 ANSWER_END = '</send_user_message_question_reply>'
+QUESTION_ANSWER_TIMEOUT = 30
 
 
 def answered_items(item):
@@ -93,21 +95,43 @@ class NativeQuestions:
         self.store.set(key, json.dumps(state))
 
     async def submit_question_answer(self, question, answers, client_id):
-        from choice_questions import ChoiceError
+        from choice_questions import AnswerNotSubmitted, ChoiceError
+        identity = -int(hashlib.sha256(('question-answer:' + client_id).encode()).hexdigest()[:15], 16) - 1
+        old = self.store.db.execute('SELECT client_id FROM inbox WHERE id=? OR client_id=?',
+                                    (identity, client_id)).fetchone()
+        if old is not None:
+            raise ChoiceError('这个答案已提交或等待核验，请勿重复发送。')
+        try:
+            return await asyncio.wait_for(
+                self._submit_question_answer(question, answers, client_id, identity), QUESTION_ANSWER_TIMEOUT)
+        except (asyncio.TimeoutError, ConnectionError, OSError, RpcError):
+            # An intent is committed before any mutating RPC. Its absence proves
+            # that a timeout while waiting for the lock or checking history is
+            # safe for the user to retry; an existing intent stays uncertain.
+            old = self.store.db.execute('SELECT client_id FROM inbox WHERE id=? OR client_id=?',
+                                        (identity, client_id)).fetchone()
+            if old is not None:
+                raise
+            raise AnswerNotSubmitted('等待或核验会话未完成，本次答案尚未提交，请稍后重试。') from None
+
+    async def _submit_question_answer(self, question, answers, client_id, identity):
+        from choice_questions import AnswerNotSubmitted, ChoiceError
         async with self.dispatch_lock:
             binding = (question.get('target_key'), question.get('thread_id'), question.get('topic_id'))
             current = (self.target['key'], self.thread_id, self.target['message_thread_id'])
             if (binding != current or self.target.get('topic_missing')
-                    or not self.owner_allowed() or not self.ready.is_set()):
-                raise ChoiceError('会话绑定或连接已变化，这个答案尚未提交。')
+                    or not self.owner_allowed()):
+                raise AnswerNotSubmitted('会话绑定已变化，这个答案尚未提交。', retryable=False)
+            if not self.ready.is_set():
+                raise AnswerNotSubmitted('会话尚未连接，这个答案尚未提交，请稍后重试。')
             if (question.get('kind') != 'async' or not isinstance(answers, list)
                     or len(answers) != len(question['questions'])
                     or any(not isinstance(answer, str) or not answer.strip() for answer in answers)):
-                raise ChoiceError('答案无效，请重新选择。')
+                raise AnswerNotSubmitted('答案无效，请重新选择。')
             turns = await self.codex.turns(limit=30)
             original = next((turn for turn in turns if turn['id'] == question['turn_id']), None)
             if not original:
-                raise ChoiceError('原问题已超出可核验的会话记录，请在 Codex 查看。')
+                raise AnswerNotSubmitted('原问题已超出可核验的会话记录，请在 Codex 查看。', retryable=False)
             source, answered = None, set()
             for turn in turns:
                 async for entry in self.codex.items(turn['id']):
@@ -115,24 +139,29 @@ class NativeQuestions:
                     answered.update(answered_items(item))
                     if turn['id'] == original['id'] and item.get('id') == question['item_id']:
                         source = item
+                # Answers can occur in the original turn or a newer one, never
+                # before their question. Older turns need no full-item reads.
+                if turn['id'] == original['id']:
+                    break
+            if source is None and getattr(self.codex, '_legacy_items', False):
+                source = await self.codex.question_source(question['turn_id'], question['item_id'])
             if (not source or source.get('type') != 'agentMessage' or source.get('delivery') != 'async'
                     or not source.get('questions')):
-                raise ChoiceError('无法核验原问题，请在 Codex 查看。')
+                raise AnswerNotSubmitted('无法核验原问题，请在 Codex 查看。', retryable=False)
             native_questions = source['questions']
             if (len(native_questions) != len(question['questions'])
                     or any(native.get('title') != expected['title']
                            or (native.get('options') or []) != expected['options']
                            for native, expected in zip(native_questions, question['questions']))):
-                raise ChoiceError('原问题内容已变化，请在 Codex 查看。')
+                raise AnswerNotSubmitted('原问题内容已变化，请在 Codex 查看。', retryable=False)
             if any((question['item_id'], index) in answered for index in range(len(answers))):
-                raise ChoiceError('这个问题已在 Codex 回答，请查看最新回复。')
+                raise AnswerNotSubmitted('这个问题已在 Codex 回答，请查看最新回复。', retryable=False)
             envelope = [{'questionItemId': json.dumps(
                             ['request_user_input_async', question['item_id'], index],
                             ensure_ascii=False, separators=(',', ':')),
                          'question': prompt['title'], 'answer': answer}
                         for index, (prompt, answer) in enumerate(zip(question['questions'], answers))]
             text = ANSWER_START + '\n' + json.dumps(envelope, ensure_ascii=False) + '\n' + ANSWER_END
-            identity = -int(hashlib.sha256(('question-answer:' + client_id).encode()).hexdigest()[:15], 16) - 1
             with self.store.db:
                 old = self.store.db.execute('SELECT client_id FROM inbox WHERE id=? OR client_id=?',
                                             (identity, client_id)).fetchone()
