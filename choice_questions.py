@@ -351,6 +351,12 @@ class ChoiceQuestions:
             params['message_thread_id'] = self._topic(origin)
         await self.router.telegram.call('sendMessage', **params)
 
+    def _queue_prompt(self, question):
+        # The partial answer and the next prompt intent are committed together.
+        # Existing cancelled, active or unknown sends must never be reopened.
+        self.db.execute("INSERT OR IGNORE INTO choice_prompt_claims VALUES(?,?,'queued')",
+                        (question['id'], question['position']))
+
     async def _other(self, question):
         with self.db:
             claim = self.db.execute('SELECT state FROM choice_prompt_claims WHERE question_id=? AND position=?',
@@ -360,9 +366,14 @@ class ChoiceQuestions:
             self.db.execute("INSERT INTO choice_prompt_claims VALUES(?,?,'creating') "
                             "ON CONFLICT(question_id,position) DO UPDATE SET state='creating'",
                             (question['id'], question['position']))
-        title = next(plain_chunks(question['questions'][question['position']]['title'], 3300))
+        item = question['questions'][question['position']]
+        body = item['title']
+        if item['options']:
+            body += '\n\n' + '\n'.join(f'{index + 1}. {label}' for index, label in enumerate(item['options']))
+        title = next(plain_chunks(body, 3300))
         params = {'chat_id': question['chat_id'], 'message_thread_id': question['topic_id'],
-                  'text': PROMPT_TITLE + '\n' + title + '\n\n请回复这条消息输入答案；/cancel 取消文字输入。',
+                  'text': PROMPT_TITLE + f" 第 {question['position'] + 1}/{len(question['questions'])} 题\n" + title
+                          + '\n\n请回复这条消息输入答案；也可使用当前问题的选项按钮。/cancel 取消文字输入。',
                   'reply_markup': {'force_reply': True, 'selective': True}}
         try:
             result = await self.router.telegram.call('sendMessage', **params)
@@ -379,12 +390,23 @@ class ChoiceQuestions:
                                 (question['id'], question['position']))
             raise
         with self.db:
-            self.db.execute("UPDATE choice_prompts SET state='closed' WHERE question_id=?", (question['id'],))
-            self.db.execute('INSERT INTO choice_prompts(chat_id,message_id,topic_id,bot_id,question_id,position) VALUES(?,?,?,?,?,?)',
+            latest = self.db.execute('SELECT state,position FROM choice_questions WHERE id=?', (question['id'],)).fetchone()
+            claim = self.db.execute('SELECT state FROM choice_prompt_claims WHERE question_id=? AND position=?',
+                                    (question['id'], question['position'])).fetchone()
+            current = bool(latest and latest['state'] == 'active' and latest['position'] == question['position']
+                           and claim and claim['state'] == 'creating')
+            if current:
+                try:
+                    self._bridge(question)
+                except ChoiceError:
+                    current = False
+            # A late acknowledgement still needs a registered (closed) prompt,
+            # so replies cannot accidentally enter the ordinary message route.
+            self.db.execute('INSERT INTO choice_prompts(chat_id,message_id,topic_id,bot_id,question_id,position,state) VALUES(?,?,?,?,?,?,?)',
                             (question['chat_id'], result['message_id'], question['topic_id'], question['bot_id'],
-                             question['id'], question['position']))
-            self.db.execute("UPDATE choice_prompt_claims SET state='active' WHERE question_id=? AND position=? AND state='creating'",
-                            (question['id'], question['position']))
+                             question['id'], question['position'], 'active' if current else 'closed'))
+            self.db.execute("UPDATE choice_prompt_claims SET state=? WHERE question_id=? AND position=? AND state='creating'",
+                            ('active' if current else 'closed', question['id'], question['position']))
 
     async def _answer(self, question, answer):
         bridge = self._bridge(question)
@@ -408,6 +430,8 @@ class ChoiceQuestions:
             if changed:
                 self.db.execute("UPDATE choice_prompts SET state='closed' WHERE question_id=?", (question['id'],))
                 self.db.execute("UPDATE choice_prompt_claims SET state='closed' WHERE question_id=?", (question['id'],))
+                if not final and (prompts or not question['questions'][question['position'] + 1]['options']):
+                    self._queue_prompt({**question, 'position': question['position'] + 1})
         if not changed:
             raise ChoiceError('这个问题已处理。')
         note = getattr(bridge, 'note_user_interaction', None)
@@ -469,8 +493,17 @@ class ChoiceQuestions:
     async def _reply(self, update):
         message = update['message']
         prompt = self._prompt(message)
-        if (not prompt or prompt['state'] != 'active' or prompt['bot_id'] != self.router.bot_id
+        if (not prompt or prompt['bot_id'] != self.router.bot_id
                 or prompt['topic_id'] != self._topic(message)):
+            raise ChoiceError('文字回答入口已失效，请使用当前问题的按钮。')
+        if prompt['state'] != 'active':
+            current = self._current(prompt['question_id'])
+            if current['position'] > prompt['position']:
+                with self.db:
+                    self._queue_prompt(current)
+                return await self._notice(message, f"第 {prompt['position'] + 1} 题已记录，当前是第 "
+                    f"{current['position'] + 1}/{len(current['questions'])} 题。请回复最新的文字回答提示，"
+                    '或使用当前问题的选项按钮；本条回复未作为下一题答案提交。')
             raise ChoiceError('文字回答入口已失效，请使用当前问题的按钮。')
         question = self._current(prompt['question_id'], prompt['position'])
         text = message.get('text', '').strip()
@@ -522,7 +555,7 @@ class ChoiceQuestions:
                               "AND state IN ('queued','active','answered','resolved','expired','uncertain') ORDER BY rowid LIMIT 1",
                               (time.time(),)).fetchone()
         if not row:
-            return False
+            return await self._flush_prompt()
         try:
             if row['state'] not in (*ACTIVE, *TERMINAL):
                 return False
@@ -559,11 +592,49 @@ class ChoiceQuestions:
             LOG.warning('Question display failed: %s', type(error).__name__)
         return True
 
+    async def _flush_prompt(self):
+        row = self.db.execute("SELECT q.* FROM choice_questions q JOIN choice_prompt_claims c "
+                              "ON c.question_id=q.id AND c.position=q.position "
+                              "WHERE c.state='queued' AND q.state='active' AND q.retry_at<=? ORDER BY q.rowid LIMIT 1",
+                              (time.time(),)).fetchone()
+        if not row:
+            return False
+        try:
+            question = self._current(row['id'], row['position'])
+            await self._other(question)
+        except ChoiceError:
+            with self.db:
+                self.db.execute("UPDATE choice_prompt_claims SET state='closed' WHERE question_id=? AND position=? "
+                                "AND state='queued'", (row['id'], row['position']))
+        except TelegramError as error:
+            # Prompt delivery is independent of the already saved answer and
+            # question card. A prompt refusal must not expire that question.
+            if error.code == 429:
+                with self.db:
+                    self.db.execute("UPDATE choice_prompt_claims SET state='queued' WHERE question_id=? AND position=? "
+                                    "AND state='closed' AND EXISTS(SELECT 1 FROM choice_questions "
+                                    "WHERE id=? AND state='active' AND position=?)",
+                                    (row['id'], row['position'], row['id'], row['position']))
+                    self.db.execute('UPDATE choice_questions SET retry_at=? WHERE id=?',
+                                    (time.time() + max(1, error.retry_after), row['id']))
+            LOG.warning('Question follow-up prompt refused: %s', error.code)
+        except Exception as error:
+            LOG.warning('Question follow-up prompt failed: %s', type(error).__name__)
+        return True
+
     def recover(self):
         with self.db:
             self.db.execute("UPDATE choice_jobs SET state='uncertain' WHERE state='processing'")
             self.db.execute("UPDATE choice_questions SET state='uncertain',dirty=1 WHERE state IN ('publishing','submitting')")
             self.db.execute("UPDATE choice_prompt_claims SET state='uncertain' WHERE state='creating'")
+            # Upgrade/restart recovery: restore the missing next input prompt,
+            # never an answer, for groups already advanced through free text.
+            for row in self.db.execute("SELECT * FROM choice_questions WHERE state='active' AND position>0").fetchall():
+                question = self._question(row)
+                previous = self.db.execute('SELECT 1 FROM choice_prompts WHERE question_id=? AND position=?',
+                                           (question['id'], question['position'] - 1)).fetchone()
+                if previous or not question['questions'][question['position']]['options']:
+                    self._queue_prompt(question)
 
     def sweep(self):
         for row in self.db.execute("SELECT * FROM choice_questions WHERE state IN ('queued','active')").fetchall():

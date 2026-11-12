@@ -106,6 +106,31 @@ class QuestionTests(unittest.IsolatedAsyncioTestCase):
         await self.ui.flush_one()
         return update
 
+    async def start_two_text_questions(self, next_options=None):
+        questions = [{'title': '第一个问题', 'options': []},
+                     {'title': '第二个问题', 'options': next_options or []}]
+        await self.ui.observe(self.bridge, 'turn-1', self.item(questions=questions))
+        await self.ui.flush_one()
+        await self.click(label='自行输入')
+        return copy.deepcopy(self.messages[self.sequence])
+
+    async def answer_prompt(self, prompt, text):
+        self.sequence += 1
+        update = {'update_id': self.sequence, 'message': {
+            'message_id': self.sequence, 'from': {'id': 123}, 'chat': {'id': 123, 'type': 'private'},
+            'message_thread_id': 42, 'text': text, 'reply_to_message': copy.deepcopy(prompt)}}
+        self.assertTrue(self.ui.ingest(update))
+        await self.ui.handle_one()
+        return update
+
+    def prompt_claim(self, position):
+        return self.router.store.db.execute('SELECT * FROM choice_prompt_claims WHERE question_id=? AND position=?',
+                                            (self.row()['id'], position)).fetchone()
+
+    def force_reply_attempts(self):
+        return [params for method, params in self.calls if method == 'sendMessage'
+                and params.get('reply_markup', {}).get('force_reply')]
+
     async def sync(self, request_id='request-1'):
         params = {'threadId': self.bridge.thread_id, 'turnId': 'turn-1', 'itemId': 'sync-item',
                   'questions': [{'id': 'q-id', 'header': '方案', 'question': '同步选择？',
@@ -229,6 +254,197 @@ class QuestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.ui.ingest({'update_id': 803, 'message': message}))
         await self.ui.handle_one()
         self.assertEqual(self.native[0][2], ['自定义答案'])
+
+    async def test_partial_text_answer_queues_next_free_reply_without_submitting(self):
+        first = await self.start_two_text_questions()
+        update = await self.answer_prompt(first, '没有；没有')
+        self.assertEqual(json.loads(self.row()['answers']), ['没有；没有'])
+        self.assertEqual((self.row()['position'], self.row()['state']), (1, 'active'))
+        self.assertEqual(self.prompt_claim(1)['state'], 'queued')
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_jobs WHERE id=?',
+                                                     (update['update_id'],)).fetchone()[0], 'done')
+        self.assertEqual(self.native, [])
+        self.assertTrue(await self.ui.flush_one())  # Refresh the existing question panel.
+        self.assertTrue(await self.ui.flush_one())  # Publish the queued next input prompt.
+        second = copy.deepcopy(self.messages[self.sequence])
+        self.assertTrue(second['reply_markup']['force_reply'])
+        self.assertIn('2/2', second['text'])
+        self.assertIn('第二个问题', second['text'])
+        self.assertNotEqual(first['message_id'], second['message_id'])
+        await self.answer_prompt(second, '目前都没有')
+        self.assertEqual(self.native[0][2], ['没有；没有', '目前都没有'])
+        self.assertEqual(len(self.native), 1)
+
+    async def test_text_input_continues_for_next_question_with_options(self):
+        first = await self.start_two_text_questions(['甲', '乙'])
+        await self.answer_prompt(first, '没有')
+        await self.ui.flush_one()
+        await self.ui.flush_one()
+        second = copy.deepcopy(self.messages[self.sequence])
+        self.assertTrue(second['reply_markup']['force_reply'])
+        self.assertIn('2/2', second['text'])
+        self.assertIn('甲', second['text'])
+        self.assertIn('乙', second['text'])
+        self.assertTrue(self.panel()['reply_markup']['inline_keyboard'])
+        await self.answer_prompt(second, '目前都没有')
+        self.assertEqual(self.native[0][2], ['没有', '目前都没有'])
+
+    async def test_button_answer_queues_prompt_when_next_question_has_no_options(self):
+        questions = [{'title': '选择方案', 'options': ['甲', '乙']},
+                     {'title': '补充说明', 'options': []}]
+        await self.ui.observe(self.bridge, 'turn-1', self.item(questions=questions))
+        await self.ui.flush_one()
+        await self.click(label='1. 甲')
+        self.assertEqual(self.prompt_claim(1)['state'], 'queued')
+        self.assertEqual(self.native, [])
+        await self.ui.flush_one()
+        prompt = copy.deepcopy(self.messages[self.sequence])
+        self.assertTrue(prompt['reply_markup']['force_reply'])
+        self.assertIn('补充说明', prompt['text'])
+        await self.answer_prompt(prompt, '补充答案')
+        self.assertEqual(self.native[0][2], ['甲', '补充答案'])
+
+    async def test_manual_input_claims_queued_prompt_before_display_without_duplicates(self):
+        first = await self.start_two_text_questions(['甲', '乙'])
+        await self.answer_prompt(first, '第一条答案')
+        await self.ui.flush_one()
+        await self.click(label='自行输入')
+        self.assertEqual(self.prompt_claim(1)['state'], 'active')
+        self.assertFalse(await self.ui.flush_one())
+        self.assertEqual(len(self.force_reply_attempts()), 2)
+        self.assertEqual(json.loads(self.row()['answers']), ['第一条答案'])
+
+    async def test_restart_during_prompt_creation_does_not_resend(self):
+        first = await self.start_two_text_questions()
+        await self.answer_prompt(first, '第一条答案')
+        self.router.store.db.execute("UPDATE choice_prompt_claims SET state='creating' WHERE position=1")
+        self.ui = ChoiceQuestions(self.router)
+        self.ui.recover()
+        self.assertEqual(self.prompt_claim(1)['state'], 'uncertain')
+        await self.ui.flush_one()
+        self.assertFalse(await self.ui.flush_one())
+        self.assertEqual(len(self.force_reply_attempts()), 1)
+        self.assertEqual(json.loads(self.row()['answers']), ['第一条答案'])
+        self.assertEqual(self.native, [])
+
+    async def test_queued_next_prompt_survives_restart_and_sends_once(self):
+        first = await self.start_two_text_questions()
+        await self.answer_prompt(first, '第一条答案')
+        self.ui = ChoiceQuestions(self.router)
+        self.ui.recover()
+        self.assertEqual(self.prompt_claim(1)['state'], 'queued')
+        await self.ui.flush_one()
+        await self.ui.flush_one()
+        self.assertEqual(self.prompt_claim(1)['state'], 'active')
+        self.ui = ChoiceQuestions(self.router)
+        self.ui.recover()
+        self.assertFalse(await self.ui.flush_one())
+        self.assertEqual(len(self.force_reply_attempts()), 2)
+        self.assertEqual(json.loads(self.row()['answers']), ['第一条答案'])
+        self.assertEqual(self.native, [])
+
+    async def test_upgrade_queues_missing_next_prompt_without_replaying_saved_answer(self):
+        first = await self.start_two_text_questions(['甲', '乙'])
+        update = await self.answer_prompt(first, '没有；没有')
+        await self.ui.flush_one()
+        self.router.store.db.execute('DELETE FROM choice_prompt_claims WHERE question_id=? AND position=1',
+                                     (self.row()['id'],))
+        self.assertIsNone(self.prompt_claim(1))
+        self.assertEqual(self.row()['dirty'], 0)
+        self.ui = ChoiceQuestions(self.router)
+        self.ui.recover()
+        self.assertEqual(self.prompt_claim(1)['state'], 'queued')
+        await self.ui.flush_one()
+        second = copy.deepcopy(self.messages[self.sequence])
+        self.assertTrue(second['reply_markup']['force_reply'])
+        self.assertIn('2/2', second['text'])
+        self.assertIn('甲', second['text'])
+        self.assertEqual(self.prompt_claim(1)['state'], 'active')
+        self.assertEqual(json.loads(self.row()['answers']), ['没有；没有'])
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_jobs WHERE id=?',
+                                                     (update['update_id'],)).fetchone()[0], 'done')
+        self.assertEqual(self.native, [])
+        self.ui.recover()
+        self.assertFalse(await self.ui.flush_one())
+        self.assertEqual(len(self.force_reply_attempts()), 2)
+
+    async def test_unknown_next_prompt_send_never_replays_or_loses_partial_answer(self):
+        first = await self.start_two_text_questions()
+        update = await self.answer_prompt(first, '第一条答案')
+        await self.ui.flush_one()
+        self.send_error = ConnectionError('acknowledgement lost')
+        await self.ui.flush_one()
+        self.assertEqual(self.prompt_claim(1)['state'], 'uncertain')
+        self.assertEqual((self.row()['state'], self.row()['position']), ('active', 1))
+        self.assertEqual(json.loads(self.row()['answers']), ['第一条答案'])
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_jobs WHERE id=?',
+                                                     (update['update_id'],)).fetchone()[0], 'done')
+        self.send_error = None
+        self.ui = ChoiceQuestions(self.router)
+        self.ui.recover()
+        await self.ui.flush_one()
+        await self.answer_prompt(first, '误回旧题')
+        await self.ui.flush_one()
+        await self.click(label='自行输入')
+        self.assertEqual(self.prompt_claim(1)['state'], 'uncertain')
+        self.assertEqual(len(self.force_reply_attempts()), 2)
+        self.assertEqual(json.loads(self.row()['answers']), ['第一条答案'])
+        self.assertEqual(self.native, [])
+
+    async def test_rate_limited_next_prompt_retries_without_expiring_question(self):
+        first = await self.start_two_text_questions()
+        await self.answer_prompt(first, '第一条答案')
+        await self.ui.flush_one()
+        self.send_error = TelegramError('sendMessage', 429, 'Too Many Requests', retry_after=20)
+        started = time.time()
+        await self.ui.flush_one()
+        self.assertEqual(self.prompt_claim(1)['state'], 'queued')
+        self.assertEqual(self.row()['state'], 'active')
+        self.assertGreaterEqual(self.row()['retry_at'], started + 20)
+        self.assertFalse(await self.ui.flush_one())
+        self.router.store.db.execute('UPDATE choice_questions SET retry_at=0')
+        self.send_error = None
+        await self.ui.flush_one()
+        self.assertEqual(self.prompt_claim(1)['state'], 'active')
+        self.assertEqual(json.loads(self.row()['answers']), ['第一条答案'])
+        self.assertEqual(self.native, [])
+
+    async def test_reply_to_prior_prompt_does_not_answer_current_question(self):
+        first = await self.start_two_text_questions(['甲', '乙'])
+        await self.answer_prompt(first, '第一条答案')
+        await self.ui.flush_one()
+        await self.ui.flush_one()
+        await self.answer_prompt(first, '目前都没有')
+        self.assertEqual(json.loads(self.row()['answers']), ['第一条答案'])
+        self.assertEqual((self.row()['state'], self.row()['position']), ('active', 1))
+        self.assertEqual(self.prompt_claim(1)['state'], 'active')
+        self.assertEqual(self.native, [])
+        notice = self.calls[-1][1]['text']
+        self.assertRegex(notice, r'第\s*1\s*题.*已记录')
+        self.assertRegex(notice, r'第\s*2(?:/2)?\s*题')
+        self.assertEqual(len(self.force_reply_attempts()), 2)
+
+    async def test_next_prompt_ack_does_not_reopen_question_resolved_during_send(self):
+        first = await self.start_two_text_questions()
+        await self.answer_prompt(first, '第一条答案')
+        await self.ui.flush_one()
+
+        async def resolve_during_send():
+            await self.ui.observe(self.bridge, 'native-answer-turn', self.native_answer())
+
+        self.on_send = resolve_during_send
+        await self.ui.flush_one()
+        self.on_send = None
+        self.assertEqual(self.row()['state'], 'resolved')
+        self.assertEqual(self.prompt_claim(1)['state'], 'closed')
+        second = copy.deepcopy(self.messages[self.sequence])
+        prompt = self.router.store.db.execute('SELECT state FROM choice_prompts WHERE message_id=?',
+                                             (second['message_id'],)).fetchone()
+        self.assertIsNotNone(prompt)
+        self.assertEqual(prompt['state'], 'closed')
+        await self.answer_prompt(second, '过时回复')
+        self.assertEqual(self.row()['state'], 'resolved')
+        self.assertEqual(self.native, [])
 
     async def test_native_answer_prevents_old_question_and_closes_existing_one(self):
         await self.ui.observe(self.bridge, 'answer-turn', self.native_answer(), replay=True)
