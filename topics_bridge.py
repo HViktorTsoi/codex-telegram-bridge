@@ -414,6 +414,7 @@ class TargetBridge(NativeQuestions, Bridge):
         if command in {"/help", "/start", "/sessions"}:
             reply = (self.sessions_text() + "\n\n进入对应话题即可继续原会话。\n"
                      "All 普通消息选择接收会话即发送；/sessions → 待发送可找回未发内容。\n"
+                     "在 All 回复已有话题消息可直接发到对应会话，仅发送新内容。\n"
                      "/sessions 查看会话并添加绑定\n"
                      "/skills 查看本机会话可用技能并选择使用\n"
                      "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
@@ -747,7 +748,7 @@ class TopicRouter:
             ready = self.bridges.get(key) and self.bridges[key].ready.is_set()
             state = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
             lines.append(f"• {target['name']}（{state}）")
-        lines.append("All 是管理入口；普通消息选择接收会话后立即发送。")
+        lines.append("All 回复话题消息直接发送到对应会话；其他普通消息选择接收会话后立即发送。")
         return "\n".join(lines)
 
     def ingest(self, update):

@@ -1,4 +1,4 @@
-"""Hold ordinary All-chat messages until an exact destination is selected."""
+"""Resolve All replies to exact local topics; hold other messages for selection."""
 import copy
 import json
 import secrets
@@ -7,7 +7,7 @@ import time
 from attachments import payload_from
 from bridge import permitted
 from message_format import plain_chunks, utf16_size
-from reply_context import snapshot as reply_snapshot, serialized as reply_serialized, render as render_reply
+from reply_context import serialized as reply_serialized, render as render_reply
 from session_picker import BindingError, clean_name
 
 
@@ -27,11 +27,101 @@ class MainChatGuard:
                 selection_json TEXT,selected_revision INTEGER,panel_id INTEGER,last_at REAL,
                 expires_at REAL,presented_revision INTEGER DEFAULT 0,error TEXT,confirmed_at REAL);
             CREATE TABLE IF NOT EXISTS main_guard_messages(
-                update_id INTEGER PRIMARY KEY,draft_id TEXT,payload TEXT,reply_json TEXT,received_at REAL);
+                update_id INTEGER PRIMARY KEY,draft_id TEXT,payload TEXT,reply_json TEXT,received_at REAL,
+                reply_binding_json TEXT);
         ''')
         if 'confirmed_at' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_drafts)')}:
             self.db.execute('ALTER TABLE main_guard_drafts ADD COLUMN confirmed_at REAL')
-            self.db.commit()
+        if 'reply_binding_json' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_messages)')}:
+            self.db.execute('ALTER TABLE main_guard_messages ADD COLUMN reply_binding_json TEXT')
+        self.db.commit()
+
+    def _reply_binding(self, message):
+        """Freeze an explicit same-chat reply destination without reading its body.
+
+        None is a neutral album member; an empty object is an unresolved or
+        unsafe reference which prevents automatic routing of the whole album.
+        """
+        parent = message.get('reply_to_message')
+        external = message.get('external_reply')
+        if external:
+            if parent or not isinstance(external, dict):
+                return {}
+            chat, identity = external.get('chat'), external.get('message_id')
+            if (not isinstance(chat, dict) or type(chat.get('id')) is not int
+                    or str(chat['id']) != str(message['chat']['id'])
+                    or chat.get('type', 'private') != 'private'
+                    or type(identity) is not int or identity <= 0):
+                return {}
+            return self._known_reply_binding(identity)
+        if not isinstance(parent, dict) or not parent:
+            return {} if message.get('quote') else None
+        if any(key in parent for key in self.SERVICES):
+            return {}
+        parent_id, topic_id = parent.get('message_id'), parent.get('message_thread_id')
+        if type(parent_id) is not int or parent_id <= 0:
+            return {}
+        if 'chat' in parent:
+            chat = parent['chat']
+            if (not isinstance(chat, dict) or type(chat.get('id')) is not int
+                    or str(chat['id']) != str(message['chat']['id'])
+                    or chat.get('type', 'private') != 'private'):
+                return {}
+        if topic_id is None:
+            return self._known_reply_binding(parent_id)
+        if type(topic_id) is not int or topic_id <= 0:
+            return {}
+        target = self.router.by_topic.get(topic_id)
+        if not target or target.get('message_thread_id') != topic_id:
+            return {}
+        binding = self._binding(target)
+        try:
+            self._validate(binding)
+        except BindingError:
+            return {}
+        return binding
+
+    def _known_reply_binding(self, message_id):
+        """Resolve a missing topic only from this Bot's exact durable message IDs."""
+        matches = []
+        for target in self.router.targets.values():
+            binding = self._binding(target)
+            try:
+                self._validate(binding)
+            except BindingError:
+                continue
+            store = self.router.bridges[target['key']].store
+            topic_id, owner = binding['message_thread_id'], str(self.router.owner)
+            known = store.db.execute('SELECT 1 FROM outbox WHERE message_id=? AND chat_id=? '
+                                     'AND message_thread_id=? LIMIT 1', (message_id, owner, topic_id)).fetchone()
+            known = known or store.db.execute('SELECT 1 FROM inbox WHERE source_message_id=? AND chat_id=? '
+                                              'AND message_thread_id=? LIMIT 1', (message_id, owner, topic_id)).fetchone()
+            if not known:
+                for row in store.db.execute("SELECT value FROM kv WHERE key LIKE 'completion_preview_v1:%'"):
+                    try:
+                        preview = json.loads(row['value'])
+                    except (ValueError, TypeError):
+                        continue
+                    if (isinstance(preview, dict) and preview.get('message_id') == message_id
+                            and preview.get('route') == [binding['thread_id'], owner, topic_id]
+                            and preview.get('delivery') == 'sent' and not preview.get('closed')
+                            and preview.get('cleanup_state') != 'deleted'):
+                        known = True
+                        break
+            if known:
+                matches.append(binding)
+        return matches[0] if len(matches) == 1 else {}
+
+    def _reply_selection(self, draft):
+        members = self._members(draft['id'])
+        # SQL NULL marks a draft accepted before this routing policy existed.
+        # A new album part must not silently authorize sending those old rows.
+        if any(row['reply_binding_json'] is None for row in members):
+            return None
+        bindings = [value for row in members if (value := json.loads(row['reply_binding_json'])) is not None]
+        if not bindings or not bindings[0] or any(value != bindings[0] for value in bindings):
+            return None
+        return bindings[0]
 
     def _save(self, draft_id, **values):
         allowed = {'state', 'revision', 'selection_json', 'selected_revision', 'panel_id', 'last_at',
@@ -96,9 +186,12 @@ class MainChatGuard:
                     self.db.execute('INSERT INTO main_guard_drafts '
                                     '(id,chat_id,album_id,state,revision,last_at,expires_at) VALUES(?,?,?,?,?,?,?)',
                                     (draft_id, chat_id, album_id, 'held', 1, now, now + self.TTL))
-                self.db.execute('INSERT INTO main_guard_messages VALUES(?,?,?,?,?)',
+                reply_binding = self._reply_binding(message)
+                self.db.execute('INSERT INTO main_guard_messages '
+                                '(update_id,draft_id,payload,reply_json,received_at,reply_binding_json) VALUES(?,?,?,?,?,?)',
                                 (update['update_id'], draft_id, json.dumps(update, ensure_ascii=False),
-                                 json.dumps(reply_snapshot(message), ensure_ascii=False), now))
+                                 'null', now,
+                                 json.dumps(reply_binding, sort_keys=True)))
                 self.db.execute('INSERT OR IGNORE INTO ui_jobs(id,payload) VALUES(?,?)',
                                 (update['update_id'], json.dumps(update, ensure_ascii=False)))
             self.db.execute("UPDATE kv SET value=? WHERE key='offset'",
@@ -205,6 +298,22 @@ class MainChatGuard:
             return await self._panel(update, 'All · 待发送消息已过期\n原文和附件仍保留，请重新选择接收会话。\n\n' + self._preview(draft),
                                      [[('重新选择', 'main:choose', {'id': draft['id']})],
                                       [('取消', 'main:cancel', {'id': draft['id']})]], draft)
+        selected = self._reply_selection(draft)
+        if selected:
+            try:
+                self._validate(selected)
+                if draft['album_id'] and self.clock() - draft['last_at'] < 2:
+                    return
+                # The user's explicit reply selects the destination. Freeze the
+                # same durable handoff used by the destination buttons.
+                self._save(draft['id'], state='releasing',
+                           selection_json=json.dumps(selected, ensure_ascii=False, sort_keys=True),
+                           selected_revision=draft['revision'], confirmed_at=self.clock())
+                self._release(self._draft(draft['id']))
+                return
+            except BindingError as error:
+                self._save(draft['id'], state='held', selection_json=None,
+                           selected_revision=None, error=str(error))
         return await self._selector(update, draft)
 
     async def listing(self, update, page=0):
@@ -266,7 +375,8 @@ class MainChatGuard:
                         or existing['state'] in ('denied', 'cancelled', 'blocked', 'failed')):
                     raise BindingError('原投递标识已存在或已被拒绝，未覆盖旧任务；请核对后取消并重新发送。')
             else:
-                bridge.store.accept({'update_id': row['update_id']}, message, reply_context=context, guard_binding=binding)
+                bridge.store.accept({'update_id': row['update_id']}, message,
+                                    reply_context=context if context is not None else {}, guard_binding=binding)
             # Mirror the user's text into the selected Telegram topic,
             # including on recovery after input import but before outbox commit.
             # This distinct key retains literal source text for quote rendering

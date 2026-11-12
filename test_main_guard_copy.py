@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from message_format import utf16_size
-from reply_context import render
+from reply_context import render, snapshot
 import test_main_guard as fixtures
 from topics_bridge import TopicRouter
 
@@ -113,9 +113,14 @@ class MainGuardCopyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.copies()), 1)
         self.assertEqual(len(self.inbox()), 1)
 
-    async def test_copy_uses_saved_readable_quote_without_changing_native_input(self):
+    async def test_legacy_draft_keeps_saved_readable_quote_without_changing_native_input(self):
         update, panel = await self.send('翻译选中部分', reply_to_message={
             'message_id': 80, 'text': '包含选中部分的原始正文'}, quote={'text': '选中部分', 'position': 2})
+        # Drafts already accepted before All reply routing retain their exact
+        # saved input when the owner later selects their destination.
+        with self.router.store.db:
+            self.router.store.db.execute('UPDATE main_guard_messages SET reply_json=?,reply_binding_json=NULL '
+                'WHERE update_id=?', (json.dumps(snapshot(update['message']), ensure_ascii=False), update['update_id']))
         update['message']['reply_to_message']['text'] = '后来修改的调用方对象'
         await self.confirm(panel)
         row = self.inbox()[0]

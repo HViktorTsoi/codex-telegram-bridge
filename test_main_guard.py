@@ -158,19 +158,17 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row['message_thread_id'], 22)
         self.assertEqual(self.inbox('meeting'), [])
 
-    async def test_quoted_main_message_preserves_snapshot_and_routes_to_chosen_topic(self):
-        update, panel = await self.send('修改这里', reply_to_message={
+    async def test_quoted_main_message_uses_parent_topic_without_sending_quoted_content(self):
+        update, _ = await self.send('修改这里', reply_to_message={
             'message_id': 80, 'message_thread_id': 22, 'text': '另一个话题的原始引用内容'},
             quote={'text': '原始引用', 'position': 6})
-        await self.confirm(panel, '会议记录')
-        row = self.inbox('meeting')[0]
-        context = json.loads(row['reply_json'])
+        row = self.inbox()[0]
         self.assertEqual(row['text'], '修改这里')
-        self.assertEqual(row['message_thread_id'], 11)
-        self.assertEqual(context['reply_to_message_id'], 80)
-        self.assertEqual(context['reply_to_thread_id'], 22)
-        self.assertEqual(context['quote'], '原始引用')
-        self.assertEqual(self.inbox(), [])
+        self.assertEqual(row['id'], update['update_id'])
+        self.assertEqual(row['message_thread_id'], 22)
+        self.assertFalse(json.loads(row['reply_json']) if row['reply_json'] else None)
+        self.assertEqual(self.router.picker.guard.pending_count(), 0)
+        self.assertEqual(self.inbox('meeting'), [])
 
     async def test_owner_and_callback_context_checks_cannot_be_bypassed(self):
         await self.send('外人不应产生草稿', sender=999)
@@ -440,26 +438,26 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assert_held()
         self.assertEqual(self.router.picker.guard.pending_count(), 0)
 
-    async def test_quoted_old_photo_is_context_only_and_only_new_photo_downloads_after_confirmation(self):
+    async def test_all_reply_routes_new_photo_without_downloading_or_quoting_the_old_photo(self):
         from test_outgoing_images import PNG
         photo = self.path / 'downloaded.png'
         photo.write_bytes(PNG)
-        _, panel = await self.send('', caption='分析这张新图', photo=[{'file_id': 'new-photo'}],
+        await self.send('', caption='分析这张新图', photo=[{'file_id': 'new-photo'}],
                                    reply_to_message={'message_id': 77, 'message_thread_id': 11,
                                                      'caption': '旧图仅作引用', 'photo': [{'file_id': 'old-photo'}]})
-        await self.confirm(panel)
-        child = self.router.bridges['instagram']
+        child = self.router.bridges['meeting']
         child.codex = type('Native', (), {'call': AsyncMock(return_value={'turn': {'id': 'photo-turn'}})})()
         with patch('attachments.download', new=AsyncMock(return_value=photo)) as download:
             await child.dispatch_one(child.store.pending())
         download.assert_awaited_once()
         self.assertEqual(download.call_args.args[1]['file_id'], 'new-photo')
         method, params = child.codex.call.call_args.args
-        self.assertEqual((method, params['threadId']), ('turn/start', 'instagram-native'))
+        self.assertEqual((method, params['threadId']), ('turn/start', 'meeting-native'))
         self.assertEqual(sum(c['type'] == 'localImage' for c in params['input']), 1)
         self.assertIn('分析这张新图', params['input'][0]['text'])
-        self.assertIn('旧图仅作引用', params['input'][0]['text'])
-        self.assertIn('［引用内容］', params['input'][0]['text'])
+        self.assertNotIn('旧图仅作引用', params['input'][0]['text'])
+        self.assertNotIn('［引用内容］', params['input'][0]['text'])
+        self.assertEqual(self.router.picker.guard.pending_count(), 0)
 
 
 if __name__ == '__main__':

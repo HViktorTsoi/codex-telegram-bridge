@@ -39,23 +39,26 @@ Add these fields (the IDs below are placeholders):
 ```
 
 The original top-level `thread_id` must match `root_target`, which retains the
-original session and main-chat system-command context. Ordinary topic-less All
-messages are held until explicit target selection, which sends them immediately, rather
-than automatically using that root or the most recent session.
+original session and main-chat system-command context. A topic-less All reply to
+a message in a currently bound local topic selects that exact destination and
+sends directly. Other ordinary All messages are held until explicit target
+selection, rather than automatically using the root or most recent session.
 `initial_telegram_offset` must come from the
 old collector's database after a clean stop with an empty queue; it is used only
 when creating `topics.sqlite` for the first time. Preserve the original database
 and its backups. Do not change a target key to a different native thread: each
 target database records its native ID and refuses such reuse.
 
-Explicit replies append readable quoted material after two newlines within the
-same native text input. Selected passages come first, followed by the parent
+Explicit replies inside a bound topic append readable quoted material after two
+newlines within the same native text input. Selected passages come first, followed by the parent
 body for context; identical passages are not repeated. Rich bodies are flattened
 to readable text. Message/topic IDs remain in private storage and are omitted
 from the model prompt. Routing still follows the incoming topic, or an explicit
 local alias dispatch. Quoted attachments are described,
 never downloaded again. A topic's implicit creation-message reference adds no
-context. Unquoted inputs and command/media classification remain unchanged.
+context. For ordinary topic-less All input, the parent reply identifies a route
+only; its body and selected quote are omitted from native input and the topic
+echo. Unquoted inputs and command/media classification remain unchanged.
 The additive `inbox.reply_json` column is stored atomically with each input;
 existing queued rows need no backfill and continue with their original input.
 
@@ -159,23 +162,40 @@ the exact message/topic checks on callbacks and ForceReply prompts. Regular
 output and activity indicators keep their original topics; already queued output
 retains its stored destination.
 
-All's ordinary text and media use a durable held-message selector. Each text
-message is independent; an album is grouped after two seconds of quiet. The
-selector shows the message preview. Choosing a local bound target immediately
-imports the original message(s) into that exact native thread/topic queue, with
-no second confirmation page. No attachment download or model request occurs
-before selection. A late album member arriving before selection invalidates
-the old selection buttons; members arriving after handoff require a fresh choice.
-The original content and reply snapshot are retained before rewriting the
-destination topic. Replies stay in the selected topic, without main-chat relay.
+An ordinary topic-less All reply to a same-chat message in a currently bound
+local topic goes directly to that topic's native input queue, without target
+selection or a confirmation page. Only the newly written text and new attachments
+are passed to Codex. The parent body and selected quote are neither model input
+nor topic echo. Replies inside an existing topic keep their original quoted
+context behavior.
+
+Other ordinary All text and media use a durable held-message selector. Each text
+message is independent; an album is grouped after two seconds of quiet. A group
+whose first member replies to a bound topic can include later unquoted members
+in the same direct handoff. Conflicting or invalid references require selection.
+The selector shows the message preview; choosing a local bound target immediately
+imports the original message(s) with no second confirmation page. Unknown or
+deleted topics, foreign-chat references, unresolved external replies and changed bindings
+never select another target automatically. No attachment download or model
+request occurs before the destination is resolved. A late album member arriving
+before selection invalidates old buttons; members arriving after handoff require
+a fresh choice. Replies stay in the selected topic, without main-chat relay.
 Find held content under `/sessions` → **待发送**. Cancelled, expired or stale UI
 never falls back to the root session. Creator and dispatch ForceReply inputs,
 plain-text explicit aliases and slash commands retain their existing paths.
 Main-chat media captions cannot run slash or alias commands.
 
-Selection also queues the original text or media caption in the selected
-Telegram topic, prefixed with `📩 你在 All 说：` and followed by the saved readable
-reply context. This plain-text copy uses a durable, deduplicated outbox key;
+If Telegram omits the parent topic, a same-chat external or ordinary reply can
+still resolve through this Bot's uniquely recorded message ID, including an
+acknowledged preview. Missing identity, ambiguous records and deleted previews
+retain the selector. Message text, sender names and external origins never serve
+as routing evidence.
+
+Direct reply routing or target selection also queues the new text or media
+caption in the selected Telegram topic, prefixed with `📩 你在 All 说：`.
+Rich rendering leaves this heading as ordinary text and quotes only the user's
+body; parent reply context is not appended for new ordinary All input.
+This copy uses a durable, deduplicated outbox key;
 recovery can complete it after input import without importing the native input
 again or starting another model turn. It copies text only, leaving attachment
 delivery to Codex on the existing path. Unselected/cancelled drafts do not send
