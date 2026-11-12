@@ -1,5 +1,17 @@
 # One Bot, multiple local Codex conversations
 
+Topic mode includes a chat-wide persistent reply keyboard with eight command
+shortcuts: Sessions, Tasks, Inbox, Model, Effort, Skills, Stop and Help. Commands
+retain the topic on the incoming button message, never the topic where the
+keyboard was installed. Global menus still respond in All. One quiet All message
+installs the keyboard per verified Bot/owner/layout; restarts reuse its durable
+acknowledgement. Keep that installation message. `/keyboard` explicitly installs
+it again if the client hides or replaces it after a ForceReply flow. Set
+`quick_keyboard: false` to disable this feature. Regular inline status and option
+buttons stay on their own messages. Exact reserved emoji labels are text command
+aliases; media captions, forwarded text and replies to managed input prompts are
+not normalized. Keyboard installation and menu queries never start a model turn.
+
 `topics_bridge.py` reuses the single-thread bridge's native socket, attachment
 handling and durable recovery. One Telegram poller routes the owner's private
 topics to separate target queues and Codex subscriptions. Binding and repairing

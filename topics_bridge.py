@@ -421,6 +421,7 @@ class TargetBridge(NativeQuestions, Bridge):
                      "/status 查看此会话及完整 ID\n/model 按钮选择此会话模型\n"
                      "/effort 按钮选择此会话强度\n/stop 停止此会话的当前任务\n"
                      "/format 按钮选择回复格式；也支持 /format rich 或 /format plain\n"
+                     "/keyboard 重新显示输入框下方的常用按钮\n"
                      "支持图片、文件和相册；附件上限20MB。语音视频暂按文件接收。\n"
                      "未绑定话题不会创建或改用其他 Codex 会话。")
         elif command == "/status":
@@ -729,6 +730,8 @@ class TopicRouter:
         self.questions = ChoiceQuestions(self)
         from settings_menu import SettingsMenu
         self.settings_menu = SettingsMenu(self)
+        from quick_keyboard import QuickKeyboard
+        self.keyboard = QuickKeyboard(self)
         for bridge in self.bridges.values():
             bridge.questions = self.questions
 
@@ -752,6 +755,14 @@ class TopicRouter:
         return "\n".join(lines)
 
     def ingest(self, update):
+        message = update.get('message', {})
+        protected = False
+        if not update.get('callback_query') and permitted(message, self.access(), self.owner):
+            protected = self._keyboard_prompt_reply(update)
+            from quick_keyboard import normalize_update
+            update = normalize_update(update, protected=protected or not self.keyboard.enabled)
+        if not protected and self.keyboard.ingest(update):
+            return
         if self.settings_menu.ingest(update):
             return
         if self.questions.ingest(update):
@@ -788,6 +799,18 @@ class TopicRouter:
             target = self.by_topic.get(topic_id) if topic_id else self.root_target
         error = None if target else "此话题尚未绑定 Codex 会话。发送 /sessions 可选择已有会话并创建绑定话题。"
         self.store.accept(update, message, target, error)
+
+    def _keyboard_prompt_reply(self, update):
+        """Prompt data takes precedence over reserved keyboard button labels."""
+        message = update.get('message', {})
+        parent = message.get('reply_to_message') or {}
+        if not isinstance(parent, dict) or not parent:
+            return False
+        if (self.picker.creator.is_reply(update) or self.picker.renamer.is_reply(update)
+                or self.skills._prompt_reply(message) or self.questions._prompt(message)):
+            return True
+        return bool(self.store.db.execute('SELECT 1 FROM cc_prompts WHERE message_id=? AND chat_id=?',
+            (parent.get('message_id'), str(message.get('chat', {}).get('id')))).fetchone())
 
     def forward_one(self):
         row = self.store.pending()
@@ -1111,7 +1134,8 @@ class TopicRouter:
             from control_center import COMMANDS
             commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'},
                         {'command': 'rename', 'description': '修改会话名称，同步话题名称'},
-                        {'command': 'skills', 'description': '查看本机会话技能并选择使用'}, *COMMANDS]
+                        {'command': 'skills', 'description': '查看本机会话技能并选择使用'},
+                        {'command': 'keyboard', 'description': '显示底部常用按钮'}, *COMMANDS]
             if await self.telegram.call('getMyCommands', scope=scope) != commands:
                 await self.telegram.call('setMyCommands', scope=scope, commands=commands)
             self.failure = asyncio.get_running_loop().create_future()
@@ -1122,6 +1146,7 @@ class TopicRouter:
                 self.skills.recover()
                 self.questions.recover()
                 self.settings_menu.recover()
+                self.keyboard.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
@@ -1131,6 +1156,7 @@ class TopicRouter:
                 self.spawn(self.skills.loop())
                 self.spawn(self.questions.loop())
                 self.spawn(self.settings_menu.loop())
+                self.spawn(self.keyboard.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())
