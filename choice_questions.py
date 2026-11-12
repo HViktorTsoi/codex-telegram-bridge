@@ -22,6 +22,14 @@ class ChoiceError(RuntimeError):
     pass
 
 
+class AnswerNotSubmitted(ChoiceError):
+    """A native preflight failed before creating a submission intent."""
+
+    def __init__(self, message, *, retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def _json(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
@@ -178,7 +186,7 @@ class ChoiceQuestions:
                         self.db.execute('INSERT OR IGNORE INTO choice_native_answers VALUES(?,?)',
                                         (bridge.thread_id, qid[1]))
                         for row in self.db.execute("SELECT id FROM choice_questions WHERE thread_id=? AND item_id=? "
-                                                   "AND kind='async' AND state IN ('queued','publishing','active','submitting')",
+                                                   "AND kind='async' AND state IN ('queued','publishing','active','submitting','uncertain')",
                                                    (bridge.thread_id, qid[1])).fetchall():
                             self._close(row['id'], 'resolved', '已在 Codex 中回答。')
             except (ValueError, TypeError, AttributeError):
@@ -287,6 +295,8 @@ class ChoiceQuestions:
             token = secrets.token_urlsafe(12)
             tokens.append((token, question['id'], position, 'other', None, question['message_id'], question['bot_id']))
             keyboard.append([{'text': '自行输入', 'callback_data': 'cq:' + token}])
+            if question.get('reason'):
+                text += '\n\n' + question['reason']
         else:
             text = 'Codex 问题\n\n'
             text += '\n\n'.join(item['title'] + ('\n已选择：' + question['answers'][index]
@@ -383,7 +393,15 @@ class ChoiceQuestions:
         answers = [*question['answers'], answer]
         final = len(answers) == len(question['questions'])
         with self.db:
-            changed = self.db.execute('UPDATE choice_questions SET answers=?,position=?,state=?,dirty=1 '
+            # Save only live input prompts. A safe preflight failure may reopen
+            # these exact prompts, never older cancelled/closed reply entries.
+            prompts = self.db.execute("SELECT chat_id,message_id FROM choice_prompts "
+                                      "WHERE question_id=? AND position=? AND state='active'",
+                                      (question['id'], question['position'])).fetchall()
+            claim = self.db.execute("SELECT 1 FROM choice_prompt_claims WHERE question_id=? "
+                                    "AND position=? AND state='active'",
+                                    (question['id'], question['position'])).fetchone()
+            changed = self.db.execute('UPDATE choice_questions SET answers=?,position=?,state=?,reason=NULL,dirty=1 '
                                       "WHERE id=? AND position=? AND state='active'",
                                       (_json(answers), question['position'] + (not final), 'submitting' if final else 'active',
                                        question['id'], question['position'])).rowcount
@@ -405,7 +423,24 @@ class ChoiceQuestions:
                 await asyncio.wait_for(bridge.codex.respond_user_input(question['request_id'],
                     {item['id']: {'answers': [value]} for item, value in zip(question['questions'], answers)}), 30)
             else:
-                await asyncio.wait_for(bridge.submit_question_answer(question, answers, 'telegram-choice-' + question['id']), 30)
+                # Native submission owns its timeout and durable send boundary;
+                # an outer timeout cannot tell preflight from an unknown send.
+                await bridge.submit_question_answer(question, answers, 'telegram-choice-' + question['id'])
+        except AnswerNotSubmitted as error:
+            with self.db:
+                restored = self.db.execute("UPDATE choice_questions SET state=?,answers=?,position=?,reason=?,dirty=1 "
+                                          "WHERE id=? AND state='submitting'",
+                                          ('active' if error.retryable else 'expired', _json(question['answers']),
+                                           question['position'], str(error), question['id'])).rowcount
+                if restored and error.retryable:
+                    for prompt in prompts:
+                        self.db.execute("UPDATE choice_prompts SET state='active' WHERE chat_id=? AND message_id=? "
+                                        "AND question_id=? AND position=? AND state='closed'",
+                                        (prompt['chat_id'], prompt['message_id'], question['id'], question['position']))
+                    if claim:
+                        self.db.execute("UPDATE choice_prompt_claims SET state='active' WHERE question_id=? "
+                                        "AND position=? AND state='closed'", (question['id'], question['position']))
+            raise
         except BaseException:
             with self.db:
                 self.db.execute("UPDATE choice_questions SET state='uncertain',dirty=1 WHERE id=? AND state='submitting'",

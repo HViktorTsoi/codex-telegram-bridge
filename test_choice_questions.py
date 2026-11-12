@@ -6,7 +6,7 @@ import time
 from types import SimpleNamespace
 import unittest
 
-from choice_questions import ChoiceQuestions
+from choice_questions import AnswerNotSubmitted, ChoiceQuestions
 from bridge import TelegramError
 from message_format import utf16_size
 
@@ -257,6 +257,101 @@ class QuestionTests(unittest.IsolatedAsyncioTestCase):
         await self.click(panel)
         self.assertEqual(self.row()['state'], 'uncertain')
         self.ui.recover()
+        self.submit_error = None
+        await self.click(panel)
+        self.assertEqual(len(self.native), 1)
+
+    async def test_unsubmitted_preflight_restores_buttons_for_explicit_retry(self):
+        await self.show()
+        self.submit_error = AnswerNotSubmitted('本次答案尚未提交，请稍后重试当前按钮。')
+        await self.click()
+        self.assertEqual(self.row()['state'], 'active')
+        self.assertEqual(json.loads(self.row()['answers']), [])
+        self.assertIn('尚未提交', self.panel()['text'])
+        self.assertTrue(self.panel()['reply_markup']['inline_keyboard'])
+        self.assertFalse(await self.ui.handle_one())
+        self.assertEqual(len(self.native), 1)
+        self.submit_error = None
+        await self.click()
+        self.assertEqual(self.row()['state'], 'answered')
+        self.assertIsNone(self.row()['reason'])
+        self.assertEqual(self.native[-1][2], ['甲'])
+
+    async def test_unsubmitted_final_reply_preserves_prior_answers_and_live_prompt(self):
+        await self.show(2)
+        await self.click(label='2. 乙')
+        await self.click(label='自行输入')
+        prompt = copy.deepcopy(self.messages[self.sequence])
+        message = {'message_id': 950, 'from': {'id': 123}, 'chat': {'id': 123, 'type': 'private'},
+                   'message_thread_id': 42, 'text': '补充答案', 'reply_to_message': prompt}
+        self.submit_error = AnswerNotSubmitted('本次答案尚未提交，请重试。')
+        self.ui.ingest({'update_id': 950, 'message': message})
+        await self.ui.handle_one()
+        self.assertEqual(self.row()['state'], 'active')
+        self.assertEqual(self.row()['position'], 1)
+        self.assertEqual(json.loads(self.row()['answers']), ['乙'])
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_prompts').fetchone()[0], 'active')
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_prompt_claims').fetchone()[0], 'active')
+        self.submit_error = None
+        self.ui.ingest({'update_id': 951, 'message': {**message, 'message_id': 951}})
+        await self.ui.handle_one()
+        self.assertEqual(self.row()['state'], 'answered')
+        self.assertEqual(self.native[-1][2], ['乙', '补充答案'])
+
+    async def test_safe_retry_does_not_reopen_cancelled_prompts(self):
+        await self.show()
+        await self.click(label='自行输入')
+        prompt = copy.deepcopy(self.messages[self.sequence])
+        self.ui.ingest({'update_id': 960, 'message': {'message_id': 960, 'from': {'id': 123},
+            'chat': {'id': 123, 'type': 'private'}, 'message_thread_id': 42,
+            'text': '/cancel', 'reply_to_message': prompt}})
+        await self.ui.handle_one()
+        self.submit_error = AnswerNotSubmitted('本次答案尚未提交，请重试。')
+        await self.click()
+        self.assertEqual(self.row()['state'], 'active')
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_prompts').fetchone()[0], 'closed')
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_prompt_claims').fetchone()[0], 'closed')
+
+    async def test_definitively_invalid_question_is_not_reopened(self):
+        panel = await self.show()
+        self.submit_error = AnswerNotSubmitted('原问题内容已变化，答案尚未提交。', retryable=False)
+        await self.click()
+        self.assertEqual(self.row()['state'], 'expired')
+        self.assertIn('尚未提交', self.panel()['text'])
+        self.assertEqual(self.panel()['reply_markup']['inline_keyboard'], [])
+        self.submit_error = None
+        await self.click(panel)
+        self.assertEqual(len(self.native), 1)
+
+    async def test_native_answer_during_preflight_failure_stays_resolved(self):
+        await self.show()
+        await self.click(label='自行输入')
+        async def submit(question, answers, client_id):
+            await self.ui.observe(self.bridge, 'new-turn', self.native_answer())
+            raise AnswerNotSubmitted('核验超时，答案尚未提交。')
+        self.bridge.submit_question_answer = submit
+        await self.click()
+        self.assertEqual(self.row()['state'], 'resolved')
+        self.assertEqual(self.panel()['reply_markup']['inline_keyboard'], [])
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM choice_prompts').fetchone()[0], 'closed')
+
+    async def test_observed_native_answer_resolves_unknown_submission_without_retry(self):
+        await self.show()
+        self.submit_error = TimeoutError('acknowledgement lost')
+        await self.click()
+        self.assertEqual(self.row()['state'], 'uncertain')
+        await self.ui.observe(self.bridge, 'answer-turn', self.native_answer(), replay=True)
+        await self.ui.flush_one()
+        self.assertEqual(self.row()['state'], 'resolved')
+        self.assertEqual(self.panel()['reply_markup']['inline_keyboard'], [])
+        self.assertEqual(len(self.native), 1)
+
+    async def test_sync_timeout_stays_uncertain_and_cannot_be_retried(self):
+        await self.sync()
+        panel = self.panel()
+        self.submit_error = TimeoutError('sync write acknowledgement missing')
+        await self.click(panel)
+        self.assertEqual(self.row()['state'], 'uncertain')
         self.submit_error = None
         await self.click(panel)
         self.assertEqual(len(self.native), 1)

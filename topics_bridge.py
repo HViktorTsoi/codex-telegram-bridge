@@ -78,6 +78,19 @@ class ExactCodex(Codex):
             if not cursor:
                 raise RpcError('Turn not found during legacy recovery')
 
+    async def question_source(self, turn_id, item_id):
+        from legacy_questions import read_question_source
+
+        epoch = self.turn_state.epoch
+        result = await self.call('thread/read', {'threadId': self.thread_id, 'includeTurns': False})
+        thread = result.get('thread') if isinstance(result, dict) else None
+        if not isinstance(thread, dict) or thread.get('id') != self.thread_id:
+            return None
+        source = await asyncio.to_thread(read_question_source, thread.get('path'), self.thread_id, turn_id, item_id)
+        if epoch != self.turn_state.epoch:
+            raise ConnectionError('Codex connection changed during question source read')
+        return source
+
 
 class RoutedStore(Store):
     """Reply to the original topic, with global command panels in the main chat."""
