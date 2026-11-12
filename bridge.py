@@ -219,6 +219,8 @@ class Codex:
         self.pending, self.sequence = {}, 0
         self.pending_user_inputs, self._claimed_user_inputs = {}, set()
         self.user_input_epoch = os.urandom(12).hex()
+        from turn_state import TurnState
+        self.turn_state = TurnState()
         self.events = asyncio.Queue()
         self.session = self.ws = self.reader = None
 
@@ -226,6 +228,7 @@ class Codex:
         self.pending_user_inputs.clear()
         self._claimed_user_inputs.clear()
         self.user_input_epoch = os.urandom(12).hex()
+        self.turn_state.reset()
         self.session = aiohttp.ClientSession(
             connector=aiohttp.UnixConnector(path=self.socket_path),
             timeout=aiohttp.ClientTimeout(total=30),
@@ -241,6 +244,7 @@ class Codex:
 
     async def _read(self):
         epoch = self.user_input_epoch
+        turn_epoch = self.turn_state.epoch
         try:
             async for message in self.ws:
                 if message.type != aiohttp.WSMsgType.TEXT:
@@ -257,6 +261,14 @@ class Codex:
                     params = data.get("params", {})
                     if params.get("threadId") == self.thread_id:
                         method = data["method"]
+                        if method in ('turn/started', 'turn/completed'):
+                            if turn_epoch != self.turn_state.epoch:
+                                continue
+                            if method == 'turn/started':
+                                self.turn_state.started(params.get('turn'))
+                            else:
+                                self.turn_state.finished(params.get('turn'))
+                            data['_turn_state_epoch'] = turn_epoch
                         if method == 'item/tool/requestUserInput' and 'id' in data:
                             request_id = data['id']
                             if request_id in self._claimed_user_inputs:
@@ -266,9 +278,11 @@ class Codex:
                         elif method == 'serverRequest/resolved':
                             self.pending_user_inputs.pop(params.get('requestId'), None)
                             data['_user_input_epoch'] = epoch
-                        if method in {"item/completed", "turn/completed", 'serverRequest/resolved'} or "id" in data:
+                        if method in {"item/completed", "turn/started", "turn/completed", 'serverRequest/resolved'} or "id" in data:
                             self.events.put_nowait(data)
         finally:
+            if turn_epoch == self.turn_state.epoch:
+                self.turn_state.reset()
             if epoch == self.user_input_epoch:
                 self.pending_user_inputs.clear()
             for future in list(self.pending.values()):
@@ -308,16 +322,25 @@ class Codex:
         request_id = self.sequence
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
+        turn_epoch = self.turn_state.epoch
         try:
             await self.ws.send_json({"id": request_id, "method": method, "params": params})
-            return await asyncio.wait_for(future, 30)
+            result = await asyncio.wait_for(future, 30)
+            if (method == 'turn/start' and params.get('threadId') == self.thread_id
+                    and turn_epoch == self.turn_state.epoch and isinstance(result, dict)):
+                self.turn_state.acknowledge(result.get('turn'))
+            return result
         finally:
             self.pending.pop(request_id, None)
 
     async def turns(self, limit=10):
-        return (await self.call("thread/turns/list", {
+        epoch = self.turn_state.epoch
+        result = (await self.call("thread/turns/list", {
             "threadId": self.thread_id, "limit": limit, "sortDirection": "desc", "itemsView": "notLoaded",
         }))["data"]
+        if epoch != self.turn_state.epoch:
+            raise ConnectionError('Codex connection changed during turn history read')
+        return self.turn_state.merge(result, limit)
 
     async def settings(self):
         # Reading a loaded thread this way also keeps this client subscribed.
@@ -350,6 +373,7 @@ class Codex:
 
     async def close(self):
         self.pending_user_inputs.clear()
+        self.turn_state.reset()
         if self.ws:
             await self.ws.close()
         if self.reader:
@@ -715,6 +739,9 @@ class Bridge:
         while True:
             data = await self.codex.events.get()
             async with self.dispatch_lock:
+                epoch = data.get('_turn_state_epoch')
+                if epoch is not None and epoch != self.codex.turn_state.epoch:
+                    continue
                 if await self.handle_server_event(data):
                     continue
                 params = data["params"]

@@ -166,6 +166,48 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["threadId"], "thread")
         self.assertEqual(self.bridge.store.running()[0][0], "active-turn")
 
+    async def test_stop_uses_current_live_turn_instead_of_an_older_missing_turn(self):
+        native = Codex('/unused', 'thread')
+        native.turn_state.started({'id': 'older', 'startedAt': 100})
+        native.turn_state.started({'id': 'current', 'startedAt': 200})
+        native.turn_state.acknowledge({'id': 'older'})
+        calls = []
+
+        async def rpc(method, params):
+            calls.append((method, params))
+            if method == 'thread/turns/list':
+                return {'data': [{'id': 'current', 'status': 'inProgress', 'startedAt': 200}]}
+            if method == 'turn/interrupt':
+                return {}
+            raise AssertionError('Unexpected RPC: ' + method)
+
+        native.call = rpc
+        self.bridge.codex = native
+        with self.bridge.store.db:
+            self.bridge.store.db.execute("UPDATE inbox SET text='/stop' WHERE id=1")
+        await self.bridge.dispatch_one(self.bridge.store.pending())
+        self.assertEqual(calls[-1], ('turn/interrupt', {'threadId': 'thread', 'turnId': 'current'}))
+
+    async def test_stop_does_not_interrupt_old_missing_turn_after_current_turn_finishes(self):
+        native = Codex('/unused', 'thread')
+        native.turn_state.started({'id': 'older', 'startedAt': 100})
+        native.turn_state.started({'id': 'current', 'startedAt': 200})
+        calls = []
+
+        async def rpc(method, params):
+            calls.append((method, params))
+            if method == 'thread/turns/list':
+                return {'data': [{'id': 'current', 'status': 'completed', 'startedAt': 200, 'completedAt': 300}]}
+            raise AssertionError('No interrupt is allowed after the latest task finished: ' + method)
+
+        native.call = rpc
+        self.bridge.codex = native
+        with self.bridge.store.db:
+            self.bridge.store.db.execute("UPDATE inbox SET text='/stop' WHERE id=1")
+        await self.bridge.dispatch_one(self.bridge.store.pending())
+        self.assertEqual([method for method, _ in calls], ['thread/turns/list'])
+        self.assertEqual(self.bridge.store.db.execute('SELECT text FROM outbox').fetchone()[0], '当前没有正在执行的任务。')
+
 
 class SocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_unix_websocket_rpc_filters_unrelated_events(self):
@@ -204,6 +246,105 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
                 await runner.cleanup()
+
+
+class LiveTurnSocketTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.tmp.name) / 'live.sock')
+        self.history, self.requests = [], []
+        self.finished_before_ack = None
+        self.ws = None
+
+        async def handler(request):
+            self.ws = web.WebSocketResponse()
+            await self.ws.prepare(request)
+            async for message in self.ws:
+                data = json.loads(message.data)
+                if 'id' not in data:
+                    continue
+                method = data['method']
+                self.requests.append((method, data.get('params', {})))
+                if method == 'initialize':
+                    result = {}
+                elif method == 'thread/resume':
+                    result = {'thread': {'id': 'wanted'}}
+                elif method == 'thread/turns/list':
+                    result = {'data': self.history}
+                elif method == 'turn/start':
+                    await self.emit('turn/started', {'id': 'work', 'status': 'inProgress', 'startedAt': 100})
+                    if self.finished_before_ack:
+                        await self.emit('turn/completed', {'id': 'work', 'status': self.finished_before_ack})
+                    result = {'turn': {'id': 'work', 'status': 'inProgress', 'startedAt': 100}}
+                else:
+                    raise AssertionError('Unexpected RPC: ' + method)
+                await self.ws.send_json({'id': data['id'], 'result': result})
+            return self.ws
+
+        app = web.Application()
+        app.router.add_get('/', handler)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        await web.UnixSite(self.runner, self.path).start()
+        self.client = Codex(self.path, 'wanted')
+        await self.client.connect()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        await self.runner.cleanup()
+        self.tmp.cleanup()
+
+    async def emit(self, method, turn, thread='wanted'):
+        await self.ws.send_json({'method': method, 'params': {'threadId': thread, 'turn': turn}})
+
+    async def test_live_started_event_protects_history_projection_without_a_write_rpc(self):
+        self.history = [{'id': 'work', 'status': 'interrupted', 'completedAt': None}]
+        await self.emit('turn/started', {'id': 'foreign'}, 'unrelated')
+        await self.emit('turn/started', {'id': 'work', 'status': 'inProgress'})
+        turns = await self.client.turns()
+        self.assertEqual(turns[0]['status'], 'inProgress')
+        self.assertEqual(set(self.client.turn_state.active), {'work'})
+        event = await asyncio.wait_for(self.client.events.get(), 2)
+        self.assertEqual(event['method'], 'turn/started')
+        self.assertEqual(event['_turn_state_epoch'], self.client.turn_state.epoch)
+        self.assertTrue(self.client.events.empty())
+        self.assertTrue(all(method in ('initialize', 'thread/resume', 'thread/turns/list')
+                            for method, _ in self.requests))
+
+    async def test_terminal_event_before_start_ack_is_not_reopened_by_ack_or_history(self):
+        self.finished_before_ack = 'interrupted'
+        self.history = [{'id': 'work', 'status': 'inProgress'}]
+        await self.client.call('turn/start', {'threadId': 'wanted', 'input': []})
+        self.assertFalse(self.client.turn_state.active)
+        self.assertEqual((await self.client.turns())[0]['status'], 'interrupted')
+        self.assertEqual([(await self.client.events.get())['method'] for _ in range(2)],
+                         ['turn/started', 'turn/completed'])
+
+    async def test_start_ack_preserves_active_until_real_terminal_then_drops_live_evidence(self):
+        self.history = [{'id': 'work', 'status': 'interrupted', 'completedAt': None}]
+        await self.client.call('turn/start', {'threadId': 'wanted', 'input': []})
+        self.assertEqual((await self.client.turns())[0]['status'], 'inProgress')
+        await self.emit('turn/completed', {'id': 'work', 'status': 'completed', 'completedAt': 200})
+        self.assertEqual((await self.client.turns())[0]['status'], 'completed')
+        self.assertFalse(self.client.turn_state.active)
+
+    async def test_disconnect_clears_live_evidence_and_reconnect_does_not_reopen_old_turn(self):
+        self.history = [{'id': 'work', 'status': 'interrupted', 'completedAt': None}]
+        await self.emit('turn/started', {'id': 'work'})
+        self.assertEqual((await self.client.turns())[0]['status'], 'inProgress')
+        epoch = self.client.turn_state.epoch
+        await self.client.close()
+        self.assertNotEqual(self.client.turn_state.epoch, epoch)
+        self.assertFalse(self.client.turn_state.active)
+        await self.client.connect()
+        self.assertEqual((await self.client.turns())[0]['status'], 'interrupted')
+
+    async def test_another_live_turn_does_not_reopen_the_older_interrupted_id(self):
+        self.history = [{'id': 'old', 'status': 'interrupted', 'completedAt': None}]
+        await self.emit('turn/started', {'id': 'new'})
+        turns = await self.client.turns()
+        self.assertEqual([(turn['id'], turn['status']) for turn in turns],
+                         [('new', 'inProgress'), ('old', 'interrupted')])
 
 
 class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
