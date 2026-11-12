@@ -1,7 +1,8 @@
 # One Bot, multiple local Codex conversations
 
-Topic mode includes a chat-wide persistent reply keyboard with eight command
-shortcuts: Sessions, Tasks, Inbox, Model, Effort, Skills, Stop and Help. Commands
+Topic mode includes a chat-wide persistent reply keyboard with three command
+shortcuts in one row: Sessions, Tasks and Stop, using the client's default theme.
+Commands
 retain the topic on the incoming button message, never the topic where the
 keyboard was installed. Global menus still respond in All. One quiet All message
 installs the keyboard per verified Bot/owner/layout; restarts reuse its durable
