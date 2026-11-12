@@ -43,17 +43,16 @@ class KeyboardProjectionTests(unittest.TestCase):
         protected = self.message()
         self.assertIs(normalize_update(protected, protected=True), protected)
 
-    def test_markup_is_compact_persistent_colored_reply_keyboard_and_returns_fresh_objects(self):
+    def test_markup_is_single_row_persistent_theme_default_and_returns_fresh_objects(self):
         value = markup()
-        self.assertEqual([len(row) for row in value['keyboard']], [3, 3, 2])
+        self.assertEqual([len(row) for row in value['keyboard']], [3])
         buttons = [button for row in value['keyboard'] for button in row]
-        self.assertEqual([button['text'] for button in buttons], list(BUTTON_COMMANDS))
-        self.assertEqual([button['style'] for button in buttons], ['primary'] * 6 + ['danger', 'primary'])
+        self.assertEqual([button['text'] for button in buttons], ['📚 会话', '📋 任务', '⏹ 停止'])
         self.assertTrue(value['is_persistent'])
         self.assertTrue(value['resize_keyboard'])
         self.assertFalse(value['one_time_keyboard'])
         self.assertNotIn('inline_keyboard', value)
-        self.assertTrue(all(set(button) == {'text', 'style'} for button in buttons))
+        self.assertTrue(all(set(button) == {'text'} for button in buttons))
         value['keyboard'][0][0]['text'] = 'mutated'
         self.assertEqual(markup()['keyboard'][0][0]['text'], '📚 会话')
 

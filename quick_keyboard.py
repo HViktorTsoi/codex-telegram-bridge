@@ -24,10 +24,8 @@ BUTTON_COMMANDS = {
 
 
 def markup():
-    labels = list(BUTTON_COMMANDS)
-    rows = [labels[:3], labels[3:6], labels[6:]]
-    return {'keyboard': [[{'text': label, 'style': 'danger' if label == '⏹ 停止' else 'primary'}
-                           for label in row] for row in rows],
+    # Omit style so Telegram renders the buttons using the client's theme.
+    return {'keyboard': [[{'text': label} for label in ('📚 会话', '📋 任务', '⏹ 停止')]],
             'is_persistent': True, 'resize_keyboard': True, 'one_time_keyboard': False}
 
 
@@ -55,8 +53,8 @@ def normalize_update(update, protected=False):
 
 class QuickKeyboard:
     KEY = 'quick_keyboard_v1'
-    TEXT = ('常用操作已放在输入框下方。\n'
-            '模型、强度和停止按所在话题执行；在 All 中操作主会话。\n'
+    TEXT = ('底部常用操作：会话、任务、停止。\n'
+            '停止按所在话题执行；在 All 中操作主会话。\n'
             '未展开时可点输入框旁的键盘图标；/keyboard 可重新显示。')
 
     def __init__(self, router, clock=time.time):
