@@ -226,18 +226,18 @@ class UsageCard:
                 prefix = _window_name(window['minutes']) + ' ' if multiple_windows else ''
                 lines.append(prefix + _quota_bar(used))
                 if expired:
-                    lines.append('重置时间已到，等待同步（上次记录）')
+                    lines.append('\u00a0' * 4 + '重置时间已到，等待同步（上次记录）')
                 elif reset is not None:
                     try:
                         stamp = datetime.fromtimestamp(reset, timezone(timedelta(hours=8))).strftime('%m/%d %H:%M')
                     except (ValueError, OverflowError, OSError):
                         stamp = '未知'
-                    lines.append('重置：' + stamp + '（香港，' + _remaining(reset - now) + '）')
+                    lines.append('\u00a0' * 4 + '重置：' + stamp + '（香港，' + _remaining(reset - now) + '）')
         if not buckets:
             lines.append('暂无可用额度数据' if self.state.get('sample_at') else '等待额度同步')
         if self.state.get('sample_at'):
             age = max(0, int((now - self.state['sample_at']) // 60))
-            lines.append(f"{self.state.get('source', '缓存')} · 缓存 {age} 分钟")
+            lines.append(f'缓存 {age} 分钟')
         if self.state.get('error'):
             lines.append('连接暂不可用，保留上次记录')
         return '\n'.join(lines)[:3800]

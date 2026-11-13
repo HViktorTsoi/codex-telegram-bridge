@@ -89,7 +89,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         await self.ui.tick()
         self.assertEqual(self.native.call.await_count, 1)
         self.assertIn('剩余 75%', self.ui.text())
-        self.assertIn('事件推送', self.ui.text())
+        self.assertEqual(self.ui.state['source'], '事件推送')
         self.now += 60
         await self.ui.tick()
         self.assertEqual(self.native.call.await_count, 1)
