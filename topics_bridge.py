@@ -303,6 +303,12 @@ class TargetBridge(NativeQuestions, Bridge):
             self.mirror.note_event(self, turn_id, item)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
             return
+        observer = getattr(self, 'on_collaboration_item', None)
+        if observer is not None:
+            try:
+                observer(self, turn_id, item, replay=replay)
+            except Exception as error:
+                LOG.warning('Group collaboration observer failed: %s', type(error).__name__)
         if self.delivery.enabled:
             # Completion events identify finished items. Readback supplies stable
             # content identities even when native history renumbers item IDs.
@@ -748,8 +754,11 @@ class TopicRouter:
         from usage_card import UsageCard
         self.usage = UsageCard(self)
         self.bridges[self.config['root_target']].codex.on_account_event = self.usage.on_account_event
+        from group_collaboration import GroupCollaboration
+        self.collaboration = GroupCollaboration(self)
         for bridge in self.bridges.values():
             bridge.questions = self.questions
+            bridge.on_collaboration_item = self.collaboration.on_item
 
     def access(self):
         try:
@@ -777,6 +786,8 @@ class TopicRouter:
             protected = self._keyboard_prompt_reply(update)
             from quick_keyboard import normalize_update
             update = normalize_update(update, protected=protected or not self.keyboard.enabled)
+        if not protected and self.collaboration.ingest(update):
+            return
         if not protected and self.keyboard.ingest(update):
             return
         if not protected and self.usage.ingest(update):
@@ -1127,6 +1138,7 @@ class TopicRouter:
         if not target.get('topic_missing'):
             self.by_topic[int(target['message_thread_id'])] = self.targets[target['key']]
         self.bridges[target['key']] = bridge
+        bridge.on_collaboration_item = self.collaboration.on_item
         if target['key'] == self.config['root_target']:
             bridge.codex.on_account_event = self.usage.on_account_event
         if self.running:
@@ -1169,6 +1181,7 @@ class TopicRouter:
                 self.settings_menu.recover()
                 self.keyboard.recover()
                 self.usage.recover()
+                self.collaboration.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
@@ -1180,6 +1193,7 @@ class TopicRouter:
                 self.spawn(self.settings_menu.loop())
                 self.spawn(self.keyboard.loop())
                 self.spawn(self.usage.loop())
+                self.spawn(self.collaboration.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())
