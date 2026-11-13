@@ -47,13 +47,17 @@ def snapshot(payload):
 
 
 def _window_name(minutes):
-    if minutes == 10080:
-        return '周额度'
-    if minutes == 1440:
-        return '日额度'
+    if minutes % 1440 == 0:
+        return f'{minutes / 1440:g}天'
     if minutes % 60 == 0:
-        return f'{minutes / 60:g} 小时额度'
-    return f'{minutes:g} 分钟额度'
+        return f'{minutes / 60:g}h'
+    return f'{minutes:g}min'
+
+
+def _quota_bar(used):
+    remaining = max(0, min(100, 100 - used))
+    filled = int(remaining / 10 + .5)
+    return '█' * filled + '░' * (10 - filled) + f' 剩余 {remaining:g}%'
 
 
 def _remaining(seconds):
@@ -205,10 +209,12 @@ class UsageCard:
 
     def text(self):
         now = self.clock()
-        host = ' '.join(str(self.router.config.get('host_id', '本机')).split())[:40]
-        lines = ['Codex 用量 · ' + host]
+        lines = ['用量']
         buckets = self.state.get('buckets') or {}
-        for key, bucket in sorted(buckets.items(), key=lambda pair: (pair[0] != 'codex', pair[0]))[:8]:
+        displayed = sorted(buckets.items(), key=lambda pair: (pair[0] != 'codex', pair[0]))[:8]
+        multiple_windows = sum(bool(bucket.get(field)) for _, bucket in displayed
+                               for field in ('primary', 'secondary')) > 1
+        for key, bucket in displayed:
             if len(buckets) > 1:
                 lines.append(' '.join(bucket['name'].split()))
             for field in ('primary', 'secondary'):
@@ -217,10 +223,10 @@ class UsageCard:
                     continue
                 reset, used = window['reset'], window['used']
                 expired = reset is not None and reset <= now
-                prefix = '上次记录' if expired else _window_name(window['minutes'])
-                lines.append(f'{prefix}：已用 {used:g}% · 剩余 {max(0, 100 - used):g}%')
+                prefix = _window_name(window['minutes']) + ' ' if multiple_windows else ''
+                lines.append(prefix + _quota_bar(used))
                 if expired:
-                    lines.append('重置时间已到，等待同步')
+                    lines.append('重置时间已到，等待同步（上次记录）')
                 elif reset is not None:
                     try:
                         stamp = datetime.fromtimestamp(reset, timezone(timedelta(hours=8))).strftime('%m/%d %H:%M')
