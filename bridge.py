@@ -222,6 +222,7 @@ class Codex:
         from turn_state import TurnState
         self.turn_state = TurnState()
         self.events = asyncio.Queue()
+        self.on_account_event = None
         self.session = self.ws = self.reader = None
 
     async def connect(self):
@@ -259,6 +260,14 @@ class Codex:
                             future.set_result(data.get("result", {}))
                 elif "method" in data:
                     params = data.get("params", {})
+                    if data['method'] in ('account/rateLimits/updated', 'account/updated'):
+                        hook = self.on_account_event
+                        if 'id' not in data and hook is not None and epoch == self.user_input_epoch:
+                            try:
+                                hook({**data, '_account_epoch': epoch})
+                            except Exception as error:
+                                LOG.warning('Account event observer failed: %s', type(error).__name__)
+                        continue
                     if params.get("threadId") == self.thread_id:
                         method = data["method"]
                         if method in ('turn/started', 'turn/completed'):
