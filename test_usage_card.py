@@ -75,8 +75,10 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.methods('pinChatMessage')[0]['disable_notification'])
         self.assertNotIn('message_thread_id', self.methods('sendMessage')[0])
         text = self.methods('sendMessage')[0]['text']
-        self.assertIn('周额度', text)
-        self.assertIn('已用 20%', text)
+        self.assertEqual(text.splitlines()[0], '用量')
+        self.assertIn('████████░░ 剩余 80%', text)
+        self.assertNotIn('已用', text)
+        self.assertNotIn('Codex', text)
         self.assertIn('剩余 80%', text)
         self.assertNotIn('5 小时', text)
 
@@ -86,7 +88,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.ui.on_account_event({'method': 'account/rateLimits/updated', 'params': limits(25), '_account_epoch': 'epoch'})
         await self.ui.tick()
         self.assertEqual(self.native.call.await_count, 1)
-        self.assertIn('已用 25%', self.ui.text())
+        self.assertIn('剩余 75%', self.ui.text())
         self.assertIn('事件推送', self.ui.text())
         self.now += 60
         await self.ui.tick()
@@ -110,14 +112,42 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_reset_countdown_edits_same_card_without_quota_request(self):
         await self.ui.tick()
         self.assertIn('1小时7分钟后', self.ui.text())
+        quota_line = self.ui.text().splitlines()[1]
         mid = self.ui.state['message_id']
         self.now += 61
         await self.ui.tick()
         self.assertIn('1小时6分钟后', self.ui.text())
+        self.assertEqual(self.ui.text().splitlines()[1], quota_line)
         self.assertEqual(self.native.call.await_count, 1)
         self.assertEqual(self.ui.state['message_id'], mid)
         self.assertEqual(len(self.methods('sendMessage')), 1)
         self.assertEqual(len(self.methods('pinChatMessage')), 1)
+
+    def test_remaining_bar_preserves_numeric_percentage_at_empty_full_and_fractional_levels(self):
+        for used, bar, label in ((100, '░' * 10, '0%'), (0, '█' * 10, '100%'),
+                                 (22.5, '█' * 8 + '░' * 2, '77.5%'),
+                                 (99.9, '░' * 10, '0.1%'), (125, '░' * 10, '0%')):
+            with self.subTest(used=used):
+                self.ui.state['buckets'] = snapshot(limits(used))
+                text = self.ui.text()
+                self.assertEqual(text.splitlines()[0], '用量')
+                self.assertEqual(text.splitlines()[1], bar + ' 剩余 ' + label)
+                self.assertNotIn('已用', text)
+                self.assertNotIn('周额度', text)
+        self.native.call.assert_not_awaited()
+
+    async def test_multiple_windows_keep_short_duration_labels(self):
+        data = limits(50, minutes=300)
+        data['rateLimitsByLimitId']['codex']['secondary'] = {
+            'usedPercent': 75, 'windowDurationMins': 10080, 'resetsAt': 6000}
+        self.native.call.return_value = data
+        await self.ui.tick()
+        text = self.ui.text()
+        self.assertEqual(text.splitlines()[0], '用量')
+        self.assertIn('5h █████░░░░░ 剩余 50%', text)
+        self.assertRegex(text, r'7天 [█░]{10} 剩余 25%')
+        self.assertNotIn('已用', text)
+        self.native.call.assert_awaited_once_with('account/rateLimits/read', {})
 
     async def test_root_rebinding_reuses_main_card_and_invalidates_cached_quota(self):
         await self.ui.tick()
@@ -127,7 +157,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.native.call.return_value = limits(35)
         await self.ui.tick()
         self.assertEqual(self.ui.state['identity']['thread'], 'new-native')
-        self.assertIn('已用 35%', self.ui.text())
+        self.assertIn('剩余 65%', self.ui.text())
         self.assertEqual(self.native.call.await_count, 2)
         self.assertEqual(self.ui.state['message_id'], mid)
         self.assertEqual(len(self.methods('sendMessage')), 1)
@@ -144,7 +174,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
                                       '_account_epoch': 'epoch'})
         await self.ui.tick()
         self.assertEqual(set(self.ui.state['buckets']), {'codex'})
-        self.assertIn('已用 19%', self.ui.text())
+        self.assertIn('剩余 81%', self.ui.text())
         self.assertEqual(self.native.call.await_count, 1)
 
     async def test_disabled_does_nothing_until_explicit_usage_command(self):
@@ -207,7 +237,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await work)
         await self.ui.tick()
         self.assertIsNone(self.ui.state['buckets'])
-        self.assertNotIn('99%', self.ui.text())
+        self.assertNotIn('剩余 1%', self.ui.text())
         self.assertEqual(self.native.call.await_count, 2)
 
     async def test_newer_push_wins_over_inflight_read_and_old_epoch_is_ignored(self):
@@ -221,10 +251,10 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.native.call.side_effect = read
         await self.ui._fetch(force=True)
         self.ui._drain()
-        self.assertIn('已用 42%', self.ui.text())
+        self.assertIn('剩余 58%', self.ui.text())
         self.ui.on_account_event({'method': 'account/rateLimits/updated', 'params': limits(88), '_account_epoch': 'old'})
         self.ui._drain()
-        self.assertNotIn('88%', self.ui.text())
+        self.assertNotIn('剩余 12%', self.ui.text())
 
     async def test_reset_passage_does_not_invent_refilled_quota(self):
         self.native.call.return_value = limits(reset=1100)
@@ -233,7 +263,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         await self.ui.tick()
         self.assertIn('上次记录', self.ui.text())
         self.assertIn('等待同步', self.ui.text())
-        self.assertIn('已用 20%', self.ui.text())
+        self.assertIn('剩余 80%', self.ui.text())
         self.assertEqual(self.native.call.await_count, 1)
 
     async def test_failed_automatic_reads_back_off_for_fifteen_minutes(self):
