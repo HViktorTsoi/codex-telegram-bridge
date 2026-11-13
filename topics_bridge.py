@@ -745,6 +745,9 @@ class TopicRouter:
         self.settings_menu = SettingsMenu(self)
         from quick_keyboard import QuickKeyboard
         self.keyboard = QuickKeyboard(self)
+        from usage_card import UsageCard
+        self.usage = UsageCard(self)
+        self.bridges[self.config['root_target']].codex.on_account_event = self.usage.on_account_event
         for bridge in self.bridges.values():
             bridge.questions = self.questions
 
@@ -775,6 +778,8 @@ class TopicRouter:
             from quick_keyboard import normalize_update
             update = normalize_update(update, protected=protected or not self.keyboard.enabled)
         if not protected and self.keyboard.ingest(update):
+            return
+        if not protected and self.usage.ingest(update):
             return
         if self.settings_menu.ingest(update):
             return
@@ -1122,6 +1127,8 @@ class TopicRouter:
         if not target.get('topic_missing'):
             self.by_topic[int(target['message_thread_id'])] = self.targets[target['key']]
         self.bridges[target['key']] = bridge
+        if target['key'] == self.config['root_target']:
+            bridge.codex.on_account_event = self.usage.on_account_event
         if self.running:
             self.start_target(bridge)
 
@@ -1149,6 +1156,7 @@ class TopicRouter:
                         {'command': 'rename', 'description': '修改会话名称，同步话题名称'},
                         {'command': 'skills', 'description': '查看本机会话技能并选择使用'},
                         {'command': 'keyboard', 'description': '显示底部常用按钮'}, *COMMANDS]
+            commands.append({'command': 'usage', 'description': 'All 置顶 Codex 额度与缓存刷新'})
             if await self.telegram.call('getMyCommands', scope=scope) != commands:
                 await self.telegram.call('setMyCommands', scope=scope, commands=commands)
             self.failure = asyncio.get_running_loop().create_future()
@@ -1160,6 +1168,7 @@ class TopicRouter:
                 self.questions.recover()
                 self.settings_menu.recover()
                 self.keyboard.recover()
+                self.usage.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
@@ -1170,6 +1179,7 @@ class TopicRouter:
                 self.spawn(self.questions.loop())
                 self.spawn(self.settings_menu.loop())
                 self.spawn(self.keyboard.loop())
+                self.spawn(self.usage.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())
