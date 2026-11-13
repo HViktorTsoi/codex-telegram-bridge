@@ -75,7 +75,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.methods('pinChatMessage')[0]['disable_notification'])
         self.assertNotIn('message_thread_id', self.methods('sendMessage')[0])
         text = self.methods('sendMessage')[0]['text']
-        self.assertEqual(text.splitlines()[0], '用量')
+        self.assertEqual(text.splitlines()[0], '████████░░ 剩余 80%')
         self.assertIn('████████░░ 剩余 80%', text)
         self.assertNotIn('已用', text)
         self.assertNotIn('Codex', text)
@@ -112,12 +112,12 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_reset_countdown_edits_same_card_without_quota_request(self):
         await self.ui.tick()
         self.assertIn('1小时7分钟后', self.ui.text())
-        quota_line = self.ui.text().splitlines()[1]
+        quota_line = self.ui.text().splitlines()[0]
         mid = self.ui.state['message_id']
         self.now += 61
         await self.ui.tick()
         self.assertIn('1小时6分钟后', self.ui.text())
-        self.assertEqual(self.ui.text().splitlines()[1], quota_line)
+        self.assertEqual(self.ui.text().splitlines()[0], quota_line)
         self.assertEqual(self.native.call.await_count, 1)
         self.assertEqual(self.ui.state['message_id'], mid)
         self.assertEqual(len(self.methods('sendMessage')), 1)
@@ -130,8 +130,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(used=used):
                 self.ui.state['buckets'] = snapshot(limits(used))
                 text = self.ui.text()
-                self.assertEqual(text.splitlines()[0], '用量')
-                self.assertEqual(text.splitlines()[1], bar + ' 剩余 ' + label)
+                self.assertEqual(text.splitlines()[0], bar + ' 剩余 ' + label)
                 self.assertNotIn('已用', text)
                 self.assertNotIn('周额度', text)
         self.native.call.assert_not_awaited()
@@ -143,7 +142,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.native.call.return_value = data
         await self.ui.tick()
         text = self.ui.text()
-        self.assertEqual(text.splitlines()[0], '用量')
+        self.assertEqual(text.splitlines()[0], '5h █████░░░░░ 剩余 50%')
         self.assertIn('5h █████░░░░░ 剩余 50%', text)
         self.assertRegex(text, r'7天 [█░]{10} 剩余 25%')
         self.assertNotIn('已用', text)

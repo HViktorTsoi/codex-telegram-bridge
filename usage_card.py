@@ -209,7 +209,7 @@ class UsageCard:
 
     def text(self):
         now = self.clock()
-        lines = ['用量']
+        lines = []
         buckets = self.state.get('buckets') or {}
         displayed = sorted(buckets.items(), key=lambda pair: (pair[0] != 'codex', pair[0]))[:8]
         multiple_windows = sum(bool(bucket.get(field)) for _, bucket in displayed
