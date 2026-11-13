@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 import test_session_picker as fixtures
+from bridge import TelegramError
 from topics_bridge import TopicRouter
 
 
@@ -44,7 +45,8 @@ class CreatorTests(unittest.IsolatedAsyncioTestCase):
         return browser
 
     def panel(self):
-        return self.telegram.messages[self.panel_id]
+        row = self.router.store.db.execute('SELECT panel_id FROM ui_new_drafts ORDER BY updated_at DESC LIMIT 1').fetchone()
+        return self.telegram.messages[row['panel_id']]
 
     async def answer(self, prompt, text, sender=123, topic=None, media=False):
         self.sequence += 1
@@ -72,6 +74,133 @@ class CreatorTests(unittest.IsolatedAsyncioTestCase):
         prompt = self.telegram.messages[self.telegram.next_id]
         await self.answer(prompt, name)
         return self.panel()
+
+    async def test_text_name_reply_sends_review_below_input_and_retires_old_panel(self):
+        browser = await self.wizard()
+        await self.click(browser, '使用当前目录')
+        prompt = copy.deepcopy(self.telegram.messages[self.telegram.next_id])
+        old = copy.deepcopy(self.panel())
+        old_text = old['text']
+        update = await self.answer(prompt, 'IOT开发')
+        review = copy.deepcopy(self.panel())
+        self.assertNotEqual(review['message_id'], old['message_id'])
+        self.assertGreater(review['message_id'], update['message']['message_id'])
+        self.assertIn('确认新建', review['text'])
+        self.assertIn('IOT开发', review['text'])
+        self.assertEqual(self.telegram.messages[old['message_id']]['text'], old_text)
+        self.assertEqual(self.telegram.messages[old['message_id']]['reply_markup']['inline_keyboard'], [])
+        states = self.router.store.db.execute('SELECT state FROM ui_buttons WHERE message_id=?',
+                                              (old['message_id'],)).fetchall()
+        self.assertTrue(states)
+        self.assertTrue(all(row['state'] == 'expired' for row in states))
+        self.assertEqual(self.create_calls, [])
+        self.assertEqual(self.telegram.created, [])
+
+    async def test_modified_name_uses_new_panel_and_old_confirmation_cannot_create(self):
+        old = copy.deepcopy(await self.review('旧名称'))
+        await self.click(old, '修改名称')
+        prompt = copy.deepcopy(self.telegram.messages[self.telegram.next_id])
+        await self.answer(prompt, '新名称')
+        latest = copy.deepcopy(self.panel())
+        self.assertNotEqual(latest['message_id'], old['message_id'])
+        self.assertIn('新名称', latest['text'])
+        await self.click(old, '确认新建并连接')
+        self.assertEqual(self.create_calls, [])
+        self.assertEqual(self.telegram.created, [])
+        self.assertEqual(self.router.store.db.execute('SELECT name FROM ui_new_drafts').fetchone()[0], '新名称')
+        await self.click(latest, '确认新建并连接')
+        self.assertEqual(sum(method == 'thread/start' for method, _ in self.create_calls), 1)
+
+    async def test_home_resume_moves_current_panel_and_rejects_older_active_confirmation(self):
+        old = copy.deepcopy(await self.review('恢复同一草稿'))
+        menu = await self.menu()
+        current = copy.deepcopy(await self.click(menu, '继续处理：恢复同一草稿'))
+        self.assertNotEqual(current['message_id'], old['message_id'])
+        self.assertEqual(self.panel()['message_id'], current['message_id'])
+        self.assertTrue(self.router.store.db.execute("SELECT 1 FROM ui_buttons WHERE message_id=? "
+                                                    "AND action='new:confirm' AND state='active'",
+                                                    (old['message_id'],)).fetchone())
+        await self.click(old, '确认新建并连接')
+        self.assertEqual(self.create_calls, [])
+        self.assertEqual(self.telegram.created, [])
+        await self.click(current, '确认新建并连接')
+        self.assertEqual(sum(method == 'thread/start' for method, _ in self.create_calls), 1)
+        self.assertEqual(len(self.telegram.created), 1)
+
+    async def test_path_and_folder_text_replies_each_create_a_new_browser_panel(self):
+        browser = await self.wizard()
+        old_id = browser['message_id']
+        browser = await self.choose_path(browser, self.path)
+        self.assertNotEqual(browser['message_id'], old_id)
+        await self.click(browser, '新建文件夹')
+        previous = self.panel()['message_id']
+        prompt = copy.deepcopy(self.telegram.messages[self.telegram.next_id])
+        await self.answer(prompt, '新的目录')
+        self.assertNotEqual(self.panel()['message_id'], previous)
+        self.assertIn(str(self.path / '新的目录'), self.panel()['text'])
+        self.assertEqual(self.create_calls, [])
+
+    async def test_old_markup_cleanup_failure_does_not_fail_the_new_review(self):
+        browser = await self.wizard()
+        await self.click(browser, '使用当前目录')
+        prompt = copy.deepcopy(self.telegram.messages[self.telegram.next_id])
+        previous = self.panel()['message_id']
+        original = self.telegram.call
+
+        async def fail_cleanup(method, **params):
+            if method == 'editMessageReplyMarkup':
+                raise ConnectionError('old card cleanup unavailable')
+            return await original(method, **params)
+
+        self.telegram.call = fail_cleanup
+        await self.answer(prompt, '清理失败也保留')
+        self.assertNotEqual(self.panel()['message_id'], previous)
+        self.assertIn('清理失败也保留', self.panel()['text'])
+        self.assertEqual(self.router.store.db.execute('SELECT state FROM ui_jobs ORDER BY id DESC LIMIT 1').fetchone()[0], 'done')
+        self.assertEqual(self.create_calls, [])
+
+    async def test_unknown_or_rate_limited_review_send_does_not_repeat_input_or_create(self):
+        for failure in (ConnectionError('review acknowledgement lost'),
+                        TelegramError('sendMessage', 429, 'Too Many Requests', retry_after=30)):
+            with self.subTest(failure=type(failure).__name__):
+                browser = await self.wizard()
+                await self.click(browser, '使用当前目录')
+                prompt = copy.deepcopy(self.telegram.messages[self.telegram.next_id])
+                previous = copy.deepcopy(self.panel())
+                original = self.telegram.call
+                attempts = []
+
+                async def fail_review(method, **params):
+                    if method == 'sendMessage' and params.get('text', '').startswith('确认新建 Codex'):
+                        attempts.append(params)
+                        if isinstance(failure, ConnectionError):
+                            await original(method, **params)  # Delivered, but ACK lost.
+                        raise failure
+                    return await original(method, **params)
+
+                self.telegram.call = fail_review
+                update = await self.answer(prompt, '待继续-' + type(failure).__name__)
+                await self.router.picker.recover()
+                self.router.ingest(update)
+                await self.router.picker.handle_one()
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(self.create_calls, [])
+                self.assertEqual(self.telegram.created, [])
+                await self.click(previous, '取消')
+                self.assertEqual(self.router.store.db.execute('SELECT state FROM ui_new_drafts ORDER BY updated_at DESC LIMIT 1').fetchone()[0], 'review')
+                self.telegram.call = original
+                menu = await self.menu()
+                restored = await self.click(menu, '继续处理：待继续-' + type(failure).__name__)
+                self.assertIn('确认新建', restored['text'])
+                self.assertIn('待继续-' + type(failure).__name__, restored['text'])
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(self.create_calls, [])
+                self.assertEqual(self.telegram.created, [])
+
+    async def test_expired_review_is_not_listed_as_a_resumable_draft(self):
+        await self.review('已过期确认')
+        self.router.store.db.execute('UPDATE ui_new_drafts SET expires_at=?', (time.time() - 1,))
+        self.assertEqual(self.router.picker.creator.unfinished('123'), [])
 
     async def test_create_folder_name_and_exact_new_binding_only_after_confirmation(self):
         browser = await self.wizard()

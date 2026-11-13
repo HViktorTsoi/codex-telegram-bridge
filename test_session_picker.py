@@ -69,6 +69,10 @@ class PickerTests(unittest.IsolatedAsyncioTestCase):
                     msg = {**self.messages[params['message_id']], **params}
                     self.messages[params['message_id']] = msg
                     return msg
+                if method == 'editMessageReplyMarkup':
+                    msg = {**self.messages[params['message_id']], **params}
+                    self.messages[params['message_id']] = msg
+                    return msg
                 raise AssertionError(method)
 
         self.telegram = Telegram()

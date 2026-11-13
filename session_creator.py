@@ -5,7 +5,7 @@ import secrets
 import time
 
 from attachments import payload_from
-from bridge import RpcError
+from bridge import RpcError, TelegramError
 from session_picker import BindingError, TopicCreationUnavailable, clean_name, directory_text
 
 
@@ -57,12 +57,22 @@ class SessionCreator:
                             (draft_id,))
 
     async def show(self, update, draft, text, rows):
-        # Text replies update the same management panel, rather than the user's message.
-        if draft['panel_id'] and not update.get('callback_query'):
-            update = {'callback_query': {'message': {
-                'message_id': draft['panel_id'], 'chat': {'id': int(draft['chat_id'])}}}}
+        previous = draft['panel_id'] if not update.get('callback_query') else None
+        if previous:
+            # Retire the old actions before sending, including when the new
+            # message's acknowledgement is lost. Never confirm a stale card.
+            with self.db:
+                self.db.execute("UPDATE ui_buttons SET state='expired' WHERE chat_id=? AND message_id=?",
+                                (draft['chat_id'], previous))
         result = await self.picker.panel(update, text, rows)
         self.save(draft['id'], panel_id=result['message_id'])
+        if previous and result['message_id'] != previous:
+            try:
+                await asyncio.wait_for(self.router.telegram.call('editMessageReplyMarkup',
+                    chat_id=draft['chat_id'], message_id=previous,
+                    reply_markup={'inline_keyboard': []}), 5)
+            except (TelegramError, ConnectionError, OSError, asyncio.TimeoutError):
+                pass  # The new card and saved input do not depend on cleanup.
 
     @staticmethod
     def resolve(value, base=None):
@@ -283,6 +293,8 @@ class SessionCreator:
             return await self.start(update)
         origin = update['callback_query']['message']
         draft = self.draft(data['id'], origin['chat']['id'])
+        if action != 'new:resume' and origin['message_id'] != draft['panel_id']:
+            raise BindingError('这个新建页面已更新，请使用最新卡片，或发送 /sessions 继续处理。')
         if action == 'new:cancel':
             return await self.cancel(update, draft)
         if draft['state'] == 'cancelled':
@@ -298,9 +310,10 @@ class SessionCreator:
         raise BindingError('未知新建步骤，请重新打开 /sessions。')
 
     def unfinished(self, chat_id):
-        return self.db.execute("SELECT * FROM ui_new_drafts WHERE chat_id=? AND state IN "
-                               "('created','named','creating','uncertain','blocked') ORDER BY updated_at DESC LIMIT 5",
-                               (str(chat_id),)).fetchall()
+        return self.db.execute("SELECT * FROM ui_new_drafts WHERE chat_id=? AND (state IN "
+                               "('created','named','creating','uncertain','blocked') OR "
+                               "(state='review' AND expires_at>?)) ORDER BY updated_at DESC LIMIT 5",
+                               (str(chat_id), time.time())).fetchall()
 
     def recover(self):
         with self.db:
