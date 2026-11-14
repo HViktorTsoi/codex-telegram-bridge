@@ -1,4 +1,4 @@
-"""Topic-local file records and deliberate resends, without native model calls."""
+"""Topic-local Codex output files and deliberate resends, without model calls."""
 import asyncio
 import hashlib
 import json
@@ -11,19 +11,12 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from attachments import media_items, payload_from
+from attachments import payload_from
 from bridge import TelegramError, permitted
 from outgoing_images import ImageError, MAX_BYTES, send_image
 
 
 LOG = logging.getLogger('codex_telegram_files')
-MEDIA_METHODS = {
-    'photo': ('sendPhoto', 'photo'), 'document': ('sendDocument', 'document'),
-    'voice': ('sendVoice', 'voice'), 'audio': ('sendAudio', 'audio'),
-    'video': ('sendVideo', 'video'), 'video_note': ('sendVideoNote', 'video_note'),
-    'animation': ('sendAnimation', 'animation'), 'sticker': ('sendSticker', 'sticker'),
-}
-
 
 class FilesError(RuntimeError):
     pass
@@ -206,26 +199,9 @@ class FilesMenu:
             raise FilesError('文件快照不可用，请重新生成或发送原文件。') from None
 
     def inventory(self, bridge):
-        """Read known media records only; do not scan projects, tools or prose."""
+        """Read delivered Codex output snapshots, never user inputs or projects."""
         self._bridge(self.binding(bridge.target))
         owner, records = str(self.router.owner), []
-        for row in bridge.store.db.execute('SELECT id,message_json,received_ms FROM inbox '
-                "WHERE chat_id=? AND message_json IS NOT NULL AND message_json LIKE '%\"file_id\"%' "
-                'ORDER BY received_ms DESC,id DESC', (owner,)):
-            payload = json_value(row['message_json'], {})
-            try:
-                items = media_items(payload)
-            except (TypeError, ValueError, KeyError, AttributeError):
-                continue
-            for item in items:
-                if item.get('kind') not in MEDIA_METHODS or not isinstance(item.get('file_id'), str) or not item['file_id']:
-                    continue
-                identity = encoded(['in', item['kind'], item.get('file_unique_id') or item['file_id']])
-                record = {'source': 'in', 'source_id': row['id'], 'identity': identity,
-                          'name': label(item.get('file_name')), 'kind': item['kind'],
-                          'size': item.get('file_size'), 'mime': item.get('mime_type'),
-                          'stamp': timestamp(row['received_ms'], milliseconds=True), 'item': item}
-                records.append(record)
         for row in bridge.store.db.execute('SELECT o.rowid AS ordering,o.key,o.media_json,t.started_at '
                 'FROM outbox o LEFT JOIN completion_rows c ON c.key=o.key '
                 'LEFT JOIN completion_turns t ON t.turn_id=c.turn_id AND t.chat_id=c.chat_id '
@@ -258,21 +234,15 @@ class FilesMenu:
 
     def _record(self, bridge, record):
         """Re-read the selected immutable ledger reference before a resend."""
-        if record.get('source') == 'in':
-            row = bridge.store.db.execute('SELECT message_json FROM inbox WHERE id=? AND chat_id=?',
-                    (record.get('source_id'), str(self.router.owner))).fetchone()
-            items = media_items(json_value(row['message_json'], {})) if row else []
-            if not any(encoded(item) == encoded(record.get('item')) for item in items):
-                raise FilesError('这条上传记录已变化，请刷新文件列表。')
-        elif record.get('source') == 'out':
-            row = bridge.store.db.execute('SELECT media_json,message_id FROM outbox WHERE key=? AND chat_id=?',
-                    (record.get('source_id'), str(self.router.owner))).fetchone()
-            media = json_value(row['media_json'], {}) if row else {}
-            if not row or row['message_id'] <= 0 or encoded(media) != encoded(record.get('media')):
-                raise FilesError('这条回传记录已变化，请刷新文件列表。')
-            self._snapshot_path(bridge, media)
-        else:
-            raise FilesError('文件记录无效，请重新打开文件列表。')
+        if not isinstance(record, dict) or record.get('source') != 'out':
+            raise FilesError('文件列表仅支持 Codex 已回传的文件，请刷新列表。')
+        row = bridge.store.db.execute('SELECT media_json,message_id FROM outbox WHERE key=? AND chat_id=?',
+                (record.get('source_id'), str(self.router.owner))).fetchone()
+        media = json_value(row['media_json'], {}) if row else {}
+        if (not row or row['message_id'] <= 0 or encoded(media) != encoded(record.get('media'))
+                or media.get('delivery') != 'sent' or media.get('method') not in ('sendPhoto', 'sendDocument')):
+            raise FilesError('这条回传记录已变化，请刷新文件列表。')
+        self._snapshot_path(bridge, media)
         return record
 
     async def _notice(self, update, text):
@@ -309,21 +279,19 @@ class FilesMenu:
         pages = max(1, math.ceil(len(records) / self.PAGE))
         page = max(0, min(int(page), pages - 1))
         revision = panel['revision'] + 1
-        text = '会话文件 · ' + label(bridge.target['name'], 90) + f'\n共 {len(records)} 项 · 第 {page + 1}/{pages} 页'
+        text = 'Codex 文件 · ' + label(bridge.target['name'], 90) + f'\n共 {len(records)} 项 · 第 {page + 1}/{pages} 页'
         if not records:
-            text += '\n\n还没有已记录的上传或回传附件。'
+            text += '\n\n还没有已回传的 Codex 文件。'
         rows = []
         for index, record in enumerate(records[page * self.PAGE:(page + 1) * self.PAGE], page * self.PAGE + 1):
-            direction = '你上传的' if record['source'] == 'in' else 'Codex 回传的'
             unavailable = False
-            if record['source'] == 'out':
-                try:
-                    self._snapshot_path(bridge, record['media'])
-                except FilesError:
-                    unavailable = True
+            try:
+                self._snapshot_path(bridge, record['media'])
+            except FilesError:
+                unavailable = True
             suffix = ' · 快照已不可用' if unavailable else ''
             date = datetime.fromtimestamp(record['stamp'], ZoneInfo('Asia/Hong_Kong')).strftime('%m/%d %H:%M') if record['stamp'] else '时间未知'
-            text += f'\n\n{index}. {record["name"]}\n{direction} · {label(record.get("mime") or record["kind"], 70)} · {size_label(record["size"])} · {date}{suffix}'
+            text += f'\n\n{index}. {record["name"]}\n{label(record.get("mime") or record["kind"], 70)} · {size_label(record["size"])} · {date}{suffix}'
             rows.append([(f'{index}. {label(record["name"], 48)}', 'unavailable' if unavailable else 'send', record)])
         navigation = []
         if page:
@@ -333,7 +301,7 @@ class FilesMenu:
         if navigation:
             rows.append(navigation)
         rows.append([('刷新', 'refresh', None), ('关闭', 'close', None)])
-        text += '\n\n点文件可在本话题重发。列表仅含已记录的附件。'
+        text += '\n\n点文件可在本话题重发。仅列出 Codex 已回传的附件。'
         keyboard, tokens = [], []
         with self.db:
             for row in rows:
@@ -527,14 +495,9 @@ class FilesMenu:
                     return
             route = {'chat_id': row['chat_id'], 'message_thread_id': row['topic_id'], 'disable_notification': True}
             try:
-                if record['source'] == 'in':
-                    method, field = MEDIA_METHODS[record['item']['kind']]
-                    result = await asyncio.wait_for(self.router.telegram.call(method, **route,
-                                                    **{field: record['item']['file_id']}), self.TIMEOUT)
-                else:
-                    media = dict(record['media'])
-                    media['caption'] = label(media['name'], 150)
-                    result = await asyncio.wait_for(send_image(self.router.telegram, encoded(media), route), 60)
+                media = dict(record['media'])
+                media['caption'] = label(media['name'], 150)
+                result = await asyncio.wait_for(send_image(self.router.telegram, encoded(media), route), 60)
                 mid = result.get('message_id') if isinstance(result, dict) else None
                 if (type(mid) is not int or mid <= 0
                         or isinstance(result.get('chat'), dict) and str(result['chat']['id']) != row['chat_id']

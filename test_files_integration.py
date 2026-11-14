@@ -117,6 +117,18 @@ class FilesRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         bridge.store.accept({'update_id': update_id}, message)
         bridge.store.mark(update_id, 'done')
 
+    def seed_output(self, key, serial, name):
+        bridge = self.router.bridges[key]
+        original = self.path / name
+        original.write_bytes(('Codex output ' + str(serial)).encode())
+        media = bridge.store.images.snapshot_document(original, 'Codex 文件')
+        media['delivery'] = 'sent'
+        with bridge.store.db:
+            bridge.store.db.execute('INSERT INTO outbox '
+                '(key,chat_id,text,media_json,message_thread_id,message_id) VALUES(?,?,?,?,?,?)',
+                ('turn:fixture-' + str(serial) + ':media:0', '123', '', json.dumps(media),
+                 bridge.target['message_thread_id'], serial))
+
     async def test_menu_is_shared_by_existing_and_newly_installed_bridges(self):
         for bridge in self.router.bridges.values():
             self.assertIs(bridge.files_menu, self.router.files_menu)
@@ -147,8 +159,8 @@ class FilesRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             bridge.dispatch_lock.release()
 
     async def test_all_files_command_gives_local_hint_without_listing_another_threads_files(self):
-        self.seed_upload('manager', 1, 'manager-private.txt')
-        self.seed_upload('other', 2, 'other-private.txt')
+        self.seed_output('manager', 1, 'manager-private.txt')
+        self.seed_output('other', 2, 'other-private.txt')
         shown = await self.open_files(topic=None)
         self.assertIsNone(shown.get('message_thread_id'))
         self.assertIn('话题', shown['text'])
@@ -156,19 +168,24 @@ class FilesRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('other-private.txt', shown['text'])
         self.assert_no_native()
 
-    async def test_thread_file_list_contains_only_its_own_uploads(self):
-        self.seed_upload('manager', 1, 'manager-only.txt')
-        self.seed_upload('other', 2, 'other-only.txt')
+    async def test_thread_file_list_contains_only_its_own_codex_outputs(self):
+        self.seed_output('manager', 1, 'manager-only.txt')
+        self.seed_output('other', 2, 'other-only.txt')
+        self.seed_upload('manager', 3, 'manager-upload.txt')
+        self.seed_upload('other', 4, 'other-upload.txt')
         shown = await self.open_files()
         display = shown['text'] + json.dumps(shown.get('reply_markup', {}), ensure_ascii=False)
         self.assertEqual(shown['message_thread_id'], 22)
         self.assertIn('other-only.txt', display)
         self.assertNotIn('manager-only.txt', display)
+        self.assertNotIn('manager-upload.txt', display)
+        self.assertNotIn('other-upload.txt', display)
+        self.assertIn('共 1 项', shown['text'])
         self.assertEqual(self.rows('jobs'), 0)
         self.assert_no_native()
 
     async def test_unbound_topic_does_not_fall_back_to_root_files(self):
-        self.seed_upload('manager', 1, 'manager-private.txt')
+        self.seed_output('manager', 1, 'manager-private.txt')
         shown = await self.open_files(topic=999)
         display = shown['text'] + json.dumps(shown.get('reply_markup', {}), ensure_ascii=False)
         self.assertEqual(shown['message_thread_id'], 999)
@@ -177,7 +194,7 @@ class FilesRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_native()
 
     async def test_opener_copied_to_other_topic_cannot_list_original_thread_files(self):
-        self.seed_upload('other', 1, 'other-private.txt')
+        self.seed_output('other', 1, 'other-private.txt')
         bridge = self.router.bridges['other']
         opener = self.router.files_menu.entry_callback(bridge)
         origin = {'message_id': 88, 'date': 1, 'from': {'id': 456, 'is_bot': True},

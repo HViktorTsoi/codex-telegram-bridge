@@ -55,18 +55,19 @@ class DocumentQueueTests(unittest.TestCase):
         self.assertEqual(os.stat(Path(media['path']).parent).st_mode & 0o777, 0o700)
 
     def test_common_documents_and_distinct_names_with_same_content_are_preserved(self):
-        for extension in ('.pdf', '.docx', '.xlsx', '.pptx', '.zip', '.csv'):
+        extensions = ('.pdf', '.docx', '.xlsx', '.pptx', '.zip', '.csv', '.apk')
+        for extension in extensions:
             file = self.path / ('报告' + extension)
             file.write_bytes(b'example document bytes')
             self.queue(f'[下载](<{file}>)', 'turn:task:' + extension)
         files = [json.loads(r['media_json']) for r in self.documents()]
-        self.assertEqual(len(files), 6)
-        self.assertEqual({m['name'] for m in files}, {'报告' + x for x in ('.pdf', '.docx', '.xlsx', '.pptx', '.zip', '.csv')})
+        self.assertEqual(len(files), len(extensions))
+        self.assertEqual({m['name'] for m in files}, {'报告' + x for x in extensions})
         self.assertTrue(all(m['kind'] == 'document' and m['method'] == 'sendDocument' and m['mime'] for m in files))
         other = self.path / '另一个名称.pdf'
         other.write_bytes(b'example document bytes')
         self.queue(f'[下载](<{other}>)', 'turn:task:another-name')
-        self.assertEqual(len(self.documents()), 7)
+        self.assertEqual(len(self.documents()), len(extensions) + 1)
 
     def test_unicode_spaces_parentheses_and_file_url_deduplicate_same_document(self):
         file = self.path / '最终 报告（中文）(1).pdf'
