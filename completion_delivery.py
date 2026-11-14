@@ -809,5 +809,6 @@ class CompletionDelivery:
                 or str(row['chat_id']) != group['chat_id'] or row['message_thread_id'] != group['topic_id']):
             return None
         heading = {'completed': '✅ 已完成', 'failed': '❌ 执行失败', 'interrupted': '⏹ 已停止'}.get(group['status'])
-        return (self.body_preview.status_markup(self._preview_text(heading, group['started_at'], ''))
+        return (self.body_preview.status_markup(self._preview_text(heading, group['started_at'], ''),
+                                               files_callback=self.body_preview.files_callback(group))
                 if heading else None)

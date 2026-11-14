@@ -436,6 +436,7 @@ class TargetBridge(NativeQuestions, Bridge):
                      "在 All 回复已有话题消息可直接发到对应会话，仅发送新内容。\n"
                      "/sessions 查看会话并添加绑定\n"
                      "/skills 查看本机会话可用技能并选择使用\n"
+                     "/files 查看本话题的历史附件并重新发送\n"
                      "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
                      "/status 查看此会话及完整 ID\n/model 按钮选择此会话模型\n"
                      "/effort 按钮选择此会话强度\n/stop 停止此会话的当前任务\n"
@@ -756,9 +757,12 @@ class TopicRouter:
         self.bridges[self.config['root_target']].codex.on_account_event = self.usage.on_account_event
         from group_collaboration import GroupCollaboration
         self.collaboration = GroupCollaboration(self)
+        from files_menu import FilesMenu
+        self.files_menu = FilesMenu(self)
         for bridge in self.bridges.values():
             bridge.questions = self.questions
             bridge.on_collaboration_item = self.collaboration.on_item
+            bridge.files_menu = self.files_menu
 
     def access(self):
         try:
@@ -787,6 +791,8 @@ class TopicRouter:
             from quick_keyboard import normalize_update
             update = normalize_update(update, protected=protected or not self.keyboard.enabled)
         if not protected and self.collaboration.ingest(update):
+            return
+        if not protected and self.files_menu.ingest(update):
             return
         if not protected and self.keyboard.ingest(update):
             return
@@ -1139,6 +1145,7 @@ class TopicRouter:
             self.by_topic[int(target['message_thread_id'])] = self.targets[target['key']]
         self.bridges[target['key']] = bridge
         bridge.on_collaboration_item = self.collaboration.on_item
+        bridge.files_menu = self.files_menu
         if target['key'] == self.config['root_target']:
             bridge.codex.on_account_event = self.usage.on_account_event
         if self.running:
@@ -1167,6 +1174,7 @@ class TopicRouter:
             commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'},
                         {'command': 'rename', 'description': '修改会话名称，同步话题名称'},
                         {'command': 'skills', 'description': '查看本机会话技能并选择使用'},
+                        {'command': 'files', 'description': '查看本话题的历史附件并重新发送'},
                         {'command': 'keyboard', 'description': '显示底部常用按钮'}, *COMMANDS]
             commands.append({'command': 'usage', 'description': 'All 置顶 Codex 额度与缓存刷新'})
             if await self.telegram.call('getMyCommands', scope=scope) != commands:
@@ -1182,6 +1190,7 @@ class TopicRouter:
                 self.keyboard.recover()
                 self.usage.recover()
                 self.collaboration.recover()
+                self.files_menu.recover()
                 for bridge in self.bridges.values():
                     self.start_target(bridge)
                 for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
@@ -1194,6 +1203,7 @@ class TopicRouter:
                 self.spawn(self.keyboard.loop())
                 self.spawn(self.usage.loop())
                 self.spawn(self.collaboration.loop())
+                self.spawn(self.files_menu.loop())
                 for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
                     self.spawn(coro)
                 self.spawn(self.control.sync_loop())

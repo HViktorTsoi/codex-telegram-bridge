@@ -101,13 +101,25 @@ class CompletionPreview:
         return True
 
     @staticmethod
-    def status_markup(status, stop_callback=None):
+    def status_markup(status, stop_callback=None, files_callback=None):
         lines = [line.strip(' ━═─=\t') for line in status.splitlines() if line.strip(' ━═─=\t')]
         lines = (lines + ['任务已收到。', '处理中。'])[:2]
         rows = [[{'text': line, 'disabled': {}}] for line in lines]
+        if files_callback:
+            rows[0].append({'text': '📎 文件', 'callback_data': files_callback})
         if stop_callback:
             rows[1].append({'text': '⏹ 停止当前任务', 'callback_data': stop_callback})
         return {'inline_keyboard': rows}
+
+    def files_callback(self, identity=None):
+        """Keep file browsing local to the current native session and topic."""
+        menu = getattr(self.delivery.bridge, 'files_menu', None)
+        if menu is None or (identity is not None and not self._current(identity)):
+            return None
+        try:
+            return menu.entry_callback(self.delivery.bridge)
+        except Exception:
+            return None  # File navigation must not prevent task status updates.
 
     def stop_callback(self, identity):
         """Expose a control only for this exact current, active native turn."""
@@ -195,7 +207,7 @@ class CompletionPreview:
             if not body or not body.strip():
                 body = state.get('desired_text') or state.get('sent_text') or '任务已收到。'
                 rich_body = state.get('desired_display_text')
-            markup = self.status_markup(status, self.stop_callback(identity))
+            markup = self.status_markup(status, self.stop_callback(identity), self.files_callback(identity))
             return await self.update(telegram, identity, body, reply_markup=markup, _status_bar=True,
                                      rich_body=rich_body)
         except Exception:
