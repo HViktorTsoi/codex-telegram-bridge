@@ -145,9 +145,13 @@ class PersistentStatusTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('callback_data', row[0])
         if len(rows[1]) == 2:
             control = rows[1][1]
-            self.assertEqual(control['text'], '⏹ 停止当前任务')
             self.assertNotIn('disabled', control)
-            self.assertRegex(control['callback_data'], r'^stop:[0-9a-f]{24}$')
+            if control['callback_data'].startswith('cancel:'):
+                self.assertEqual(control['text'], '⏹ 取消待处理')
+                self.assertRegex(control['callback_data'], r'^cancel:[0-9a-f]{24}$')
+            else:
+                self.assertEqual(control['text'], '⏹ 停止当前任务')
+                self.assertRegex(control['callback_data'], r'^stop:[0-9a-f]{24}$')
         if text:
             self.assertIn(text, self.keyboard_text(message))
 

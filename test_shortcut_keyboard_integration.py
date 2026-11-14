@@ -58,18 +58,19 @@ class ShortcutKeyboardIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.native_calls, [])
 
     async def test_stop_button_only_interrupts_the_current_native_thread(self):
+        child = self.router.bridges['instagram']
+        child.ready.set()
+        child.codex = type('Native', (), {
+            'turns': AsyncMock(return_value=[{'id': 'current', 'status': 'inProgress', 'startedAt': time.time() - 1}]),
+            'call': AsyncMock(return_value={})})()
         update = self.message('⏹ 停止', topic=22)
         self.router.ingest(update)
-        while self.router.forward_one():
-            pass
-        child = self.router.bridges['instagram']
-        child.codex = type('Native', (), {
-            'turns': AsyncMock(return_value=[{'id': 'current', 'status': 'inProgress'}]),
-            'call': AsyncMock(return_value={})})()
-        row = child.store.pending()
-        self.assertEqual(row['text'], '/stop')
-        await child.dispatch_one(row)
+        self.assertFalse(self.router.forward_one())
+        row = self.router.store.db.execute('SELECT payload FROM status_stop_jobs WHERE id=?', (update['update_id'],)).fetchone()
+        self.assertEqual(json.loads(row['payload'])['message']['text'], '/stop')
+        await self.router.status_controls.handle_one()
         child.codex.call.assert_awaited_once_with('turn/interrupt', {'threadId': 'instagram-native', 'turnId': 'current'})
+        self.assertEqual(self.inbox('instagram'), [])
         self.assertEqual(self.inbox('meeting'), [])
 
     async def test_help_button_does_not_enter_the_all_message_selector(self):
@@ -132,6 +133,10 @@ class ShortcutKeyboardIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.router.ingest(update)
         while self.router.forward_one():
             pass
+        await self.router.status_controls.handle_one()
         self.assertFalse(any(self.inbox(key) for key in self.router.bridges))
-        notice = self.router.store.db.execute('SELECT * FROM notices').fetchone()
-        self.assertEqual(notice['topic_id'], 999)
+        notice = self.telegram.messages[self.telegram.next_id]
+        self.assertEqual(notice['message_thread_id'], 999)
+        self.assertIn('尚未绑定', notice['text'])
+        self.assertIn('/sessions', notice['text'])
+        self.assertEqual(self.native_calls, [])

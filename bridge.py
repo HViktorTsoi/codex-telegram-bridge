@@ -158,6 +158,20 @@ class Store:
                 self.db.execute("UPDATE inbox SET state=?,turn_id=COALESCE(?,turn_id),client_id=? WHERE id=?",
                                 (state, turn_id, rows[0]["client_id"], row["id"]))
 
+    def claim_batch(self, rows):
+        """Atomically claim input only if preparation was not cancelled."""
+        if not rows:
+            return False
+        with self.db:
+            identities = [row['id'] for row in rows]
+            placeholders = ','.join('?' for _ in identities)
+            changed = self.db.execute("UPDATE inbox SET state='dispatching',client_id=? WHERE state='pending' AND id IN ("
+                                      + placeholders + ')', (rows[0]['client_id'], *identities)).rowcount
+            if changed != len(identities):
+                self.db.rollback()  # An album is claimed in full or not at all.
+                return False
+        return True
+
     def mark(self, update_id, state, turn_id=None):
         with self.db:
             self.db.execute(
@@ -697,18 +711,48 @@ class Bridge:
             return
         try:
             user_input = await inputs_for(batch, self.telegram, self.state_dir / "inbox")
+        except AttachmentError as error:
+            changed = 0
+            with self.store.db:
+                for part in batch:
+                    changed += self.store.db.execute(
+                        "UPDATE inbox SET state='failed' WHERE id=? AND state='pending'", (part['id'],)).rowcount
+            if changed:
+                self.store.enqueue(f"input:{update_id}:attachment_error", chat_id, str(error))
+            return
+        except (ConnectionError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as error:
+            # Telegram file transport is independent of the native connection.
+            # Reconnecting Codex would retry the same still-pending attachment
+            # forever and keep later messages, including /stop, behind it.
+            changed = 0
+            with self.store.db:
+                for part in batch:
+                    changed += self.store.db.execute(
+                        "UPDATE inbox SET state='failed' WHERE id=? AND state='pending'", (part['id'],)).rowcount
+            if changed:
+                self.store.enqueue(f"input:{update_id}:attachment_error", chat_id,
+                                   "附件下载暂时失败，本条尚未提交给 Codex。请重新发送附件；其他消息可继续处理。")
+            LOG.warning('Telegram input preparation failed (%s); native connection retained', type(error).__name__)
+            return
+        try:
             user_input = await self.prepare_inputs(batch, user_input)
         except (AttachmentError, InputPreparationError) as error:
             kind = 'attachment_error' if isinstance(error, AttachmentError) else 'input_error'
-            self.store.enqueue(f"input:{update_id}:{kind}", chat_id, str(error))
-            self.store.mark_batch(batch, "failed")
+            changed = 0
+            with self.store.db:
+                for part in batch:
+                    changed += self.store.db.execute(
+                        "UPDATE inbox SET state='failed' WHERE id=? AND state='pending'", (part['id'],)).rowcount
+            if changed:
+                self.store.enqueue(f"input:{update_id}:{kind}", chat_id, str(error))
             return
         if not self.owner_allowed():
             self.store.mark_batch(batch, "denied")
             return
         if not self.validate_destination(batch):
             return
-        self.store.mark_batch(batch, "dispatching")
+        if not self.store.claim_batch(batch):
+            return  # A priority stop may cancel while an attachment is prepared.
         params = {"threadId": self.thread_id,
                   "input": user_input,
                   "clientUserMessageId": row["client_id"]}
@@ -727,7 +771,10 @@ class Bridge:
                 continue
             try:
                 async with self.dispatch_lock:
-                    await self.dispatch_one(row)
+                    current = self.store.db.execute("SELECT * FROM inbox WHERE id=? AND state='pending'",
+                                                    (row['id'],)).fetchone()
+                    if current is not None and self.ready.is_set():
+                        await self.dispatch_one(current)
             except (ConnectionError, asyncio.TimeoutError):
                 # Reconnect reconciliation resolves any ambiguous delivery by clientId.
                 if self.codex.ws and not self.codex.ws.closed:
