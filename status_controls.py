@@ -300,7 +300,8 @@ class StatusControls:
             elif (meta.get('bot_id') == self.router.bot_id and self.router.owner_allowed()
                     and permitted(update.get('message') or {}, self.router.access(), self.router.owner)):
                 origin = update['message']
-                params = {'chat_id': str(self.router.owner), 'text': '这个话题尚未绑定，或绑定已变化；未停止任何任务。',
+                params = {'chat_id': str(self.router.owner),
+                          'text': '这个话题尚未绑定，或绑定已变化；未停止任何任务。请发送 /sessions 选择会话。',
                           'disable_notification': True}
                 if origin.get('message_thread_id'):
                     params['message_thread_id'] = origin['message_thread_id']

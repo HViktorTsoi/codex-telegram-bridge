@@ -45,22 +45,26 @@ class StopButtonMarkupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button['callback_data'], expected)
         self.assertEqual(len(button['callback_data'].encode()), 29)
 
-    async def test_receipt_adopts_real_turn_before_exposing_a_control_on_the_same_message(self):
+    async def test_receipt_cancel_adopts_real_turn_stop_on_the_same_message(self):
         self.accept()
         await self.delivery().receipt(self.telegram)
         pending = self.pending_identity()
         mid = self.preview().load(pending)['message_id']
-        self.assertEqual(self.controls(self.messages[mid]), [])
-        self.assertIsNone(self.preview().stop_callback(pending))
         pending_key = self.preview()._key(pending)
+        pending_callback = 'cancel:' + pending_key[-24:]
+        self.assertEqual(self.controls(self.messages[mid]), [
+            {'text': '⏹ 取消待处理', 'callback_data': pending_callback}])
+        self.assertEqual(self.preview().stop_callback(pending), pending_callback)
         self.bridges['a'].store.mark(7, 'running', 'a-work')
         self.output()
         self.now += 1
         await self.update()
         self.assertEqual(self.preview().load(self.identity())['message_id'], mid)
         button = self.controls(self.messages[mid])[0]
+        self.assertEqual(button['text'], '⏹ 停止当前任务')
         self.assertEqual(button['callback_data'], self.preview().stop_callback(self.identity()))
-        self.assertNotEqual(button['callback_data'], 'stop:' + pending_key[-24:])
+        self.assertTrue(button['callback_data'].startswith('stop:'))
+        self.assertNotEqual(button['callback_data'], pending_callback)
         self.assertEqual(len(self.sends()), 1)
 
     async def test_body_and_heartbeat_edits_preserve_the_exact_task_callback(self):

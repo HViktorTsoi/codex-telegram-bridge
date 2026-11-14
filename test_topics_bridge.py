@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -133,13 +134,22 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(output['message_thread_id'])
         self.assertIn('/sessions', output['text'])
 
-    def test_unknown_topic_session_command_fails_in_origin_without_retargeting(self):
+    async def test_unknown_topic_session_command_fails_in_origin_without_retargeting(self):
+        self.router.bot_id, self.router.username = 444, 'test_bot'
+        self.router.telegram = type('Telegram', (), {'call': AsyncMock(return_value={'message_id': 1})})()
         for i, command in enumerate(['/model test', '/effort high', '/stop', '/status', '/format rich'], 100):
             self.accept(self.message(i, 999, text=command))
         self.assertTrue(all(b.store.pending() is None for b in self.router.bridges.values()))
+        await self.router.status_controls.handle_one()
         notices = self.router.store.db.execute('SELECT * FROM notices').fetchall()
-        self.assertEqual(len(notices), 5)
+        self.assertEqual(len(notices), 4)
         self.assertTrue(all(r['topic_id'] == 999 and '尚未绑定' in r['text'] for r in notices))
+        self.router.telegram.call.assert_awaited_once()
+        call = self.router.telegram.call.call_args
+        self.assertEqual(call.args, ('sendMessage',))
+        self.assertEqual((call.kwargs['chat_id'], call.kwargs['message_thread_id']), ('123', 999))
+        self.assertIn('尚未绑定', call.kwargs['text'])
+        self.assertIn('/sessions', call.kwargs['text'])
 
     def test_command_like_attachment_caption_retains_normal_reply_topic(self):
         self.accept(self.message(100, 22, text='', caption='/status', document={'file_id': 'a'}))
@@ -276,6 +286,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.router.bridges['meeting'].store.counts()['unsent_messages'], 0)
 
     async def test_status_and_stop_are_scoped_to_selected_topic(self):
+        self.router.bot_id, self.router.username = 444, 'test_bot'
         calls = []
         values = {'model': 'existing-model', 'reasoningEffort': 'high'}
 
@@ -290,7 +301,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
                         for model in ('existing-model', 'alternate-model')]
 
             async def turns(self, limit=1):
-                return [{'id': 'in-progress', 'status': 'inProgress'}]
+                return [{'id': 'in-progress', 'status': 'inProgress', 'startedAt': time.time() - 1}]
 
             async def call(self, method, params):
                 calls.append((method, params))
@@ -303,12 +314,17 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         child = self.router.bridges['instagram']
         child.codex = StubCodex()
+        child.ready.set()
         commands = ['/status', '/stop', '/model unavailable',
                     '/effort invalid', '/format invalid', '/model@test_bot alternate-model', '/effort low',
                     '/unknown']
         for i, text in enumerate(commands, 100):
             self.accept(self.message(i, 22, text=text))
-            await child.dispatch_one(child.store.pending())
+            if text == '/stop':
+                self.assertIsNone(child.store.pending())
+                await self.router.status_controls.handle_one()
+            else:
+                await child.dispatch_one(child.store.pending())
         replies = '\n'.join(r['text'] for r in child.store.db.execute('SELECT * FROM outbox'))
         self.assertIn('native-instagram', replies)
         self.assertEqual(calls, [

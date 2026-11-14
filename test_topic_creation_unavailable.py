@@ -167,8 +167,15 @@ class TopicCreationUnavailableTests(unittest.IsolatedAsyncioTestCase):
         self.router.ingest({'update_id': self.sequence, 'message': {
             'message_id': self.sequence, 'from': {'id': 123}, 'chat': {'id': 123, 'type': 'private'},
             'message_thread_id': 22, 'text': '/stop'}})
-        self.assertTrue(self.router.forward_one())
-        self.assertEqual(self.router.bridges['instagram'].store.pending()['text'], '/stop')
+        self.assertFalse(self.router.forward_one())
+        self.assertIsNone(self.router.bridges['instagram'].store.pending())
+        self.assertTrue(await self.router.status_controls.handle_one())
+        job = self.router.store.db.execute('SELECT state FROM status_stop_jobs WHERE id=?', (self.sequence,)).fetchone()
+        self.assertEqual(job['state'], 'done')
+        output = self.router.bridges['instagram'].store.db.execute(
+            "SELECT * FROM outbox WHERE key LIKE 'stop-control-result:%'").fetchone()
+        self.assertEqual(output['message_thread_id'], 22)
+        self.assertIn('未连接', output['text'])
 
     async def test_cooldown_is_frozen_to_runtime_bot_and_owner_chat(self):
         self.telegram.create_error = self.refusal()
