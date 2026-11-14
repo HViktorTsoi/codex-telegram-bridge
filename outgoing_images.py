@@ -21,7 +21,7 @@ DOCUMENT_EXTENSIONS = {
     '.pdf', '.doc', '.docx', '.odt', '.rtf', '.xls', '.xlsx', '.ods',
     '.ppt', '.pptx', '.odp', '.csv', '.tsv', '.txt', '.md', '.markdown',
     '.html', '.htm', '.json', '.xml', '.yaml', '.yml', '.toml', '.ini',
-    '.cfg', '.log', '.sql', '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
+    '.cfg', '.log', '.sql', '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar', '.apk',
     '.cmd', '.bat', '.ps1', '.sh', '.bash', '.zsh', '.py', '.js', '.ts',
     '.jsx', '.tsx', '.css', '.scss', '.c', '.h', '.cpp', '.hpp', '.rs',
     '.go', '.java', '.kt', '.swift', '.rb', '.php', '.ipynb',
