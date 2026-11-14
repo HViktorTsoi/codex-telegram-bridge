@@ -802,7 +802,7 @@ class TopicRouter:
             return
         if self.questions.ingest(update):
             return
-        if self.status_controls.ingest(update):
+        if not protected and self.status_controls.ingest(update):
             return
         if self.picker.creator.is_reply(update):
             self.picker.ingest(update)
@@ -1151,6 +1151,25 @@ class TopicRouter:
         if self.running:
             self.start_target(bridge)
 
+    async def startup_call(self, method, **params):
+        """Keep a transient Telegram outage from killing the only receiver."""
+        while True:
+            try:
+                result = await self.telegram.call(method, **params)
+                self.last_error = None
+                return result
+            except TelegramError as error:
+                if error.code != 429 and not 500 <= error.code < 600:
+                    raise
+                delay = max(3, error.retry_after) if error.code == 429 else 3
+                self.last_error = 'Telegram startup: ' + str(error.code)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
+                delay = 3
+                self.last_error = 'Telegram startup: connection unavailable'
+            LOG.warning('%s; retrying %s in %s seconds', self.last_error, method, delay)
+            refresh_health_snapshot(self)
+            await asyncio.sleep(delay)
+
     async def run(self):
         if not self.owner_allowed():
             raise RuntimeError("Configured owner is not in the allowlist")
@@ -1160,14 +1179,14 @@ class TopicRouter:
             raise RuntimeError("Telegram token is missing")
         async with aiohttp.ClientSession() as session:
             self.telegram = Telegram(match[1].strip().strip("\"'"), session)
-            me = await self.telegram.call("getMe")
+            me = await self.startup_call("getMe")
             self.username = me['username']
             self.bot_id = me['id']
             if self.username.lower() != self.config['expected_bot_username'].lstrip('@').lower():
                 raise RuntimeError("Bot identity mismatch; no polling started")
             if not me.get('has_topics_enabled'):
                 raise RuntimeError("Enable private topics in BotFather before starting topic mode")
-            if (await self.telegram.call('getWebhookInfo')).get('url'):
+            if (await self.startup_call('getWebhookInfo')).get('url'):
                 raise RuntimeError("Bot already has a webhook; leaving it unchanged")
             scope = {'type': 'chat', 'chat_id': int(self.owner)}
             from control_center import COMMANDS
@@ -1177,8 +1196,8 @@ class TopicRouter:
                         {'command': 'files', 'description': '查看本话题的 Codex 输出文件'},
                         {'command': 'keyboard', 'description': '显示底部常用按钮'}, *COMMANDS]
             commands.append({'command': 'usage', 'description': 'All 置顶 Codex 额度与缓存刷新'})
-            if await self.telegram.call('getMyCommands', scope=scope) != commands:
-                await self.telegram.call('setMyCommands', scope=scope, commands=commands)
+            if await self.startup_call('getMyCommands', scope=scope) != commands:
+                await self.startup_call('setMyCommands', scope=scope, commands=commands)
             self.failure = asyncio.get_running_loop().create_future()
             self.running = True
             try:

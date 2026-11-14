@@ -108,7 +108,8 @@ class CompletionPreview:
         if files_callback:
             rows[0].append({'text': '📎 文件', 'callback_data': files_callback})
         if stop_callback:
-            rows[1].append({'text': '⏹ 停止当前任务', 'callback_data': stop_callback})
+            text = '⏹ 取消待处理' if stop_callback.startswith('cancel:') else '⏹ 停止当前任务'
+            rows[1].append({'text': text, 'callback_data': stop_callback})
         return {'inline_keyboard': rows}
 
     def files_callback(self, identity=None):
@@ -125,7 +126,12 @@ class CompletionPreview:
         """Expose a control only for this exact current, active native turn."""
         try:
             identity = self._bar_identity(identity)
-            if not identity or not identity.get('turn_id') or not self._bar_allowed(identity):
+            if not identity or not self._bar_allowed(identity):
+                return None
+            if not identity.get('turn_id'):
+                source = self._source(identity)
+                if source is not None and source['state'] == 'pending' and not source['turn_id']:
+                    return 'cancel:' + self._key(identity)[-24:]
                 return None
             group = self.delivery._group(identity['turn_id'], identity['chat_id'], identity['topic_id'])
             if (not group or group['native_id'] != identity['native_id']
@@ -400,7 +406,8 @@ class CompletionPreview:
                 state.update(route=self._route(identity), turn_id=identity.get('turn_id'),
                              desired_identity=identity, desired_text=self._text(body), desired_markup=reply_markup,
                              source_id=identity.get('source_id'),
-                             closed=bool(source is not None and not source['turn_id'] and source['state'] == 'failed'))
+                             closed=bool(source is not None and not source['turn_id']
+                                         and source['state'] in ('failed', 'cancelled')))
                 self._save(state, identity)
             if (state.get('delivery') == 'failed'
                     or (not message_id and state.get('delivery') == 'uncertain')):
