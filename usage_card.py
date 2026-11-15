@@ -80,7 +80,9 @@ class UsageCard:
         self.db.execute('CREATE TABLE IF NOT EXISTS usage_jobs('
                         'id INTEGER PRIMARY KEY,payload TEXT,state TEXT DEFAULT \'pending\',error TEXT)')
         self.state = self._load(self.KEY, {})
-        self.enabled = router.config.get('usage_card', False) is True or self._load(self.ENABLED, False) is True
+        saved_enabled = self._load(self.ENABLED, None)
+        self.enabled = (saved_enabled if type(saved_enabled) is bool
+                        else router.config.get('usage_card', True) is True)
         self.events = deque(maxlen=16)
         self.account_change = None
         self.generation = self.event_sequence = 0
