@@ -150,10 +150,11 @@ class UsageRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         root, other = (self.router.bridges[key].codex for key in ('root', 'other'))
         self.assertEqual(root.on_account_event, self.router.usage.on_account_event)
         self.assertIsNone(other.on_account_event)
-        self.assertFalse(self.router.usage.enabled)
+        self.assertTrue(self.router.usage.enabled)
         root.on_account_event({'method': 'account/updated', 'params': {},
                                '_account_epoch': root.user_input_epoch})
-        self.assertEqual(len(self.router.usage.events), 0)
+        self.assertEqual(len(self.router.usage.events), 1)
+        self.assert_no_native_or_all_dispatch()
 
     def test_usage_command_from_main_or_topic_enters_only_usage_lane(self):
         for update in (self.message(100), self.message(101, topic=22),

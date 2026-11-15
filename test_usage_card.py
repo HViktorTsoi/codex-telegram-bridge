@@ -176,6 +176,44 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('剩余 81%', self.ui.text())
         self.assertEqual(self.native.call.await_count, 1)
 
+    async def test_missing_setting_shows_and_pins_card_without_usage_command(self):
+        self.router.config.pop('usage_card')
+        self.ui = UsageCard(self.router, clock=lambda: self.now)
+        await self.ui.tick()
+        self.native.call.assert_awaited_once_with('account/rateLimits/read', {})
+        self.assertEqual(len(self.methods('sendMessage')), 1)
+        self.assertEqual(len(self.methods('pinChatMessage')), 1)
+        self.assertNotIn('message_thread_id', self.methods('sendMessage')[0])
+        self.assertTrue(self.methods('sendMessage')[0]['disable_notification'])
+        self.assertTrue(self.methods('pinChatMessage')[0]['disable_notification'])
+
+    async def test_saved_disabled_preference_prevents_default_or_config_enabling_card(self):
+        with self.db:
+            self.db.execute('INSERT INTO kv VALUES(?,?)', (UsageCard.ENABLED, 'false'))
+        for configured in (None, True):
+            with self.subTest(configured=configured):
+                if configured is None:
+                    self.router.config.pop('usage_card', None)
+                else:
+                    self.router.config['usage_card'] = configured
+                self.ui = UsageCard(self.router, clock=lambda: self.now)
+                self.ui.on_account_event({'method': 'account/rateLimits/updated', 'params': limits()})
+                self.assertFalse(await self.ui.tick())
+                self.native.call.assert_not_awaited()
+                self.assertEqual(self.calls, [])
+
+    async def test_usage_command_can_reenable_saved_disabled_preference(self):
+        with self.db:
+            self.db.execute('INSERT INTO kv VALUES(?,?)', (UsageCard.ENABLED, 'false'))
+        self.ui = UsageCard(self.router, clock=lambda: self.now)
+        self.assertFalse(await self.ui.tick())
+        self.assertTrue(self.ui.ingest(self.command()))
+        await self.ui.handle_one()
+        self.native.call.assert_awaited_once_with('account/rateLimits/read', {})
+        self.assertEqual(len(self.methods('sendMessage')), 1)
+        self.assertEqual(len(self.methods('pinChatMessage')), 1)
+        self.assertTrue(UsageCard(self.router).enabled)
+
     async def test_disabled_does_nothing_until_explicit_usage_command(self):
         self.router.config['usage_card'] = False
         self.ui = UsageCard(self.router, clock=lambda: self.now)
