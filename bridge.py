@@ -20,6 +20,7 @@ import aiohttp
 from attachments import AttachmentError, inputs_for, payload_from
 from message_format import message_parts, send_output
 from reply_context import serialized as reply_serialized
+from session_scope import SessionScope, SessionScopeError
 
 LOG = logging.getLogger("codex_telegram")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -448,10 +449,46 @@ class Telegram:
         return data["result"]
 
 
+class TelegramScopeError(ConnectionError):
+    """Ownership changed before the next Telegram request was submitted."""
+    uncertain = False
+
+
+class GuardedTelegram:
+    """Keep a bridge's ownership check at each actual request, including fallbacks."""
+    def __init__(self, client, allowed):
+        self.client, self.allowed = client, allowed
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    @property
+    def rich_supported(self):
+        return getattr(self.client, 'rich_supported', None)
+
+    @rich_supported.setter
+    def rich_supported(self, value):
+        self.client.rich_supported = value
+
+    def _require(self):
+        if not self.allowed():
+            raise TelegramScopeError('Session ownership or access changed; Telegram request blocked')
+
+    async def call(self, *args, **kwargs):
+        self._require()
+        return await self.client.call(*args, **kwargs)
+
+    async def upload(self, *args, **kwargs):
+        self._require()
+        return await self.client.upload(*args, **kwargs)
+
+
 class Bridge:
     def __init__(self, config, state_dir):
         self.config, self.state_dir = config, Path(state_dir)
         self.thread_id, self.owner = config["thread_id"], str(config["owner_id"])
+        self.session_scope = SessionScope(config)
+        self.session_scope.require(self.thread_id)
         self.telegram_dir = Path(config["telegram_state_dir"])
         self.store = Store(self.state_dir / "bridge.sqlite")
         if self.store.get('output_format') is None:
@@ -468,7 +505,14 @@ class Bridge:
             return {}
 
     def owner_allowed(self):
-        return permitted({"from": {"id": self.owner}, "chat": {"id": self.owner, "type": "private"}}, self.access(), self.owner)
+        return (self.thread_allowed(self.thread_id)
+                and permitted({"from": {"id": self.owner}, "chat": {"id": self.owner, "type": "private"}}, self.access(), self.owner))
+
+    def thread_allowed(self, thread_id):
+        try:
+            return self.session_scope.allows(thread_id)
+        except SessionScopeError:
+            return False
 
     def token(self):
         content = (self.telegram_dir / ".env").read_text()
@@ -478,6 +522,8 @@ class Bridge:
         return match[1].strip().strip("\"'")
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
+        if not self.thread_allowed(self.thread_id):
+            return
         self.store.images.observe(turn_id, item, completed_ms)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
             return
@@ -499,6 +545,8 @@ class Bridge:
 
     async def reconcile(self, replay=False):
         """Recover outputs after reconnect without re-executing accepted input."""
+        if not self.thread_allowed(self.thread_id):
+            return []
         turns = {turn["id"]: turn for turn in await self.codex.turns(limit=30)}
         for row in self.store.db.execute("SELECT * FROM inbox WHERE state='dispatching'").fetchall():
             found = None
@@ -527,6 +575,10 @@ class Bridge:
 
     async def connection_loop(self, notify):
         while True:
+            if not self.thread_allowed(self.thread_id):
+                self.ready.clear()
+                await asyncio.sleep(3)
+                continue
             try:
                 result = await self.codex.connect()
                 async with self.dispatch_lock:
@@ -593,7 +645,11 @@ class Bridge:
     async def model_command(self, command, argument):
         """Handle settings commands without starting a model turn."""
         settings = await self.codex.settings()
+        if not self.owner_allowed():
+            return '会话归属或访问权限已变化，未修改参数。'
         models = await self.codex.models()
+        if not self.owner_allowed():
+            return '会话归属或访问权限已变化，未修改参数。'
         lookup = {str(key).lower(): model for model in models
                   for key in [model.get("id"), model.get("model")] if key}
         current = lookup.get(str(settings.get("model", "")).lower())
@@ -638,7 +694,11 @@ class Bridge:
                 return f"当前模型不支持 effort：{argument}\n可选值：{', '.join(choices) or '默认'}"
             changes = {"effort": argument}
 
+        if not self.owner_allowed():
+            return '会话归属或访问权限已变化，未修改参数。'
         await self.codex.call("thread/settings/update", {"threadId": self.thread_id, **changes})
+        if not self.owner_allowed():
+            return '设置请求已提交，会话归属或访问权限已变化，未继续读取参数。'
         actual = await self.codex.settings()
         expected = {"model": changes.get("model", settings.get("model")),
                     "reasoningEffort": changes.get("effort", settings.get("reasoningEffort"))}
@@ -698,6 +758,9 @@ class Bridge:
                      f"状态：{status['status']['type']}\n" + self.settings_text(settings) + "\n支持文字、图片和文件；附件上限20MB。")
         elif command == "/stop":
             turns = await self.codex.turns(limit=1)
+            if not self.owner_allowed():
+                self.store.mark_batch(batch, "denied")
+                return
             if turns and turns[0]["status"] == "inProgress":
                 await self.codex.call("turn/interrupt", {"threadId": self.thread_id, "turnId": turns[0]["id"]})
                 reply = "已请求停止当前任务。"
@@ -706,6 +769,9 @@ class Bridge:
         elif command.startswith("/"):
             reply = "未识别的命令。发送 /help 查看支持的命令。"
         if reply is not None:
+            if not self.owner_allowed():
+                self.store.mark_batch(batch, "denied")
+                return
             self.store.enqueue(f"input:{update_id}:reply", chat_id, reply)
             self.store.mark_batch(batch, "done")
             return
@@ -795,6 +861,8 @@ class Bridge:
         while True:
             data = await self.codex.events.get()
             async with self.dispatch_lock:
+                if not self.thread_allowed(self.thread_id):
+                    continue
                 epoch = data.get('_turn_state_epoch')
                 if epoch is not None and epoch != self.codex.turn_state.epoch:
                     continue
@@ -875,6 +943,8 @@ class Bridge:
             raise RuntimeError("Configured owner is not in the Telegram allowlist")
         async with aiohttp.ClientSession() as session:
             self.telegram = Telegram(self.token(), session)
+            if self.session_scope.enabled:
+                self.telegram = GuardedTelegram(self.telegram, self.owner_allowed)
             me = await self.telegram.call("getMe")
             self.username = me["username"]
             expected = self.config.get("expected_bot_username")

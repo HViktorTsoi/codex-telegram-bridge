@@ -201,6 +201,23 @@ class GroupCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inbox('manager'), [])
         self.assertFalse(any(m.startswith('turn/') for m, _ in self.calls))
 
+    async def test_namespaced_store_input_accepts_own_reply_and_cancels_pending_relay(self):
+        for bridge in self.router.bridges.values():
+            bridge.store.bot_id = self.router.bot_id
+        run = await self.started()
+        self.assertEqual(self.inbox('cad')[0]['client_id'],
+                         'telegram-444-' + str(input_id(run['id'], 'cad')))
+        self.answer('cad')
+        self.assertEqual(self.run_row()['cad_reply'], self.ui.expected(run, 'cad'))
+        await self.ui.tick()
+        await self.ui.tick()
+        self.assertEqual(self.run_row()['state'], 'manager_queued')
+        self.assertEqual(self.inbox('manager')[0]['client_id'],
+                         'telegram-444-' + str(input_id(run['id'], 'manager')))
+        await self.command('/collab_stop')
+        self.assertEqual(self.inbox('manager')[0]['state'], 'cancelled')
+        self.assertEqual(self.inbox('cad')[0]['state'], 'done')
+
     async def test_timeout_and_rebinding_prevent_downstream_dispatch(self):
         await self.started()
         self.now += 601
@@ -249,6 +266,134 @@ class GroupCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.run_row()['state'], 'cad_wait')
         self.assertEqual(len(self.inbox('cad')), 1)
         self.assertEqual(self.inbox('cad')[0]['id'], 900)
+
+    def scoped(self):
+        denied = set()
+        self.router.thread_allowed = lambda thread: thread not in denied
+        return denied
+
+    async def test_foreign_participant_cannot_start_a_new_run(self):
+        denied = self.scoped()
+        denied.add('cad-native')
+        await self.command()
+        await self.ui.tick()
+        self.assertIsNone(self.run_row())
+        self.assertEqual(self.inbox('cad'), [])
+        self.assertEqual(self.inbox('manager'), [])
+        self.assertIn('绑定已变化', self.calls[0][1]['text'])
+
+    async def test_scope_revocation_cancels_only_pending_test_input_and_never_resumes(self):
+        denied = self.scoped()
+        run = await self.started()
+        cad = self.router.bridges['cad']
+        for update_id, state in [(888, 'pending'), (889, 'running')]:
+            cad.store.accept({'update_id': update_id}, {'chat': {'id': 123},
+                'text': 'real user task', 'message_thread_id': 11})
+            with cad.store.db:
+                cad.store.db.execute('UPDATE inbox SET state=? WHERE id=?', (state, update_id))
+        denied.add('cad-native')
+        await self.ui.tick()
+        self.assertEqual(self.run_row()['state'], 'failed')
+        states = {row['id']: row['state'] for row in self.inbox('cad')}
+        self.assertEqual(states, {input_id(run['id'], 'cad'): 'cancelled', 888: 'pending', 889: 'running'})
+        denied.clear()
+        await self.ui.tick()
+        self.assertEqual(self.inbox('manager'), [])
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_scope_revocation_does_not_interrupt_an_already_running_native_test(self):
+        denied = self.scoped()
+        run = await self.started()
+        cad = self.router.bridges['cad']
+        with cad.store.db:
+            cad.store.db.execute("UPDATE inbox SET state='running',turn_id='running-test' WHERE id=?",
+                                 (input_id(run['id'], 'cad'),))
+        queries = cad.codex.turns.await_count
+        denied.add('cad-native')
+        await self.ui.tick()
+        self.assertEqual(self.run_row()['state'], 'failed')
+        self.assertEqual(self.inbox('cad')[0]['state'], 'running')
+        self.assertEqual(cad.codex.turns.await_count, queries)
+        self.assertEqual(self.inbox('manager'), [])
+
+    async def test_reply_event_after_migration_cannot_accept_or_relay_confirmation(self):
+        denied = self.scoped()
+        await self.started()
+        denied.add('cad-native')
+        self.answer('cad')
+        self.assertEqual(self.run_row()['state'], 'failed')
+        self.assertIsNone(self.run_row()['cad_reply'])
+        await self.ui.tick()
+        self.assertEqual(self.inbox('manager'), [])
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_migration_during_native_idle_read_is_rechecked_before_enqueue(self):
+        denied = self.scoped()
+        await self.command()
+        await self.ui.tick()
+        cad = self.router.bridges['cad']
+
+        async def read(limit=1):
+            denied.add('cad-native')
+            return [{'id': 'old', 'status': 'completed'}]
+
+        cad.codex.turns.side_effect = read
+        await self.ui.tick()
+        self.assertEqual(self.run_row()['state'], 'failed')
+        self.assertEqual(self.inbox('cad'), [])
+        self.assertEqual(self.inbox('manager'), [])
+
+    async def test_direct_sender_blocks_queued_start_without_relying_on_advance(self):
+        denied = self.scoped()
+        await self.command()
+        denied.add('cad-native')
+        self.assertTrue(await self.ui._send_one())
+        self.assertEqual(self.run_row()['state'], 'failed')
+        self.assertEqual(self.db.execute('SELECT state FROM gc_outbox').fetchone()[0], 'cancelled')
+        self.router.telegram.call.assert_not_awaited()
+
+    async def test_completed_run_pending_confirmation_is_not_sent_after_migration(self):
+        denied = self.scoped()
+        await self.started()
+        self.answer('cad')
+        await self.ui.tick()
+        await self.ui.tick()
+        self.answer('manager')
+        await self.ui._advance()
+        self.assertEqual(self.run_row()['state'], 'done')
+        calls = len(self.calls)
+        denied.add('cad-native')
+        self.assertTrue(await self.ui._send_one())
+        self.assertEqual(len(self.calls), calls)
+        self.assertEqual(self.db.execute("SELECT state FROM gc_outbox WHERE id=?",
+                         (self.run_row()['id'] + ':done',)).fetchone()[0], 'cancelled')
+
+    async def test_recovery_retires_foreign_run_and_cancels_even_delayed_outbox(self):
+        denied = self.scoped()
+        self.router.telegram.call.side_effect = TelegramError('sendMessage', 429, 'limited', retry_after=100)
+        await self.command()
+        await self.ui.tick()
+        denied.add('cad-native')
+        self.ui.recover()
+        self.assertEqual(self.run_row()['state'], 'failed')
+        self.assertEqual(self.db.execute('SELECT state FROM gc_outbox').fetchone()[0], 'cancelled')
+        self.assertFalse(await self.ui._send_one())
+        self.assertEqual(self.router.telegram.call.await_count, 1)
+
+    async def test_scope_hook_failure_fails_closed_without_dispatch(self):
+        def unavailable(thread_id):
+            raise ValueError('scope registry unavailable')
+
+        self.router.thread_allowed = unavailable
+        await self.command()
+        self.assertIsNone(self.run_row())
+        self.assertEqual(self.inbox('cad'), [])
+
+    async def test_configured_scope_without_hook_does_not_revert_to_legacy_access(self):
+        self.router.config['session_scope'] = 'general'
+        await self.command()
+        self.assertIsNone(self.run_row())
+        self.assertEqual(self.inbox('cad'), [])
 
 
 if __name__ == '__main__':

@@ -21,6 +21,8 @@ class QuestionTests(unittest.IsolatedAsyncioTestCase):
         self.router = SimpleNamespace(store=store, owner='123', bot_id=444, targets={}, bridges={})
         self.router.access = lambda: {'dmPolicy': 'allowlist', 'allowFrom': ['123']}
         self.router.owner_allowed = lambda: True
+        self.router.session_scope = SimpleNamespace(allows=lambda thread_id: True)
+        self.router.thread_allowed = lambda thread_id: self.router.session_scope.allows(thread_id)
         self.calls, self.native, self.sequence, self.messages = [], [], 100, {}
         self.send_error, self.submit_error, self.on_send = None, None, None
         test = self
@@ -59,7 +61,8 @@ class QuestionTests(unittest.IsolatedAsyncioTestCase):
         self.router.telegram = Telegram()
         for key, topic in [('alpha', 42), ('beta', 99)]:
             target = {'key': key, 'thread_id': key + '-native', 'message_thread_id': topic}
-            bridge = SimpleNamespace(target=target, thread_id=target['thread_id'], codex=Native())
+            bridge = SimpleNamespace(target=target, thread_id=target['thread_id'], codex=Native(),
+                                     owner_allowed=lambda: True)
 
             async def submit(question, answers, client_id):
                 self.native.append(('async', copy.deepcopy(question), copy.deepcopy(answers), client_id))
@@ -240,6 +243,19 @@ class QuestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.panel()['reply_markup']['inline_keyboard'], [])
         await self.click(panel)
         self.assertEqual(self.native, [])
+
+    async def test_migration_rejects_existing_answer_and_does_not_render_terminal_contents(self):
+        panel = await self.show()
+        self.bridge.owner_allowed = lambda: False
+        self.router.session_scope.allows = lambda thread_id: thread_id != self.bridge.thread_id
+        before = len([method for method, _ in self.calls if method == 'editMessageText'])
+        await self.click(panel)
+        self.ui.sweep()
+        await self.ui.flush_one()
+        await self.ui.flush_one()
+        self.assertEqual(self.native, [])
+        self.assertEqual(len([method for method, _ in self.calls if method == 'editMessageText']), before)
+        self.assertEqual(self.row()['dirty'], 0)
 
     async def test_free_text_uses_exact_reply_prompt_and_preserves_other_commands(self):
         panel = await self.show()

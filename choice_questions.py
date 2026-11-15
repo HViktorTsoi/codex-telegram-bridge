@@ -116,7 +116,8 @@ class ChoiceQuestions:
         target = self.router.targets.get(question['target_key'])
         bridge = self.router.bridges.get(question['target_key'])
         expected = {key: question[key] for key in ('target_key', 'thread_id', 'topic_id')}
-        if (not self.router.owner_allowed() or not target or not bridge or target.get('topic_missing')
+        if (not self.router.owner_allowed() or not target or not bridge or not bridge.owner_allowed()
+                or target.get('topic_missing')
                 or bridge.target.get('topic_missing') or self._binding(bridge) != expected
                 or target['thread_id'] != question['thread_id']
                 or target['message_thread_id'] != question['topic_id']
@@ -127,7 +128,8 @@ class ChoiceQuestions:
 
     def _remember(self, bridge, kind, turn_id, item_id, questions, request_id=None, epoch=None):
         binding = self._binding(bridge)
-        if not item_id or not turn_id or not self.router.bot_id or bridge.target.get('topic_missing'):
+        if (not item_id or not turn_id or not self.router.bot_id or not bridge.owner_allowed()
+                or bridge.target.get('topic_missing')):
             return
         identity = hashlib.sha256(_json([bridge.thread_id, kind, turn_id, item_id]).encode()).hexdigest()
         existing = self.db.execute('SELECT * FROM choice_questions WHERE id=?', (identity,)).fetchone()
@@ -279,7 +281,9 @@ class ChoiceQuestions:
         if state in ACTIVE:
             self._bridge(question)
         elif (not self.router.owner_allowed() or question['chat_id'] != str(self.router.owner)
-                or question['bot_id'] != self.router.bot_id):
+                or question['bot_id'] != self.router.bot_id
+                or not self.router.thread_allowed(question['thread_id'])):
+            # Terminal cards retain questions/answers even after a rebind.
             raise ChoiceError('不再允许更新此问题。')
         keyboard, tokens = [], []
         if state in ACTIVE:
@@ -358,6 +362,7 @@ class ChoiceQuestions:
                         (question['id'], question['position']))
 
     async def _other(self, question):
+        self._bridge(question)
         with self.db:
             claim = self.db.execute('SELECT state FROM choice_prompt_claims WHERE question_id=? AND position=?',
                                     (question['id'], question['position'])).fetchone()

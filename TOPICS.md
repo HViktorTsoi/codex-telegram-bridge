@@ -1,4 +1,4 @@
-# One Bot, multiple local Codex conversations
+# Telegram Bots and local Codex conversations
 
 Topic mode includes a chat-wide persistent reply keyboard with three command
 shortcuts in one row: Sessions, Tasks and Stop, using the client's default theme.
@@ -75,9 +75,65 @@ echo. Unquoted inputs and command/media classification remain unchanged.
 The additive `inbox.reply_json` column is stored atomically with each input;
 existing queued rows need no backfill and continue with their original input.
 
-Use the usual `/usr/bin/python3 manage.py start|stop|status` on zbox. `manage.py`
-selects the entry point from `config.json`; configurations without `mode: topics`
-continue using `bridge.py`. Topic mode does not use `--notify`.
+`manage.py` selects the entry point from `config.json`; configurations without
+`mode: topics` continue using `bridge.py`. For an independent instance, specify
+both `--state-dir` and `--session-name` on every start, stop, status or logs command:
+
+```sh
+.venv/bin/python manage.py start --state-dir "$HOME/.local/state/codex-telegram-research" --session-name codex-telegram-research
+```
+
+Topic mode does not use `--notify`.
+
+## Optional three-Bot groups
+
+Run separate `general`, `research` and `development` Bots with independent
+Tokens, credential directories (`telegram_state_dir`), bridge state directories,
+tmux session names and update offsets. A Token has exactly one poller. Do not
+copy an offset or Telegram topic IDs between Bots.
+
+Each Bot's private `config.json` may include the following fragment, changing
+`session_scope` for that Bot while sharing the same absolute registry path:
+
+```json
+{
+  "session_scope_file": "/home/YOUR_USER/.local/state/codex-telegram-scopes.json",
+  "session_scope": "research"
+}
+```
+
+Create the shared registry before enabling these fields:
+
+```json
+{
+  "version": 1,
+  "default_scope": "general",
+  "scopes": ["general", "research", "development"],
+  "assignments": {
+    "EXISTING_GENERAL_ID": "general",
+    "EXISTING_RESEARCH_ID": "research",
+    "EXISTING_DEVELOPMENT_ID": "development"
+  }
+}
+```
+
+IDs are existing native Codex thread IDs. Unassigned existing threads use
+`default_scope`; new threads explicitly created through a Bot's wizard are
+automatically assigned to that Bot's scope. Omitting both configuration fields
+keeps the previous behavior. When enabled, missing or invalid registry data
+blocks scoped operations; it does not restore an older allocation or choose a
+different session. Menus, old callbacks and queued delivery recheck ownership.
+Scope limits session discovery and routing, not filesystem, tool or OS access.
+
+Moving an existing session preserves its native ID, history and settings; only
+the Telegram binding changes. Drain and back up first, retire the old
+`binding_ops` records to prevent recovery from restoring them, and bind the same
+ID in the destination Bot. Telegram history cannot move between Bots: close old
+topics first and retain them instead of deleting them. This is a deployment
+procedure, not a one-click menu action; follow
+[the migration steps](DEPLOYMENT.md#三-bot-分组与已有会话迁移).
+
+## Session menus and routing
 
 From the main chat or any private topic, `/sessions` opens the session menu in
 the main chat. The home panel lists the working directory of each bound

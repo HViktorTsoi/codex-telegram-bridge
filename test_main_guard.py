@@ -96,6 +96,15 @@ class MainGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(method in ('thread/read', 'thread/list') for method, _ in self.native_calls))
         self.assertEqual(self.telegram.created, [])
 
+    async def test_migrated_target_is_hidden_and_old_destination_button_cannot_release_input(self):
+        _, panel = await self.send('仅发给原选择的会话')
+        self.router.bridges['instagram'].owner_allowed = lambda: False
+        await self.click(panel, 'Instagram')
+        self.assert_held()
+        _, fresh = await self.send('重新选择接收会话')
+        self.assertNotIn('Instagram', str(fresh['reply_markup']))
+        self.assertIn('会议记录', str(fresh['reply_markup']))
+
     async def test_default_root_is_never_implicitly_selected_and_can_be_chosen_explicitly(self):
         _, panel = await self.send('发给 Manager 的内容')
         self.assertEqual(self.inbox('meeting'), [])

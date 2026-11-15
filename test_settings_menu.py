@@ -126,6 +126,24 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
         await self.ui.handle_one()
         return update
 
+    async def test_migrated_session_rejects_existing_model_button_without_native_access(self):
+        panel = await self.send('/model')
+        self.router.bridges['manager'].owner_allowed = lambda: False
+        self.native_reads.clear()
+        await self.click(panel, 'native-B')
+        self.assertEqual(self.native_reads, [])
+        self.assertEqual(self.updates, [])
+
+    async def test_migration_while_model_list_is_loading_prevents_settings_write_and_render(self):
+        panel = await self.send('/model')
+        async def migrate():
+            self.router.bridges['manager'].owner_allowed = lambda: False
+        self.after_models = migrate
+        before = sum(method == 'editMessageText' for method, _ in self.calls)
+        await self.click(panel, 'native-B')
+        self.assertEqual(self.updates, [])
+        self.assertEqual(sum(method == 'editMessageText' for method, _ in self.calls), before)
+
     @staticmethod
     def labels(panel):
         return [button['text'] for row in panel['reply_markup']['inline_keyboard'] for button in row]

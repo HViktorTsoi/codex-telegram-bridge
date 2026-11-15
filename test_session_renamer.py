@@ -142,6 +142,26 @@ class RenamerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(topic_calls[0]['name'], '中文 新名字')
         self.assertTrue(all(b.store.pending() is None for b in self.router.bridges.values()))
 
+    async def test_migrated_session_rejects_old_confirmation_without_native_or_topic_write(self):
+        panel = await self.review()
+        self.router.bridges['meeting'].owner_allowed = lambda: False
+        await self.click(panel, '确认改名')
+        self.assertEqual(self.writes, [])
+        self.assertFalse(any(method == 'editForumTopic' for method, _ in self.telegram.calls))
+
+    async def test_migration_during_initial_metadata_read_does_not_create_rename_prompt(self):
+        from session_picker import BindingError
+        bridge = self.router.bridges['meeting']
+        async def read_then_migrate(method, params):
+            result = await self.native(method, params)
+            bridge.owner_allowed = lambda: False
+            return result
+        self.router.catalog_call = AsyncMock(side_effect=read_then_migrate)
+        with self.assertRaises(BindingError):
+            await self.router.picker.renamer.start({'message': {'chat': {'id': 123}}}, bridge.thread_id)
+        self.assertEqual(self.router.store.db.execute('SELECT COUNT(*) FROM ui_renames').fetchone()[0], 0)
+        self.assertFalse(any(params.get('reply_markup', {}).get('force_reply') for _, params in self.telegram.calls))
+
     async def test_nonroot_rename_does_not_replace_session_or_touch_running_input(self):
         child = self.router.bridges['instagram']
         child.store.accept({'update_id': 50}, {'message_id': 50, 'chat': {'id': 123},

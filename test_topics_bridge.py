@@ -6,8 +6,42 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from topics_bridge import ExactCodex, RpcError, TopicRouter
+from topics_bridge import ExactCodex, RpcError, RoutedStore, TopicRouter
 from bridge import Codex, now_ms
+
+
+class RoutedStoreIdentityTests(unittest.TestCase):
+    def test_same_update_id_from_distinct_bots_has_distinct_native_client_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client_ids = []
+            for bot_id in (111, 222):
+                store = RoutedStore(Path(directory) / (str(bot_id) + '.sqlite'), 'same-native-thread')
+                try:
+                    store.bot_id = bot_id
+                    store.accept({'update_id': 42}, {'chat': {'id': 123}, 'text': 'task'})
+                    client_ids.append(store.db.execute('SELECT client_id FROM inbox').fetchone()[0])
+                finally:
+                    store.db.close()
+            self.assertEqual(client_ids, ['telegram-111-42', 'telegram-222-42'])
+
+    def test_replay_preserves_existing_legacy_and_namespaced_client_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for initial_bot in (None, 111):
+                with self.subTest(initial_bot=initial_bot):
+                    path = Path(directory) / (str(initial_bot) + '.sqlite')
+                    store = RoutedStore(path, 'native')
+                    store.bot_id = initial_bot
+                    store.accept({'update_id': 42}, {'chat': {'id': 123}, 'text': 'original task'})
+                    expected = tuple(store.db.execute('SELECT client_id,text FROM inbox').fetchone())
+                    store.db.close()
+                    replay = RoutedStore(path, 'native')
+                    try:
+                        replay.bot_id = 222
+                        replay.accept({'update_id': 42}, {'chat': {'id': 123}, 'text': 'duplicate task'})
+                        self.assertEqual(tuple(replay.db.execute('SELECT client_id,text FROM inbox').fetchone()), expected)
+                        self.assertEqual(replay.db.execute('SELECT COUNT(*) FROM inbox').fetchone()[0], 1)
+                    finally:
+                        replay.db.close()
 
 
 class NativeCompatibilityTests(unittest.IsolatedAsyncioTestCase):

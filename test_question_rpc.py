@@ -184,6 +184,8 @@ class ServerEventHookTests(unittest.IsolatedAsyncioTestCase):
         bridge.record_item, bridge.finish_turn = Mock(), Mock()
         bridge.store = SimpleNamespace(running=Mock(return_value=True), enqueue=Mock())
         bridge.owner = '123'
+        bridge.thread_id = 'thread'
+        bridge.thread_allowed = Mock(return_value=True)
         observed, complete = [], asyncio.Event()
 
         async def handle(event):

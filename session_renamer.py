@@ -67,7 +67,7 @@ class SessionRenamer:
         target = self.router.targets.get(frozen['key'])
         bridge = self.router.bridges.get(frozen['key'])
         if (not target or target.get('topic_missing') or self.binding(target) != frozen
-                or not bridge or bridge.thread_id != frozen['thread_id']
+                or not bridge or not bridge.owner_allowed() or bridge.thread_id != frozen['thread_id']
                 or self.binding(bridge.target) != frozen
                 or target['name'] not in (draft['old_name'], draft['new_name'])):
             raise BindingError('会话绑定或名称已变化，已停止同步。请重新打开 /sessions 核对后改名。')
@@ -101,6 +101,8 @@ class SessionRenamer:
             self.db.execute("UPDATE ui_rename_prompts SET state='expired' WHERE rename_id=? AND state='active'", (rename_id,))
 
     async def _panel(self, update, text, rows, draft=None):
+        if draft:
+            self._target(draft)
         if utf16_size(text) > 3800:
             text = next(plain_chunks(text, 3700)) + '\n（显示已截断。）'
         if draft and draft['panel_id'] and not update.get('callback_query'):
@@ -126,7 +128,9 @@ class SessionRenamer:
         return await self.choose(update, proposed=proposed)
 
     async def choose(self, update, page=0, proposed=None):
-        targets = self.router.recent.ordered([t for t in self.router.targets.values() if not t.get('topic_missing')])
+        targets = self.router.recent.ordered(t for t in self.router.targets.values()
+            if not t.get('topic_missing') and (bridge := self.router.bridges.get(t['key']))
+            and bridge.owner_allowed())
         pages = max(1, (len(targets) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
         rows = [[(clean_name(t['name'], 40), 'rename:select', {'thread_id': t['thread_id'], 'proposed': proposed})]
@@ -145,7 +149,8 @@ class SessionRenamer:
         if not self.router.owner_allowed():
             raise BindingError('当前账号没有访问权限。')
         target = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
-        if not target or target.get('topic_missing'):
+        bridge = self.router.bridges.get(target['key']) if target else None
+        if not target or target.get('topic_missing') or not bridge or not bridge.owner_allowed():
             raise BindingError('目标会话或话题不可用，请先从 /sessions 修复绑定。')
         pending = self._other_pending(thread_id)
         if pending:
@@ -156,7 +161,7 @@ class SessionRenamer:
         current = self.router.targets.get(target['key'])
         if (not isinstance(thread, dict) or thread.get('id') != thread_id or not current
                 or current.get('topic_missing') or self.binding(current) != frozen
-                or not self.router.owner_allowed()):
+                or not self.router.owner_allowed() or not bridge.owner_allowed()):
             raise BindingError('会话信息已变化，请重新选择。')
         origin = update.get('callback_query', {}).get('message') or update['message']
         rename_id = secrets.token_urlsafe(12)
@@ -178,6 +183,7 @@ class SessionRenamer:
         self._expire_prompts(draft['id'])
         await self._panel(update, '修改名称\n当前：' + draft['old_name'] + '\n请回复接下来的名称输入提示。',
                           [[('取消', 'rename:cancel', {'id': draft['id']})]], draft)
+        self._target(draft)
         text = PROMPT_TITLE + '\n请输入新名称（最多 90 个字符）。回复 /cancel 取消。'
         if error:
             text += '\n\n' + error
@@ -198,6 +204,7 @@ class SessionRenamer:
                 or prompt['topic_id'] != (message.get('message_thread_id') or None)):
             raise BindingError('这个改名提示已失效，请使用最新提示或重新打开 /sessions。')
         draft = self._draft(prompt['rename_id'], message['chat']['id'])
+        self._target(draft)
         if draft['stage'] != 'input':
             raise BindingError('这一步已经处理，请使用最新按钮。')
         with self.db:
@@ -243,6 +250,7 @@ class SessionRenamer:
                                   [('返回会话管理', 'home', {})]], draft)
 
     async def _native(self, draft):
+        self._target(draft)
         binding = json.loads(draft['binding_json'])
         result = await self.router.catalog_call('thread/read', {'threadId': binding['thread_id']})
         thread = result.get('thread') if isinstance(result, dict) else None
@@ -321,6 +329,7 @@ class SessionRenamer:
             return await self.choose(update, data.get('page', 0), data.get('proposed'))
         origin = update.get('callback_query', {}).get('message') or update['message']
         draft = self._draft(data['id'], origin['chat']['id'])
+        self._target(draft)
         if draft['stage'] == 'done':
             target = self.router.targets.get(json.loads(draft['binding_json'])['key'])
             if target:
@@ -346,9 +355,17 @@ class SessionRenamer:
         return await self.apply(update, draft)
 
     def unfinished(self):
-        return self.db.execute("SELECT * FROM ui_renames WHERE chat_id=? AND stage IN "
+        rows = self.db.execute("SELECT * FROM ui_renames WHERE chat_id=? AND stage IN "
                                "('native_pending','topic_pending','config_pending') ORDER BY updated_at DESC LIMIT 5",
                                (str(self.router.owner),)).fetchall()
+        visible = []
+        for draft in rows:
+            try:
+                self._target(draft)
+            except BindingError:
+                continue
+            visible.append(draft)
+        return visible
 
     def recover(self):
         # Metadata assignments can retry the same value. Keep the saved stage and

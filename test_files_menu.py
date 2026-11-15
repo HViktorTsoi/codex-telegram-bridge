@@ -169,6 +169,42 @@ class FilesMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('parse_mode', panel)
         self.assertTrue(all(len(b.get('callback_data', '')) < 64 for row in panel['reply_markup']['inline_keyboard'] for b in row))
 
+    async def test_migrated_session_rejects_existing_file_button_without_upload(self):
+        self.outgoing()
+        panel = await self.open()
+        self.router.bridges['a'].owner_allowed = lambda: False
+        await self.click(panel, 'report.pdf')
+        self.assertEqual(self.sends(), [])
+
+    async def test_queued_file_send_rechecks_scope_before_upload(self):
+        self.outgoing()
+        panel = await self.open()
+        update = self.click_update(panel, 'report.pdf')
+        self.assertTrue(self.ui.ingest(update))
+        job = self.ui.db.execute('SELECT * FROM fl_jobs WHERE id=?', (update['update_id'],)).fetchone()
+        await self.ui._process(job)
+        self.router.bridges['a'].owner_allowed = lambda: False
+        await self.ui.send_one()
+        self.assertEqual(self.sends(), [])
+        self.assertEqual(self.state()['state'], 'failed')
+
+    async def test_migration_after_photo_rejection_blocks_document_fallback(self):
+        image = base64.b64decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=')
+        self.outgoing(name='chart.png', data=image, kind='image')
+        panel = await self.open()
+        original = self.router.telegram.upload
+        async def reject_and_migrate(method, *args, **kwargs):
+            if method == 'sendPhoto':
+                self.calls.append((method, kwargs))
+                self.router.bridges['a'].owner_allowed = lambda: False
+                raise TelegramError(method, 400, 'PHOTO_INVALID_DIMENSIONS')
+            return await original(method, *args, **kwargs)
+        self.router.telegram.upload = reject_and_migrate
+        await self.click(panel, 'chart.png')
+        self.assertEqual([method for method, _ in self.sends()], ['sendPhoto'])
+        self.assertEqual(self.state()['state'], 'failed')
+
     async def test_outgoing_photo_snapshot_keeps_matching_bot_and_topic_route(self):
         image = base64.b64decode(
             'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=')

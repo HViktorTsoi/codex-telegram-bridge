@@ -109,6 +109,7 @@ class SkillsMenu:
         target = self.router.targets.get(binding.get('target_key'))
         bridge = self.router.bridges.get(binding.get('target_key'))
         if (not self.router.owner_allowed() or not target or target.get('topic_missing') or not bridge
+                or not bridge.owner_allowed()
                 or self.binding(target) != binding or bridge.thread_id != binding.get('thread_id')
                 or bridge.target.get('message_thread_id') != binding.get('topic_id')
                 or bridge.target.get('topic_missing')):
@@ -176,6 +177,7 @@ class SkillsMenu:
     async def _fetch(self, binding, force=False):
         self._target(binding)
         metadata = await asyncio.wait_for(self.router.catalog_call('thread/read', {'threadId': binding['thread_id']}), self.TIMEOUT)
+        self._target(binding)
         thread = metadata.get('thread') if isinstance(metadata, dict) else None
         if not isinstance(thread, dict):
             raise SkillsError('会话目录信息不完整，请稍后重试。')
@@ -211,7 +213,9 @@ class SkillsMenu:
         return cwd, skills, bool(group.get('errors') or malformed)
 
     async def _selector(self, update, query='', page=0):
-        targets = self.router.recent.ordered(t for t in self.router.targets.values() if not t.get('topic_missing'))
+        targets = self.router.recent.ordered(t for t in self.router.targets.values()
+            if not t.get('topic_missing') and (bridge := self.router.bridges.get(t['key']))
+            and bridge.owner_allowed())
         pages = max(1, (len(targets) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
         rows = [[(target['name'], 'target', {'binding': self.binding(target), 'query': query})]

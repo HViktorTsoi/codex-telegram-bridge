@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from bridge import RpcError, TelegramError, permitted
+from session_scope import SessionScopeError
 
 
 class BindingError(Exception):
@@ -140,7 +141,8 @@ class SessionPicker:
         return result
 
     async def home(self, update):
-        targets = self.router.recent.ordered(self.router.targets.values())[:12]
+        visible = [t for t in self.router.targets.values() if self.router.thread_allowed(t['thread_id'])]
+        targets = self.router.recent.ordered(visible)[:12]
         cached = self._directory_values()
         directories = [self.cached_directory(t['thread_id'], 90, cached) for t in targets]
         lines = ['已绑定的原 Codex 会话（最近使用在前）：']
@@ -148,7 +150,7 @@ class SessionPicker:
             ready = self.router.bridges[target['key']].ready.is_set()
             status = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
             lines.append(f"{number}. {clean_name(target['name'], 40)}（{status}）\n目录：{directory}")
-        if len(self.router.targets) > len(targets):
+        if len(visible) > len(targets):
             lines.append('更多会话请点击“添加会话”查看。')
         lines.append('All 是管理入口；普通消息选择接收会话后立即发送。')
         text = '\n\n'.join(lines) + '\n\n点击“添加会话”，选择本机已有的 Codex 会话并绑定到新话题。'
@@ -172,7 +174,8 @@ class SessionPicker:
     def cache_directory(self, thread):
         """Retain display metadata; binding still requires a fresh native check."""
         thread_id = thread.get('id')
-        if not isinstance(thread_id, str) or not thread_id or 'cwd' not in thread:
+        if (not isinstance(thread_id, str) or not thread_id or 'cwd' not in thread
+                or not self.router.thread_allowed(thread_id)):
             return
         cwd = thread['cwd']
         cwd = cwd if isinstance(cwd, str) and cwd else None
@@ -215,13 +218,16 @@ class SessionPicker:
             pass
         # Successful exact-thread reads take precedence over fallback snapshots.
         values.update({row['thread_id']: row['cwd'] for row in self.db.execute('SELECT * FROM ui_thread_directories')})
-        return values
+        return {tid: cwd for tid, cwd in values.items() if self.router.thread_allowed(tid)}
 
     def cached_directory(self, thread_id, limit=220, values=None):
+        if not self.router.thread_allowed(thread_id):
+            return '目录暂不可用'
         values = self._directory_values() if values is None else values
         return directory_text({'cwd': values[thread_id]}, limit) if thread_id in values else '目录暂不可用'
 
     async def directory(self, thread_id, limit=220):
+        self.router.session_scope.require(thread_id)
         try:
             result = await asyncio.wait_for(self.router.catalog_call('thread/read', {'threadId': thread_id}), 5)
             thread = result['thread']
@@ -239,7 +245,7 @@ class SessionPicker:
             if cursor:
                 params['cursor'] = cursor
             result = await self.router.catalog_call('thread/list', params)
-            for thread in result.get('data', []):
+            for thread in self.router.session_scope.filter_threads(result.get('data', [])):
                 if (thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False
                         or thread['id'] in seen):
                     continue
@@ -270,6 +276,19 @@ class SessionPicker:
                             (catalog_id, json.dumps(payload, ensure_ascii=False), time.time() + 900))
         return catalog_id, payload
 
+    def scoped_groups(self, groups):
+        visible = []
+        for group in groups:
+            threads = self.router.session_scope.filter_threads(group['threads'])
+            if threads:
+                visible.append({**group, 'threads': threads})
+        return visible
+
+    async def empty_catalog(self, update):
+        host = self.router.config.get('host_id', '本机')
+        return await self.panel(update, f'{host} · 添加会话\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。',
+                                [[('重新加载', 'catalog', {}), ('返回', 'home', {})]])
+
     async def catalog(self, update, data):
         catalog_id = data.get('catalog_id')
         if catalog_id:
@@ -277,7 +296,7 @@ class SessionPicker:
                                     (catalog_id, time.time())).fetchone()
             if not saved:
                 raise BindingError('这个目录列表已过期，请点击“重新加载”或重新打开 /sessions。')
-            groups = json.loads(saved['payload'])
+            groups = self.scoped_groups(json.loads(saved['payload']))
             with self.db:
                 self.db.execute('UPDATE ui_catalogs SET expires_at=? WHERE id=?', (time.time() + 900, catalog_id))
             group_index = max(0, min(int(data.get('group', 0)), len(groups) - 1))
@@ -286,8 +305,7 @@ class SessionPicker:
             group_index = next((i for i, g in enumerate(groups) if 'directory' in data and g['cwd'] == data['directory']), 0)
         host = self.router.config.get('host_id', '本机')
         if not groups:
-            return await self.panel(update, f'{host} · 添加会话\n未找到可绑定会话；可先在电脑上创建会话，再点“重新加载”。',
-                                    [[('重新加载', 'catalog', {}), ('返回', 'home', {})]])
+            return await self.empty_catalog(update)
         if 'group' not in data and 'directory' not in data:
             return await self.directory_index(update, catalog_id, groups, data.get('dir_page', 0))
         group = groups[group_index]
@@ -326,6 +344,9 @@ class SessionPicker:
         await self.panel(update, text, rows)
 
     async def directory_index(self, update, catalog_id, groups, page=0):
+        groups = self.scoped_groups(groups)
+        if not groups:
+            return await self.empty_catalog(update)
         page_count = (len(groups) + 11) // 12
         page = max(0, min(int(page), page_count - 1))
         rows = []
@@ -348,6 +369,7 @@ class SessionPicker:
         await self.panel(update, text, rows)
 
     async def selected(self, update, thread_id, catalog=None):
+        self.router.session_scope.require(thread_id)
         existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
         if existing:
             if existing.get('topic_missing'):
@@ -390,6 +412,7 @@ class SessionPicker:
             raise TopicCreationUnavailable(int(remaining + 0.999))
 
     async def bind(self, thread_id, allow_create=True):
+        self.router.session_scope.require(thread_id)
         existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
         if existing:
             if existing.get('topic_missing'):
@@ -419,6 +442,7 @@ class SessionPicker:
         return target
 
     async def create_topic(self, thread_id, target):
+        self.router.session_scope.require(thread_id)
         self.check_topic_creation_available()
         self.operation(thread_id, target, 'creating')
         try:
@@ -454,6 +478,7 @@ class SessionPicker:
         return target
 
     async def repair_selected(self, update, thread_id, topic_id):
+        self.router.session_scope.require(thread_id)
         target = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
         if not target:
             return await self.selected(update, thread_id)
@@ -470,6 +495,7 @@ class SessionPicker:
                                         [('取消', 'home', {})]])
 
     async def repair(self, thread_id, topic_id, allow_create=True):
+        self.router.session_scope.require(thread_id)
         existing = next((t for t in self.router.targets.values() if t['thread_id'] == thread_id), None)
         if not existing:
             raise BindingError('原绑定已改变，请重新打开 /sessions。')
@@ -497,6 +523,7 @@ class SessionPicker:
         return target
 
     async def bound_panel(self, update, target, already=False, catalog=None):
+        self.router.session_scope.require(target['thread_id'])
         directory = await self.directory(target['thread_id'])
         text = (('此会话已经绑定。' if already else '已绑定，立即生效。') +
                 f"\n\n请进入话题「{target['name']}」继续聊天。\nID：{target['thread_id']}\n目录：{directory}\n"
@@ -566,6 +593,8 @@ class SessionPicker:
                         or button['topic_id'] != (origin.get('message_thread_id') or None)):
                     raise BindingError('这个按钮已失效，请发送 /sessions 重新打开。')
                 data, action = json.loads(button['data']), button['action']
+                if data.get('thread_id'):
+                    self.router.session_scope.require(data['thread_id'])
                 if action.startswith('new:'):
                     await self.creator.handle(update, action, data)
                 elif action.startswith('rename:'):
@@ -596,7 +625,7 @@ class SessionPicker:
                     raise BindingError('未知按钮，请发送 /sessions 重新打开。')
             with self.db:
                 self.db.execute("UPDATE ui_jobs SET state='done' WHERE id=?", (job['id'],))
-        except (BindingError, RpcError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TelegramError) as error:
+        except (BindingError, SessionScopeError, RpcError, ConnectionError, asyncio.TimeoutError, OSError, ValueError, TelegramError) as error:
             detail = str(error) if isinstance(error, BindingError) else '暂时无法完成，请稍后发送 /sessions 重试。'
             with self.db:
                 self.db.execute("UPDATE ui_jobs SET state='failed',error=? WHERE id=?", (type(error).__name__, job['id']))
@@ -625,6 +654,8 @@ class SessionPicker:
             self.db.execute("UPDATE binding_ops SET status='uncertain' WHERE status='creating'")
         for row in self.db.execute("SELECT * FROM binding_ops WHERE status IN ('topic_created','configured','active')").fetchall():
             target = json.loads(row['target_json'])
+            if not self.router.thread_allowed(target['thread_id']):
+                continue
             old_topic = target.get('previous_message_thread_id')
             await self.router.install_target(target, replace_topic=old_topic is not None, expected_topic_id=old_topic)
             self.operation(row['thread_id'], target, 'active')

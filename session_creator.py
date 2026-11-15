@@ -7,6 +7,7 @@ import time
 from attachments import payload_from
 from bridge import RpcError, TelegramError
 from session_picker import BindingError, TopicCreationUnavailable, clean_name, directory_text
+from session_scope import SessionScopeError
 
 
 PROMPT_TITLE = '新建 Codex 会话 · '
@@ -215,6 +216,8 @@ class SessionCreator:
                         [[('返回会话管理', 'home', {})]])
 
     async def resume(self, update, draft, confirm=False):
+        if draft['thread_id']:
+            self.router.session_scope.require(draft['thread_id'])
         if draft['state'] == 'done':
             target = next((t for t in self.router.targets.values() if t['thread_id'] == draft['thread_id']), None)
             if target:
@@ -257,9 +260,15 @@ class SessionCreator:
                     or str(self.resolve(thread.get('cwd') or result.get('cwd') or cwd)) != cwd):
                 self.save(draft['id'], state='blocked')
                 raise BindingError('新建会话信息与预期不符，已停止绑定；请检查已有会话列表。')
+            try:
+                self.router.session_scope.claim_created(tid)
+            except SessionScopeError:
+                self.save(draft['id'], state='blocked')
+                raise BindingError('新会话已创建，但归属登记未完成，已停止命名和绑定；请核对会话后再处理。') from None
             draft = self.draft(draft['id'], draft['chat_id'])
         # The ID is durable before naming or binding; retries operate on this same session.
         tid = draft['thread_id']
+        self.router.session_scope.require(tid)
         if draft['state'] == 'created':
             result = await self.router.catalog_call('thread/read', {'threadId': tid})
             thread = result.get('thread', {})
@@ -310,10 +319,11 @@ class SessionCreator:
         raise BindingError('未知新建步骤，请重新打开 /sessions。')
 
     def unfinished(self, chat_id):
-        return self.db.execute("SELECT * FROM ui_new_drafts WHERE chat_id=? AND (state IN "
+        rows = self.db.execute("SELECT * FROM ui_new_drafts WHERE chat_id=? AND (state IN "
                                "('created','named','creating','uncertain','blocked') OR "
                                "(state='review' AND expires_at>?)) ORDER BY updated_at DESC LIMIT 5",
                                (str(chat_id), time.time())).fetchall()
+        return [row for row in rows if not row['thread_id'] or self.router.thread_allowed(row['thread_id'])]
 
     def recover(self):
         with self.db:
