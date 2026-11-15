@@ -64,6 +64,8 @@ class GroupCollaboration:
                 or len({v.get('key') for v in values}) != 2
                 or [v.get('role') for v in values] != ['CAD', 'Telegram Manager']):
             return None
+        if not self._scope_allowed(values):
+            return None
         result = []
         for value in values:
             target = self.router.targets.get(value.get('key'))
@@ -75,6 +77,37 @@ class GroupCollaboration:
                 return None
             result.append({key: value[key] for key in ('key', 'thread_id', 'topic_id', 'role')})
         return result
+
+    def _scope_allowed(self, participants):
+        check = getattr(self.router, 'thread_allowed', None)
+        if check is None:
+            # Legacy routers without scope configuration retain their behavior.
+            return not any(key in self.router.config for key in ('session_scope', 'session_scope_file'))
+        try:
+            return (isinstance(participants, list) and len(participants) == 2
+                    and all(isinstance(value, dict) and isinstance(value.get('thread_id'), str)
+                            and bool(value['thread_id']) and check(value['thread_id']) for value in participants))
+        except Exception:
+            return False
+
+    def _guard_scope(self, run):
+        try:
+            participants = json.loads(run['participants'])
+        except (TypeError, ValueError):
+            participants = None
+        if self._scope_allowed(participants):
+            return True
+        with self.db:
+            self.db.execute("UPDATE gc_runs SET state='failed',detail='参与会话已不属于当前 Bot，已停止接力' WHERE id=?",
+                            (run['id'],))
+            self._cancel_pending(run)
+        return False
+
+    def _retire_scoped_runs(self):
+        for run in self.db.execute("SELECT * FROM gc_runs WHERE state IN "
+                "('cad_wait','cad_queued','manager_wait','manager_queued') OR id IN "
+                "(SELECT run_id FROM gc_outbox WHERE state='pending')").fetchall():
+            self._guard_scope(run)
 
     def _authorized(self, message):
         identity = self._identity()
@@ -110,11 +143,14 @@ class GroupCollaboration:
                         message.get('message_thread_id') or None, text))
 
     def _run_notice(self, run, suffix, text):
+        if not self._guard_scope(run):
+            return
         self._notice(run['id'] + ':' + suffix, {'chat': {'id': run['chat_id']},
                      'message_thread_id': run['topic_id']}, text, run['id'])
 
     async def handle_one(self):
         async with self.job_lock:
+            self._retire_scoped_runs()
             row = self.db.execute("SELECT * FROM gc_jobs WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
             if row is None:
                 return False
@@ -188,7 +224,16 @@ class GroupCollaboration:
             lead += 'CAD 已确认收到测试。其本次唯一回包：' + run['cad_reply'] + '\n'
         return lead + '请仅原样回复下面这一行，然后结束：\n' + self.expected(run, stage)
 
+    def _client_ids(self, iid):
+        values = ['telegram-' + str(iid)]
+        bot = getattr(self.router, 'bot_id', None)
+        if type(bot) is int and bot > 0:
+            values.append('telegram-' + str(bot) + '-' + str(iid))
+        return values
+
     async def _inject(self, run, stage):
+        if not self._guard_scope(run) or not self._valid(run):
+            return
         participant = json.loads(run['participants'])[0 if stage == 'cad' else 1]
         bridge = self.router.bridges[participant['key']]
         iid = input_id(run['id'], stage)
@@ -205,13 +250,13 @@ class GroupCollaboration:
         except asyncio.TimeoutError:
             return
         try:
-            if not self._valid(run) or not bridge.ready.is_set():
+            if not self._guard_scope(run) or not self._valid(run) or not bridge.ready.is_set():
                 return
             epoch = getattr(bridge.codex, 'user_input_epoch', None)
             turns = await asyncio.wait_for(bridge.codex.turns(limit=1), 3)
             if any(turn.get('status') == 'inProgress' for turn in turns):
                 return
-            if (not self._valid(run) or not bridge.ready.is_set() or self.clock() >= run['expires']
+            if (not self._guard_scope(run) or not self._valid(run) or not bridge.ready.is_set() or self.clock() >= run['expires']
                     or epoch != getattr(bridge.codex, 'user_input_epoch', None)
                     or bridge.store.db.execute("SELECT 1 FROM inbox WHERE state IN ('pending','dispatching','running') LIMIT 1").fetchone()
                     or getattr(getattr(bridge.codex, 'turn_state', None), 'active', {})):
@@ -238,7 +283,7 @@ class GroupCollaboration:
                 or item.get('phase') not in (None, 'final_answer')):
             return
         for run in self.db.execute("SELECT * FROM gc_runs WHERE state IN ('cad_queued','manager_queued')").fetchall():
-            if not self._valid(run):
+            if not self._guard_scope(run) or not self._valid(run):
                 continue
             stage = 'cad' if run['state'] == 'cad_queued' else 'manager'
             participant = json.loads(run['participants'])[0 if stage == 'cad' else 1]
@@ -247,7 +292,7 @@ class GroupCollaboration:
             row = bridge.store.db.execute('SELECT turn_id,client_id FROM inbox WHERE id=?',
                                            (input_id(run['id'], stage),)).fetchone()
             if (not row or row['turn_id'] != turn_id
-                    or row['client_id'] != 'telegram-' + str(input_id(run['id'], stage))):
+                    or row['client_id'] not in self._client_ids(input_id(run['id'], stage))):
                 continue
             expected = self.expected(run, stage)
             if not any(line.strip().strip('`> ').strip() == expected for line in item['text'].splitlines()):
@@ -258,17 +303,29 @@ class GroupCollaboration:
 
     def _cancel_pending(self, run):
         self.db.execute("UPDATE gc_outbox SET state='cancelled' WHERE run_id=? AND state='pending'", (run['id'],))
-        for stage, participant in zip(('cad', 'manager'), json.loads(run['participants'])):
+        try:
+            participants = json.loads(run['participants'])
+        except (TypeError, ValueError):
+            return
+        if not isinstance(participants, list):
+            return
+        for stage, participant in zip(('cad', 'manager'), participants):
+            if not isinstance(participant, dict):
+                continue
             bridge = self.router.bridges.get(participant['key'])
             if bridge and bridge.thread_id == participant['thread_id']:
                 iid = input_id(run['id'], stage)
+                clients = self._client_ids(iid)
                 with bridge.store.db:
-                    bridge.store.db.execute("UPDATE inbox SET state='cancelled' WHERE id=? AND state='pending' AND client_id=?",
-                                            (iid, 'telegram-' + str(iid)))
+                    bridge.store.db.execute("UPDATE inbox SET state='cancelled' WHERE id=? AND state='pending' "
+                                            'AND client_id IN (' + ','.join('?' for _ in clients) + ')',
+                                            (iid, *clients))
 
     async def _advance(self):
         async with self.advance_lock:
             for run in self.db.execute("SELECT * FROM gc_runs WHERE state IN ('cad_wait','cad_queued','manager_wait','manager_queued')").fetchall():
+                if not self._guard_scope(run):
+                    continue
                 if not self._valid(run) or run['expires'] <= self.clock():
                     with self.db:
                         state = 'timeout' if run['expires'] <= self.clock() else 'failed'
@@ -314,7 +371,17 @@ class GroupCollaboration:
     async def _send_one(self):
         async with self.send_lock:
             row = self.db.execute("SELECT * FROM gc_outbox WHERE state='pending' ORDER BY rowid LIMIT 1").fetchone()
-            if row is None or row['retry_at'] > self.clock():
+            if row is None:
+                return False
+            if row['run_id']:
+                run = self.db.execute('SELECT * FROM gc_runs WHERE id=?', (row['run_id'],)).fetchone()
+                if run is None:
+                    with self.db:
+                        self.db.execute("UPDATE gc_outbox SET state='cancelled' WHERE id=?", (row['id'],))
+                    return True
+                if not self._guard_scope(run):
+                    return True
+            if row['retry_at'] > self.clock():
                 return False
             if self._identity() != (row['bot_id'], row['owner']):
                 return False
@@ -344,6 +411,7 @@ class GroupCollaboration:
             return True
 
     async def tick(self):
+        self._retire_scoped_runs()
         if self._identity() is None:
             return False
         await self._advance()
@@ -354,6 +422,7 @@ class GroupCollaboration:
         with self.db:
             self.db.execute("UPDATE gc_jobs SET state='pending' WHERE state='processing'")
             self.db.execute("UPDATE gc_outbox SET state='uncertain',error='Restart during send' WHERE state='sending'")
+        self._retire_scoped_runs()
 
     async def loop(self):
         async def jobs():

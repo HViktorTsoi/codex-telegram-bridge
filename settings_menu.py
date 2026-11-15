@@ -106,7 +106,7 @@ class SettingsMenu:
     def _bridge(self, binding, *, native=False):
         target, bridge = (self.router.targets.get(binding['target_key']),
                           self.router.bridges.get(binding['target_key']))
-        if (not self.router.owner_allowed() or not target or not bridge
+        if (not self.router.owner_allowed() or not target or not bridge or not bridge.owner_allowed()
                 or target.get('topic_missing') or bridge.target.get('topic_missing')
                 or self.binding(target) != binding or self.binding(bridge.target) != binding
                 or bridge.thread_id != binding['thread_id']):
@@ -122,6 +122,7 @@ class SettingsMenu:
             return bridge, {}, [], display
         native = bridge.codex
         settings = await native.settings()
+        self._bridge(binding, native=True)
         models = await native.models()
         self._bridge(binding, native=True)
         if bridge.codex is not native or settings.get('thread', {}).get('id') != binding['thread_id']:
@@ -313,6 +314,7 @@ class SettingsMenu:
                 else:
                     native = bridge.codex
                     await native.call('thread/settings/update', {'threadId': binding['thread_id'], **changes})
+                    self._bridge(binding, native=True)
                     actual = await native.settings()
                     self._bridge(binding, native=True)
                     if bridge.codex is not native or actual.get('thread', {}).get('id') != binding['thread_id']:

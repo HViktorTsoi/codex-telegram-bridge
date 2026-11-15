@@ -13,7 +13,7 @@
 
 ## 选择实例与稳定版本
 
-先确定这次更新的 Bot、私有状态目录和实际 Python 解释器。`manage.py` 只管理默认 `~/.local/state/codex-telegram/` 实例；其他实例使用自己的 `bridge.py` 或 `topics_bridge.py run --state-dir ...` 启动入口，不要停止同机其他 Bot。下文的 `python3` 均应替换为该实例已安装依赖的解释器，例如 `.venv/bin/python`。
+先确定这次更新的 Bot、私有状态目录、tmux 会话名和实际 Python 解释器。`manage.py` 默认管理 `~/.local/state/codex-telegram/` 与 `codex-telegram-bridge`；其他实例在每次操作时同时指定 `--state-dir` 和 `--session-name`，不要停止同机其他 Bot。下文的 `python3` 均应替换为该实例已安装依赖的解释器，例如 `.venv/bin/python`。
 
 在已连接远程仓库的代码目录依次执行，任何一步失败时先处理原因：
 
@@ -30,6 +30,28 @@ test "$(git show "${bridge_version}:VERSION")" = "${bridge_version#v}"
 `bridge_version` 只定位候选稳定版本。核对该 tag 对应提交的 GitHub Actions 已成功后再继续；不能将未经验证的 `main`、测试版或任意“最新 tag”自动当作稳定版。若 `origin/main` 中的版本还没有对应 tag，停在版本选择阶段，改用已发布且检查通过的稳定 tag；也可直接把变量指定为这样的 tag。推荐呈现的默认值从 v0.11.24 开始，首次部署或统一迁移应使用该版本或更新的稳定版本。
 
 先保存本机未提交的改动，并备份本次实例的配置、凭据和 SQLite。运行中的数据库使用 SQLite backup API 获取一致快照。保留待处理请求，不用过期备份覆盖当前数据库。
+
+## 三 Bot 分组与已有会话迁移
+
+可选为 `general`、`research`、`development` 各运行一个 Bot。每个实例独立保存 Token、`telegram_state_dir`、状态目录、tmux 会话与更新 offset；同一个 Token 只启动一个接收器。各 `config.json` 同时配置绝对路径的 `session_scope_file` 和本实例的 `session_scope`，共享 version 1 registry。完整字段示例见 [TOPICS.md](TOPICS.md#optional-three-bot-groups)。推荐 `default_scope: "general"`；`scopes` 包含这三个分组，`assignments` 按原生会话 ID 分配归属。
+
+未配置两个字段时保持旧行为。启用后，未单独分配的已有会话归默认分组，新建向导返回的会话自动登记到发起 Bot。scope 只限定菜单与投递范围，不构成文件、工具或系统权限隔离。
+
+已有会话迁移按以下顺序完成，不通过新建会话替代原会话：
+
+1. 排空相关实例的待处理输入与发信队列，核对结果不明的记录，再停止相关接收器。备份配置、凭据、SQLite 和共享 registry，记录原生 ID、旧目标 key 与话题 ID。
+2. 在旧实例中退役迁出会话的 `binding_ops`，将其 `status` 标记为 `retired`，保留记录，避免恢复流程自动安装旧绑定；同时移除旧 `targets` 绑定。若涉及 `root_target`，改为本组保留的目标，并使顶层 `thread_id` 与其一致。不要删除原生会话或复用旧目标 key 指向另一个原生 ID。
+3. 更新共享 registry 中原生 ID 的归属，使用原子替换保存。为新 Bot 准备独立配置、凭据与数据库，通过 `/sessions` 绑定同一个原生 ID，并保存新 Bot 返回的话题 ID。不要把旧 Bot 的 topic ID、数据库或 offset 当作新 Bot 的状态复制过去。
+4. 旧 Telegram 历史不能搬到新 Bot；旧话题先关闭、不删除，供历史查阅。各实例重启后，核对新 Bot 菜单与投递归属、旧 Bot 菜单不再列出迁出会话且旧按钮被拒绝，再验证一轮实际消息。原 Codex 历史、模型和权限设置保持在原 ID 上。
+
+独立 Research 实例的启动与状态检查示例：
+
+```sh
+python3 manage.py start --state-dir "$HOME/.local/state/codex-telegram-research" --session-name codex-telegram-research
+python3 manage.py status --state-dir "$HOME/.local/state/codex-telegram-research" --session-name codex-telegram-research
+```
+
+General 与 Development 使用各自的状态目录和 tmux 会话名；`stop`、`logs` 同样携带对应两项参数。跨 Bot 迁移需要上述部署操作，菜单不提供一键迁移。
 
 ## 呈现配置与旧实例迁移
 

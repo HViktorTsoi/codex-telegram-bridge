@@ -8,6 +8,7 @@ from pathlib import Path
 import secrets
 import stat
 import time
+from types import SimpleNamespace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -119,7 +120,8 @@ class FilesMenu:
         self._identity()
         key = binding.get('target_key')
         target, bridge = self.router.targets.get(key), self.router.bridges.get(key)
-        if (not target or not bridge or target.get('topic_missing') or bridge.target.get('topic_missing')
+        if (not target or not bridge or not bridge.owner_allowed()
+                or target.get('topic_missing') or bridge.target.get('topic_missing')
                 or self.binding(target) != binding or self.binding(bridge.target) != binding
                 or bridge.thread_id != binding.get('thread_id')
                 or bridge.store.get('bound_thread_id') != bridge.thread_id):
@@ -497,7 +499,11 @@ class FilesMenu:
             try:
                 media = dict(record['media'])
                 media['caption'] = label(media['name'], 150)
-                result = await asyncio.wait_for(send_image(self.router.telegram, encoded(media), route), 60)
+                async def upload(*args, **kwargs):
+                    # Photo rejection can cause a second upload after an await.
+                    self._validate_send(row)
+                    return await self.router.telegram.upload(*args, **kwargs)
+                result = await asyncio.wait_for(send_image(SimpleNamespace(upload=upload), encoded(media), route), 60)
                 mid = result.get('message_id') if isinstance(result, dict) else None
                 if (type(mid) is not int or mid <= 0
                         or isinstance(result.get('chat'), dict) and str(result['chat']['id']) != row['chat_id']

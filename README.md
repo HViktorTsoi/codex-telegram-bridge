@@ -1,6 +1,6 @@
 # Telegram ↔ Codex bridge
 
-用一个 Telegram Bot 控制本机 Codex 会话，支持绑定已有会话或新建会话。绑定已有会话时保留原历史、模型和权限设置。这是通过 Codex app-server 工作的 Python 桥接程序。
+用 Telegram Bot 控制本机 Codex 会话，支持绑定已有会话或新建会话，也可选用 general、research、development 三个 Bot 分组。绑定已有会话时保留原历史、模型和权限设置。这是通过 Codex app-server 工作的 Python 桥接程序。
 
 ## 让其他 agent 配置
 
@@ -17,7 +17,7 @@
 使用独立 Bot 和私有配置目录，避免与已有实例争用同一个 Token；将访问策略设为仅允许本人 Telegram 用户 ID。
 按需引导我开启 BotFather Threaded Mode；多会话模式应创建真实 Telegram 话题并保存返回的 topic ID，替换示例里的占位值。
 在 BotFather 开启 Disallow users to create new threads，保留 Threaded Mode，让管理命令能留在主对话而不会被客户端自动建话题。
-安装依赖并运行测试，再启动对应实例；manage.py 只管理默认实例，独立状态目录需使用 bridge.py 或 topics_bridge.py 的 run --state-dir 入口，不要误操作已有实例。
+安装依赖并运行测试，再启动对应实例；manage.py 支持 --state-dir 和 --session-name，操作独立实例时同时指定两项，不要误操作已有实例。
 升级到包含 Footer 预览的版本时，先在实际运行桥接的 Python 环境重新安装 requirements.txt；新增 markdown-it-py 依赖必须在服务重启前就绪。
 验证 /status 中的原 thread ID、Markdown 和图片输入；多会话模式还需验证 /sessions 和各话题的消息归属。
 话题模式可使用 /skills 查询当前会话工作目录下可用的本机技能；All 中先选择会话。选择技能并回复文字任务后才运行模型，列表查询不调用模型。
@@ -120,6 +120,14 @@ socket 路径应指向实际使用的已有服务；使用另一个新服务不�
 
 如果 Telegram 明确返回 `BOT_TOPIC_WRONG_HOME`，桥接会提示话题服务暂不可用，保留已创建的 Codex 会话，并提供“重试连接”入口。此错误触发同一 Bot 与私聊 5 分钟的持久冷却；期间不调用话题创建接口，新建向导也不会先生成另一个空会话。冷却结束后手动重试会继续同一个原生会话。客户端出现“话题已创建”的服务记录不代表该话题可用，桥接不会据此猜测话题 ID 或绑定。Telegram 官方仓库的[相关故障报告](https://github.com/tdlib/telegram-bot-api/issues/944)记录了这类现象；本地处理不能替代 Telegram 服务恢复。其他明确拒绝和未知结果仍按原规则处理。
 
+### 可选三 Bot 分组
+
+同机可为 `general`、`research`、`development` 分别运行独立 Bot。每个 Bot 使用独立 Token、`telegram_state_dir`、桥接状态目录、tmux 会话和 Telegram 更新 offset；各实例通过同一个绝对路径的 `session_scope_file` 共享归属记录，并将 `session_scope` 设置为自己的分组。配置示例见 [TOPICS.md](TOPICS.md#optional-three-bot-groups)。
+
+不配置这两个字段时保持原有行为；启用后未单独分配的已有会话归 registry 的 `default_scope`，推荐为 `general`，通过新建向导创建的会话自动归发起 Bot。菜单、旧按钮、后台任务和投递均核对当前归属，不会改投其他会话。scope 只限定会话菜单与投递范围，不隔离文件、工具或操作系统权限。
+
+已有会话迁移保留原生 ID；先排空并备份，退役旧 `binding_ops` 后再绑定到新 Bot。旧 Telegram 历史不能搬到新 Bot，旧话题先关闭、不删除。具体步骤见 [部署文档](DEPLOYMENT.md#三-bot-分组与已有会话迁移)。
+
 ### 修改会话名称
 
 发送 `/sessions` → 选择已绑定会话 →“修改名称”，回复名称输入提示，再点击“确认改名”。也可在对应话题输入 `/rename`，或 `/rename 新名称`；在 All 输入该命令会先选择目标，不默认使用最近会话。名称输入、核对和结果面板统一显示在 All；只有回复指定名称提示的文字进入改名流程，回复 `/cancel` 或点击“取消”可退出。
@@ -170,7 +178,7 @@ All 中其他普通文字或附件仍展示消息预览和本机已绑定会话�
 
 图片先保存到对应会话私有目录的 `outgoing-images/`，其他文件保存到 `outgoing-files/`，再进入持久化发送队列，始终发送入队时的固定快照。照片上传使用 `sendPhoto`，文件发送使用 `sendDocument`；附件始终沿用接收本次任务的 Bot 与冻结的原话题，`/format plain` 也能收附件。结果不明或上传过程中重启时，附件标记为待核对并停止自动重发；429 限流按原快照延迟重试。格式化失败不会触发另一份上传。仅完成时通知模式下，附件先静音发送，成功完成后再发送静音的过程合并部分及独立最终回复，只有最终回复末段正常通知；启用后不补发历史回复。
 
-桥接不向输入追加 Bot、话题来源或文件回传指令，也不替换成隐藏的模型提示。用户正文按原有文字、引用与附件流程传入。附件回传由桥接读取公开回复中的明确本机链接，并使用当前实例的 Telegram 客户端及持久化队列保存的接收账号与话题发送。两个 Bot 可以连接同一个原生 Manager，分别按本实例已记录的任务与话题处理回传，无需为此解绑或停用独立 Bot。
+桥接不向输入追加 Bot、话题来源或文件回传指令，也不替换成隐藏的模型提示。用户正文按原有文字、引用与附件流程传入。附件回传由桥接读取公开回复中的明确本机链接，并使用当前实例的 Telegram 客户端及持久化队列保存的接收账号与话题发送。未启用分组时，两个 Bot 可以连接同一个原生 Manager，分别按本实例已记录的任务与话题处理回传；启用分组后，同一个原生 ID 只由归属分组的 Bot 操作。
 
 ## 运行与命令
 
@@ -184,6 +192,13 @@ All 中其他普通文字或附件仍展示消息预览和本机已绑定会话�
 ```
 
 `manage.py` 根据 `config.json` 的 `mode` 选择单会话或话题模式。单会话首次启动可使用 `start --notify`；话题模式使用 `/sessions`。电脑、网络和 Codex 服务需要保持运行；当前没有配置开机自启。
+
+独立实例同时指定状态目录和 tmux 会话名，后续 `status`、`logs`、`stop` 沿用同一对参数：
+
+```sh
+.venv/bin/python manage.py start --state-dir "$HOME/.local/state/codex-telegram-research" --session-name codex-telegram-research
+.venv/bin/python manage.py status --state-dir "$HOME/.local/state/codex-telegram-research" --session-name codex-telegram-research
+```
 
 | Telegram 命令 | 操作 |
 |---|---|

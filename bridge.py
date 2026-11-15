@@ -20,6 +20,7 @@ import aiohttp
 from attachments import AttachmentError, inputs_for, payload_from
 from message_format import message_parts, send_output
 from reply_context import serialized as reply_serialized
+from session_scope import SessionScope, SessionScopeError
 
 LOG = logging.getLogger("codex_telegram")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -452,6 +453,8 @@ class Bridge:
     def __init__(self, config, state_dir):
         self.config, self.state_dir = config, Path(state_dir)
         self.thread_id, self.owner = config["thread_id"], str(config["owner_id"])
+        self.session_scope = SessionScope(config)
+        self.session_scope.require(self.thread_id)
         self.telegram_dir = Path(config["telegram_state_dir"])
         self.store = Store(self.state_dir / "bridge.sqlite")
         if self.store.get('output_format') is None:
@@ -468,7 +471,14 @@ class Bridge:
             return {}
 
     def owner_allowed(self):
-        return permitted({"from": {"id": self.owner}, "chat": {"id": self.owner, "type": "private"}}, self.access(), self.owner)
+        return (self.thread_allowed(self.thread_id)
+                and permitted({"from": {"id": self.owner}, "chat": {"id": self.owner, "type": "private"}}, self.access(), self.owner))
+
+    def thread_allowed(self, thread_id):
+        try:
+            return self.session_scope.allows(thread_id)
+        except SessionScopeError:
+            return False
 
     def token(self):
         content = (self.telegram_dir / ".env").read_text()
@@ -478,6 +488,8 @@ class Bridge:
         return match[1].strip().strip("\"'")
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
+        if not self.thread_allowed(self.thread_id):
+            return
         self.store.images.observe(turn_id, item, completed_ms)
         if item.get("type") != "agentMessage" or not item.get("text", "").strip():
             return
@@ -499,6 +511,8 @@ class Bridge:
 
     async def reconcile(self, replay=False):
         """Recover outputs after reconnect without re-executing accepted input."""
+        if not self.thread_allowed(self.thread_id):
+            return []
         turns = {turn["id"]: turn for turn in await self.codex.turns(limit=30)}
         for row in self.store.db.execute("SELECT * FROM inbox WHERE state='dispatching'").fetchall():
             found = None
@@ -527,6 +541,10 @@ class Bridge:
 
     async def connection_loop(self, notify):
         while True:
+            if not self.thread_allowed(self.thread_id):
+                self.ready.clear()
+                await asyncio.sleep(3)
+                continue
             try:
                 result = await self.codex.connect()
                 async with self.dispatch_lock:
@@ -795,6 +813,8 @@ class Bridge:
         while True:
             data = await self.codex.events.get()
             async with self.dispatch_lock:
+                if not self.thread_allowed(self.thread_id):
+                    continue
                 epoch = data.get('_turn_state_epoch')
                 if epoch is not None and epoch != self.codex.turn_state.epoch:
                     continue

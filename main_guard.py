@@ -254,7 +254,7 @@ class MainChatGuard:
         target = self.router.targets.get(selected.get('key'))
         bridge = self.router.bridges.get(selected.get('key'))
         if (not target or target.get('topic_missing') or self._binding(target) != selected
-                or not bridge or bridge.thread_id != selected.get('thread_id')):
+                or not bridge or not bridge.owner_allowed() or bridge.thread_id != selected.get('thread_id')):
             raise BindingError('目标绑定已变化，消息已保留；请到 /sessions → 待发送，重新选择会话。')
         return target
 
@@ -263,7 +263,9 @@ class MainChatGuard:
             return await self._closed(update, draft)
         if draft['state'] == 'releasing':
             raise BindingError('这条消息正在投递，请稍后查看；不要重复选择。')
-        targets = self.router.recent.ordered(t for t in self.router.targets.values() if not t.get('topic_missing'))
+        targets = self.router.recent.ordered(t for t in self.router.targets.values()
+            if not t.get('topic_missing') and (bridge := self.router.bridges.get(t['key']))
+            and bridge.owner_allowed())
         pages = max(1, (len(targets) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
         base = {'id': draft['id'], 'revision': draft['revision'], 'send_on_select': True}
@@ -341,7 +343,7 @@ class MainChatGuard:
     async def _closed(self, update, draft):
         if draft['state'] == 'queued':
             selected = json.loads(draft['selection_json'])
-            target = self.router.targets.get(selected['key'], {})
+            target = self._validate(selected)
             text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n原文与回复会出现在该会话的话题中。'
         else:
             text = '已取消，这条消息不会交给 Codex。'

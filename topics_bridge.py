@@ -21,6 +21,7 @@ import aiohttp
 from attachments import payload_from
 from bridge import BOT_COMMANDS, Bridge, Codex, InputPreparationError, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted, refresh_health_snapshot
 from session_picker import topic_missing_error
+from session_scope import SessionScope, SessionScopeError
 from message_format import send_output
 from activity_indicator import TopicActivity
 from native_mirror import NativeMirror
@@ -115,6 +116,9 @@ class RoutedStore(Store):
 
     def accept(self, update, message=None, *, reply_context=None, guard_binding=None, skill=None):
         inserted = False
+        bot_id = getattr(self, 'bot_id', None)
+        client_id = ('telegram-' + str(bot_id) + '-' + str(update['update_id'])
+                     if type(bot_id) is int and bot_id > 0 else 'telegram-' + str(update['update_id']))
         with self.db:
             if message is not None:
                 inserted = bool(self.db.execute(
@@ -122,7 +126,7 @@ class RoutedStore(Store):
                     "media_group_id,message_thread_id,source_message_id,reply_json,main_guard_json,skill_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (update["update_id"], str(message["chat"]["id"]),
                      message.get("text") or message.get("caption", ""), now_ms(),
-                     "telegram-" + str(update["update_id"]), json.dumps(payload_from(message), ensure_ascii=False),
+                     client_id, json.dumps(payload_from(message), ensure_ascii=False),
                      str(message["media_group_id"]) if message.get("media_group_id") else None,
                      topic_of(message), message.get("message_id"), reply_serialized(message, reply_context),
                      json.dumps(guard_binding, sort_keys=True) if guard_binding else None,
@@ -298,6 +302,8 @@ class TargetBridge(NativeQuestions, Bridge):
             await self.mirror.update(self, turns)
 
     def record_item(self, turn_id, item, completed_ms=None, replay=False):
+        if not self.thread_allowed(self.thread_id):
+            return
         self.store.images.observe(turn_id, item, completed_ms)
         if not replay and self.mirror_allowed():
             self.mirror.note_event(self, turn_id, item)
@@ -482,6 +488,8 @@ class TargetBridge(NativeQuestions, Bridge):
 
     async def send_one(self, row):
         """Deliver one eligible row while the caller owns the preview lock."""
+        if not self.thread_allowed(self.thread_id):
+            return
         self.delivery.begin(row)
         self.store.images.begin(row)
         sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
@@ -708,6 +716,9 @@ class RouterStore:
 class TopicRouter:
     def __init__(self, config, state_dir):
         self.config, self.state_dir = config, Path(state_dir)
+        self.session_scope = SessionScope(config)
+        for target in config['targets']:
+            self.session_scope.require(target['thread_id'])
         self.owner = str(config["owner_id"])
         self.targets = {t["key"]: dict(t) for t in config["targets"]}
         if len(self.targets) != len(config["targets"]) or not self.targets:
@@ -771,12 +782,21 @@ class TopicRouter:
             return {}
 
     def owner_allowed(self):
-        return permitted({"from": {"id": self.owner}, "chat": {"id": self.owner, "type": "private"}},
-                         self.access(), self.owner)
+        return (self.thread_allowed(self.root_target['thread_id'])
+                and permitted({"from": {"id": self.owner}, "chat": {"id": self.owner, "type": "private"}},
+                              self.access(), self.owner))
+
+    def thread_allowed(self, thread_id):
+        try:
+            return self.session_scope.allows(thread_id)
+        except SessionScopeError:
+            return False
 
     def sessions_text(self):
         lines = ["已绑定的原 Codex 会话："]
         for key, target in self.targets.items():
+            if not self.thread_allowed(target['thread_id']):
+                continue
             ready = self.bridges.get(key) and self.bridges[key].ready.is_set()
             state = '话题不可用，可重建' if target.get('topic_missing') else ('已连接' if ready else '连接中')
             lines.append(f"• {target['name']}（{state}）")
@@ -857,7 +877,8 @@ class TopicRouter:
             return True
         if not row["error"]:
             target = self.bridges.get(row["target_key"])
-            if target is None or target.thread_id != row["thread_id"]:
+            if (target is None or target.thread_id != row["thread_id"]
+                    or not self.thread_allowed(row['thread_id'])):
                 # A configuration edit must never redirect accepted work to a different thread.
                 with self.store.db:
                     self.store.db.execute("UPDATE jobs SET state='blocked' WHERE id=?", (row["id"],))
@@ -911,6 +932,11 @@ class TopicRouter:
             if row is None or row["retry_at"] > time.time() or not self.owner_allowed():
                 await asyncio.sleep(0.5)
                 continue
+            if ((row['scope_thread_id'] and not self.thread_allowed(row['scope_thread_id']))
+                    or (self.session_scope.enabled and row['label'] and not row['scope_thread_id'])):
+                with self.store.db:
+                    self.store.db.execute('UPDATE notices SET message_id=-1 WHERE id=?', (row['id'],))
+                continue
             try:
                 sent = await send_output(self.telegram, chat_id=row['chat_id'], text=row['text'],
                                          rich_text=row['rich_text'], topic_id=row['topic_id'])
@@ -961,19 +987,30 @@ class TopicRouter:
             await asyncio.sleep(4)
 
     async def catalog_call(self, method, params):
+        self.session_scope.require(self.root_target['thread_id'])
+        if params.get('threadId'):
+            self.session_scope.require(params['threadId'])
         bridge = self.bridges[self.root_target['key']]
         if not bridge.ready.is_set():
             raise ConnectionError('Native conversation service is connecting')
-        return await bridge.codex.call(method, params)
+        result = await bridge.codex.call(method, params)
+        if params.get('threadId'):
+            self.session_scope.require(params['threadId'])
+        if method == 'thread/list':
+            result = {**result, 'data': self.session_scope.filter_threads(result.get('data', []))}
+        return result
 
     async def verify_existing(self, thread_id):
         # No model, permission or history overrides; this must remain the exact native ID.
+        self.session_scope.require(thread_id)
         metadata = (await self.catalog_call('thread/read', {'threadId': thread_id}))['thread']
         if metadata['id'] != thread_id or metadata.get('ephemeral') or metadata.get('canAcceptDirectInput') is False:
             raise ValueError('Native conversation is not bindable')
         client = ExactCodex(self.config['socket_path'], thread_id)
         try:
+            self.session_scope.require(thread_id)
             result = await client.connect()
+            self.session_scope.require(thread_id)
             return result['thread']
         finally:
             await client.close()
@@ -990,6 +1027,8 @@ class TopicRouter:
         task.add_done_callback(completed)
 
     def start_target(self, bridge):
+        self.session_scope.require(bridge.thread_id)
+        bridge.store.bot_id = getattr(self, 'bot_id', None)
         key = bridge.target['key']
         if key in self.started_targets:
             return
@@ -1009,7 +1048,8 @@ class TopicRouter:
             fcntl.flock(lock, fcntl.LOCK_EX)
             original = config_path.read_bytes()
             current = json.loads(original)
-            for field in ('owner_id', 'socket_path', 'telegram_state_dir', 'thread_id', 'root_target', 'expected_bot_username'):
+            for field in ('owner_id', 'socket_path', 'telegram_state_dir', 'thread_id', 'root_target', 'expected_bot_username',
+                          'session_scope_file', 'session_scope'):
                 if current.get(field) != self.config.get(field):
                     raise ValueError('Configuration changed; reload before binding')
             persisted = {t['key']: t for t in current['targets']}
@@ -1054,6 +1094,7 @@ class TopicRouter:
 
     def rename_target(self, key, binding, old_name, new_name):
         """Commit a name-only change without rebinding or restarting the session."""
+        self.session_scope.require(binding['thread_id'])
         target = self.targets.get(key)
         bridge = self.bridges.get(key)
         if (not target or not bridge or target.get('topic_missing')
@@ -1109,6 +1150,7 @@ class TopicRouter:
 
     async def install_target(self, target, replace_topic=False, expected_topic_id=None):
         # The recorded topic is reused after a crash; this method never creates one.
+        self.session_scope.require(target['thread_id'])
         replacing = None
         for existing in self.targets.values():
             if existing['thread_id'] == target['thread_id']:

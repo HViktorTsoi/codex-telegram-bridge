@@ -13,6 +13,7 @@ import time
 from bridge import RpcError, TelegramError, permitted
 from message_format import message_parts
 from reply_context import snapshot as reply_snapshot, serialized as reply_serialized
+from session_scope import SessionScope, SessionScopeError
 
 LOG = logging.getLogger('codex_telegram_control')
 COMMANDS = [{'command': 'tasks', 'description': '本机会话与进度'},
@@ -71,7 +72,7 @@ def tables(db):
         CREATE TABLE IF NOT EXISTS cc_dismissals(id TEXT PRIMARY KEY,until_at REAL,updated REAL);
     ''')
     columns = {r[1] for r in db.execute('PRAGMA table_info(notices)')}
-    for name in ('rich_text', 'label'):
+    for name in ('rich_text', 'label', 'scope_thread_id'):
         if name not in columns:
             db.execute('ALTER TABLE notices ADD COLUMN ' + name + ' TEXT')
     db.commit()
@@ -84,21 +85,25 @@ def connection(state):
     return db
 
 
-def put_notice(db, key, owner, topic, text, label=None, rich=False):
+def put_notice(db, key, owner, topic, text, label=None, rich=False, thread_id=None):
     for index, (source, rendered) in enumerate(message_parts(text, rich=rich)):
-        db.execute('INSERT OR IGNORE INTO notices(id,chat_id,topic_id,text,rich_text,label) VALUES(?,?,?,?,?,?)',
-                   (negative_id('cc-notice:' + key + ':' + str(index)), str(owner), topic, source, rendered, label))
+        db.execute('INSERT OR IGNORE INTO notices(id,chat_id,topic_id,text,rich_text,label,scope_thread_id) VALUES(?,?,?,?,?,?,?)',
+                   (negative_id('cc-notice:' + key + ':' + str(index)), str(owner), topic, source, rendered, label, thread_id))
 
 
 def export_bundle(state):
     state = Path(state)
     config = read_json(state / 'config.json', {})
+    scope = SessionScope(config)
     db = connection(state)
     try:
         snapshot = read_json(state / 'control/local.json', {'host': config.get('host_id'), 'generated': 0, 'entries': []})
+        snapshot = {**snapshot, 'entries': [e for e in snapshot.get('entries', [])
+                                          if scope.allows(e.get('thread_id'))]}
         requests = [dict(r) for r in db.execute("SELECT * FROM cc_requests WHERE state IN ('pending','queued','running','uncertain') OR updated>?", (time.time() - 86400,))
                     if json.loads(r['payload']).get('source_host') == config['host_id']
-                    and json.loads(r['payload']).get('target_host') == config['host_id']]
+                    and json.loads(r['payload']).get('target_host') == config['host_id']
+                    and scope.allows(json.loads(r['payload']).get('thread_id'))]
         dismissals = [dict(r) for r in db.execute('SELECT * FROM cc_dismissals')]
         deliveries, relays = [], []
         targets = {t['key']: t for t in config.get('targets', [])}
@@ -106,6 +111,8 @@ def export_bundle(state):
             receipt = {'id': row['id'], 'state': row['state'], 'detail': row['detail']}
             request = json.loads(row['payload'])
             if request.get('source_host') != config['host_id'] or request.get('target_host') != config['host_id']:
+                continue
+            if not scope.allows(request.get('thread_id')):
                 continue
             receipt['source_host'] = request['source_host']
             target = targets.get(request['target_key'])
@@ -146,6 +153,7 @@ def export_bundle(state):
 def receive_bundle(state, payload):
     state = Path(state)
     config = read_json(state / 'config.json', {})
+    scope = SessionScope(config)
     host, owner = config['host_id'], str(config['owner_id'])
     if payload.get('version') != 1 or str(payload.get('owner')) != owner:
         raise ValueError('Control owner/protocol mismatch')
@@ -159,6 +167,7 @@ def receive_bundle(state, payload):
                         or request.get('source_host') != host or str(request.get('owner')) != owner
                         or not re.fullmatch(r'[a-z0-9_-]{1,40}', str(request.get('target_key', '')))
                         or not isinstance(request.get('thread_id'), str) or not 0 < len(request['thread_id']) <= 128
+                        or not scope.allows(request.get('thread_id'))
                         or not isinstance(request.get('topic_id'), int) or request['topic_id'] <= 0
                         or not isinstance(request.get('target_name'), str)
                         or (request.get('source_topic') is not None and
@@ -185,13 +194,15 @@ def receive_bundle(state, payload):
                 request = json.loads(row['payload'])
                 if request.get('source_host') != host or request.get('target_host') != host:
                     continue
+                if not scope.allows(request.get('thread_id')):
+                    continue
                 if row['state'] != receipt['state'] or row['detail'] != receipt.get('detail'):
                     db.execute('UPDATE cc_requests SET state=?,detail=?,updated=? WHERE id=?',
                                (receipt['state'], receipt.get('detail'), time.time(), receipt['id']))
                 if receipt['state'] in ('failed', 'uncertain'):
                     put_notice(db, 'dispatch-error:' + receipt['id'], owner, request.get('source_topic'),
                                '派单状态：' + ('送达结果待确认，请勿重复发送。' if receipt['state'] == 'uncertain' else clean(receipt.get('detail') or '目标未接受任务。')),
-                               label=request['target_host'] + '/' + request['target_name'])
+                               label=request['target_host'] + '/' + request['target_name'], thread_id=request['thread_id'])
             for relay in payload.get('relays', []):
                 row = db.execute('SELECT payload FROM cc_requests WHERE id=?', (relay['request_id'],)).fetchone()
                 if not row:
@@ -199,8 +210,10 @@ def receive_bundle(state, payload):
                 request = json.loads(row['payload'])
                 if request.get('source_host') != host or request.get('target_host') != host:
                     continue
+                if not scope.allows(request.get('thread_id')):
+                    continue
                 put_notice(db, 'relay:' + relay['id'], owner, request.get('source_topic'), relay['text'],
-                           label=request['target_host'] + '/' + request['target_name'], rich=True)
+                           label=request['target_host'] + '/' + request['target_name'], rich=True, thread_id=request['thread_id'])
         return {'rejected': rejected}
     finally:
         db.close()
@@ -254,16 +267,19 @@ class ControlCenter:
             for table in ('cc_requests', 'cc_deliveries'):
                 for row in self.db.execute('SELECT * FROM ' + table + " WHERE state IN ('pending','importing','queued','running','uncertain')").fetchall():
                     request = json.loads(row['payload'])
-                    if request.get('source_host') == self.host and request.get('target_host') == self.host:
+                    if (request.get('source_host') == self.host and request.get('target_host') == self.host
+                            and self.router.thread_allowed(request.get('thread_id'))):
                         continue
                     if table == 'cc_deliveries' and row['inbox_id'] is not None:
                         bridge = self.router.bridges.get(request.get('target_key'))
                         if bridge:
+                            legacy_id = 'telegram-' + str(row['inbox_id'])
+                            scoped_id = 'telegram-' + str(getattr(self.router, 'bot_id', None)) + '-' + str(row['inbox_id'])
                             with bridge.store.db:
-                                bridge.store.db.execute("UPDATE inbox SET state='cancelled' WHERE id=? AND state='pending' AND client_id=?",
-                                                        (row['inbox_id'], 'telegram-' + str(row['inbox_id'])))
+                                bridge.store.db.execute("UPDATE inbox SET state='cancelled' WHERE id=? AND state='pending' AND client_id IN (?,?)",
+                                                        (row['inbox_id'], legacy_id, scoped_id))
                     self.db.execute('UPDATE ' + table + " SET state='cancelled',detail=?,updated=? WHERE id=?",
-                                    ('已切换为本机管理，跨机派单已关闭。', time.time(), row['id']))
+                                    ('派单目标已不属于当前 Bot，已停止后续投递。', time.time(), row['id']))
             for row in self.db.execute('SELECT id,label FROM notices WHERE message_id IS NULL AND label IS NOT NULL').fetchall():
                 if '/' in row['label'] and row['label'].split('/', 1)[0] != self.host:
                     self.db.execute('UPDATE notices SET message_id=-1 WHERE id=?', (row['id'],))
@@ -301,7 +317,8 @@ class ControlCenter:
         entries = {}
         for raw in raw_entries:
             thread_id = raw.get('thread_id')
-            if raw.get('host') != self.host or not thread_id or thread_id in entries:
+            if (raw.get('host') != self.host or not thread_id or thread_id in entries
+                    or not self.router.thread_allowed(thread_id)):
                 continue
             entry = dict(raw)
             entry.update(target_key=None, topic_id=None, topic_missing=False)
@@ -313,6 +330,8 @@ class ControlCenter:
             entries[thread_id] = entry
         for key, target in self.router.targets.items():
             thread_id = target['thread_id']
+            if not self.router.thread_allowed(thread_id):
+                continue
             entry = entries.get(thread_id)
             if entry is None:
                 entry = {'host': self.host, 'thread_id': thread_id, 'cwd': None, 'updated': 0,
@@ -334,7 +353,7 @@ class ControlCenter:
         entries = self._local_entries(local.get('entries', []))
         for entry in entries:
             entry['stale'] = time.time() - local.get('generated', 0) > 60
-        return entries, {self.host: local}
+        return entries, {self.host: {**local, 'entries': entries}}
 
     @staticmethod
     def selector(entry):
@@ -467,12 +486,17 @@ class ControlCenter:
                              json.dumps({**data, 'target_key': entry['target_key'], 'topic_id': entry['topic_id']}, ensure_ascii=False), time.time() + 900))
 
     async def dispatch(self, origin, update_id, entry, text, question=None, reply_context=None):
+        self.router.session_scope.require(entry['thread_id'])
         if entry.get('host') != self.host:
             raise ValueError('只支持本机会话，请切换到对应机器的 Telegram Bot。')
         if not text.strip():
             raise ValueError('请提供任务正文，例如 @论文 检查最新批注。')
         if entry.get('topic_missing') or not entry.get('target_key'):
             raise ValueError('目标话题不可用，请先在目标 Bot 用 /sessions 绑定或重建。')
+        target = self.router.targets.get(entry['target_key'])
+        if (not target or target['thread_id'] != entry['thread_id']
+                or target['message_thread_id'] != entry['topic_id']):
+            raise ValueError('目标绑定已变化，请重新选择。')
         if question:
             text = '针对待确认事项：' + question + '\n我的回复：' + text
         rid = ident(self.host + ':' + str(self.router.bot_id) + ':' + str(update_id))
@@ -513,6 +537,8 @@ class ControlCenter:
                         or button['message_id'] != origin['message_id'] or button['topic_id'] != (origin.get('message_thread_id') or None)):
                     raise ValueError('按钮已失效，请重新发送 /tasks 或 /inbox。')
                 action, data = button['action'], json.loads(button['data'])
+                if data.get('thread_id'):
+                    self.router.session_scope.require(data['thread_id'])
                 if action in ('tasks', 'inbox'):
                     await self.overview(origin, action, data.get('page', 0), True, data.get('mode', 'bound'))
                 elif action == 'detail':
@@ -563,7 +589,7 @@ class ControlCenter:
                         await self.panel(origin, '按最近访问排序。选择目标，再回复弹出的派单消息；也可发送 @别名 任务内容。',
                                          [[(e['host'] + '/' + clean(e['name'], 30), 'prompt', self.ref(e))] for e in entries[:30]])
             state = 'done'
-        except (ValueError, RpcError, TelegramError, ConnectionError, OSError, asyncio.TimeoutError) as error:
+        except (SessionScopeError, ValueError, RpcError, TelegramError, ConnectionError, OSError, asyncio.TimeoutError) as error:
             state = 'failed'
             with self.db:
                 put_notice(self.db, 'control-error:' + str(row['id']), self.router.owner,
@@ -588,6 +614,7 @@ class ControlCenter:
         target = self.router.targets.get(request['target_key'])
         if (request.get('source_host') != self.host or request.get('target_host') != self.host
                 or not self.router.owner_allowed() or not target or target['thread_id'] != request['thread_id']
+                or not self.router.thread_allowed(request['thread_id'])
                 or target['message_thread_id'] != request['topic_id'] or target.get('topic_missing')):
             with self.db:
                 self.db.execute("UPDATE cc_deliveries SET state='failed',detail=?,updated=? WHERE id=?",
@@ -622,7 +649,8 @@ class ControlCenter:
     async def refresh(self):
         previous = read_json(self.router.state_dir / 'control/local.json', {})
         cache = {e['thread_id']: e for e in previous.get('entries', [])
-                 if e.get('host') == self.host and e.get('thread_id')}
+                 if e.get('host') == self.host and e.get('thread_id')
+                 and self.router.thread_allowed(e['thread_id'])}
         threads, cursor = [], None
         for _ in range(5):
             params = {'limit': 100, 'sortKey': 'updated_at', 'sortDirection': 'desc', 'archived': False}
@@ -634,7 +662,7 @@ class ControlCenter:
                 break
         bound = {t['thread_id']: t for t in self.router.targets.values()}
         entries, seen = [], set()
-        for thread in threads:
+        for thread in self.router.session_scope.filter_threads(threads):
             thread_id = thread.get('id')
             if (not thread_id or thread_id in seen or thread.get('ephemeral')
                     or thread.get('canAcceptDirectInput') is False):
@@ -678,7 +706,7 @@ class ControlCenter:
         while True:
             try:
                 await self.refresh()
-            except (RpcError, ConnectionError, OSError, ValueError, asyncio.TimeoutError):
+            except (SessionScopeError, RpcError, ConnectionError, OSError, ValueError, asyncio.TimeoutError):
                 LOG.warning('Control snapshot temporarily unavailable')
             await asyncio.sleep(15)
 
@@ -700,6 +728,6 @@ class ControlCenter:
         while True:
             try:
                 await self.synchronize()
-            except (OSError, ValueError, sqlite3.Error):
+            except (SessionScopeError, OSError, ValueError, sqlite3.Error):
                 LOG.warning('Local control queue temporarily unavailable')
             await asyncio.sleep(1)

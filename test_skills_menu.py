@@ -179,6 +179,21 @@ class SkillsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.router.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
         self.assertEqual(self.input_count() + self.input_count('instagram'), 0)
 
+    async def test_migrated_skill_prompt_cannot_enqueue_or_query_native_session(self):
+        prompt = await self.prompt()
+        self.router.bridges['meeting'].owner_allowed = lambda: False
+        self.native_calls.clear()
+        await self.answer(prompt)
+        self.assertEqual(self.native_calls, [])
+        self.assertEqual(self.input_count(), 0)
+        self.assertEqual(self.input_count('instagram'), 0)
+
+    async def test_target_selector_hides_migrated_session(self):
+        self.router.bridges['instagram'].owner_allowed = lambda: False
+        await self.send('/skills', topic=None)
+        self.assertNotIn('Instagram', str(self.panel()['reply_markup']))
+        self.assertIn('会议记录', str(self.panel()['reply_markup']))
+
     async def test_all_chooses_recent_local_target_before_any_native_query(self):
         self.router.recent.record('meeting-native', 'old-use', 100)
         self.router.recent.record('instagram-native', 'new-use', 200)
