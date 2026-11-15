@@ -19,7 +19,7 @@ import time
 import aiohttp
 
 from attachments import payload_from
-from bridge import BOT_COMMANDS, Bridge, Codex, InputPreparationError, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted, refresh_health_snapshot
+from bridge import BOT_COMMANDS, Bridge, Codex, GuardedTelegram, InputPreparationError, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted, refresh_health_snapshot
 from session_picker import topic_missing_error
 from session_scope import SessionScope, SessionScopeError
 from message_format import send_output
@@ -483,6 +483,9 @@ class TargetBridge(NativeQuestions, Bridge):
                     self.delivery.watch({'id': accepted['turn_id'], 'status': 'inProgress'})
                 self.receipt_event.set()
             return result
+        if not self.owner_allowed():
+            self.store.mark_batch(self.store.batch(row), "denied")
+            return
         self.store.enqueue(f"input:{row['id']}:reply", row["chat_id"], reply)
         self.store.mark_batch(self.store.batch(row), "done")
 
@@ -1035,6 +1038,8 @@ class TopicRouter:
         self.started_targets.add(key)
         bridge.questions = self.questions
         bridge.telegram, bridge.username = self.telegram, self.username
+        if bridge.session_scope.enabled:
+            bridge.telegram = GuardedTelegram(self.telegram, bridge.owner_allowed)
         for coro in (bridge.connection_loop(False), bridge.input_loop(), bridge.event_loop(),
                      bridge.sender_loop(), bridge.maintenance_loop()):
             self.spawn(coro)
