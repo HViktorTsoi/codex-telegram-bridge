@@ -238,6 +238,131 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.native.call.await_count, 2)
         self.assertEqual(len(self.methods('sendMessage')), 1)
 
+    async def test_refresh_notice_reports_remaining_cooldown_and_eligible_query(self):
+        await self.ui.tick()
+        self.now += 20.2
+        self.ui.ingest(self.callback(304))
+        await self.ui.handle_one()
+        self.assertIn('40 秒', self.methods('answerCallbackQuery')[-1]['text'])
+        self.assertEqual(self.native.call.await_count, 1)
+        self.now += 40.8
+        self.ui.ingest(self.callback(305))
+        await self.ui.handle_one()
+        self.assertEqual(self.methods('answerCallbackQuery')[-1]['text'], '正在刷新额度…')
+        self.assertEqual(self.native.call.await_count, 2)
+
+    async def test_refresh_notice_distinguishes_disconnected_busy_and_disabled(self):
+        await self.ui.tick()
+        self.now += 61
+        self.bridge.ready.clear()
+        self.ui.ingest(self.callback(306))
+        await self.ui.handle_one()
+        self.assertIn('尚未连接', self.methods('answerCallbackQuery')[-1]['text'])
+        self.bridge.ready.set()
+        async with self.ui.fetch_lock:
+            self.ui.ingest(self.callback(307))
+            await self.ui.handle_one()
+        self.assertIn('正在刷新，请稍候', self.methods('answerCallbackQuery')[-1]['text'])
+        self.ui.enabled = False
+        self.ui.ingest(self.callback(308))
+        await self.ui.handle_one()
+        self.assertIn('已关闭', self.methods('answerCallbackQuery')[-1]['text'])
+        self.assertEqual(self.native.call.await_count, 1)
+
+    async def test_explicit_refresh_repairs_failed_known_card_from_cache_during_cooldown(self):
+        await self.ui.tick()
+        mid = self.ui.state['message_id']
+        self.now += 20
+        self.ui.on_account_event({'method': 'account/rateLimits/updated', 'params': limits(30),
+                                  '_account_epoch': 'epoch'})
+        self.ui._drain()
+        self.ui.state.update(delivery='failed', retry_at=self.now + 900, edited_at=self.now)
+        self.ui._save()
+        self.ui.ingest(self.callback(309))
+        await self.ui.handle_one()
+        self.assertEqual(self.native.call.await_count, 1)
+        self.assertIn('40 秒', self.methods('answerCallbackQuery')[-1]['text'])
+        self.assertEqual(self.ui.state['delivery'], 'sent')
+        self.assertEqual(self.methods('editMessageText')[-1]['message_id'], mid)
+        self.assertIn('剩余 70%', self.methods('editMessageText')[-1]['text'])
+        self.assertEqual(len(self.methods('sendMessage')), 1)
+        self.assertEqual(len(self.methods('pinChatMessage')), 1)
+
+    async def test_usage_command_repairs_failed_known_card_even_when_text_is_unchanged(self):
+        await self.ui.tick()
+        mid, sent = self.ui.state['message_id'], self.ui.state['sent_text']
+        self.now += 1
+        self.ui.state.update(delivery='failed', retry_at=self.now + 900)
+        self.ui._save()
+        self.assertEqual(self.ui.text(), sent)
+        self.ui.ingest(self.command(310))
+        await self.ui.handle_one()
+        self.assertEqual(self.native.call.await_count, 1)
+        self.assertEqual(self.ui.state['delivery'], 'sent')
+        self.assertEqual(self.methods('editMessageText')[-1]['message_id'], mid)
+        self.assertEqual(len(self.methods('sendMessage')), 1)
+
+    async def test_explicit_actions_do_not_recreate_unknown_or_unidentified_failed_cards(self):
+        await self.ui.tick()
+        initial = copy.deepcopy(self.ui.state)
+        for index, (status, mid) in enumerate((('uncertain', initial['message_id']),
+                                              ('creating', initial['message_id']),
+                                              ('failed', None), ('failed', True))):
+            for action in ('command', 'callback'):
+                with self.subTest(status=status, message_id=mid, action=action):
+                    self.ui.state = {**copy.deepcopy(initial), 'delivery': status}
+                    if mid is None:
+                        self.ui.state.pop('message_id')
+                    else:
+                        self.ui.state['message_id'] = mid
+                    identity = 320 + index * 2 + (action == 'callback')
+                    update = (self.command(identity) if action == 'command' else
+                              self.callback(identity, message_id=initial['message_id']))
+                    self.ui.ingest(update)
+                    await self.ui.handle_one()
+                    self.assertEqual(self.ui.state['delivery'], status)
+                    self.assertEqual(len(self.methods('sendMessage')), 1)
+                    self.assertEqual(self.methods('editMessageText'), [])
+
+    async def test_callback_ack_failure_does_not_block_query_or_known_card_repair(self):
+        await self.ui.tick()
+        mid = self.ui.state['message_id']
+        for index, error in enumerate((TelegramError('answerCallbackQuery', 400, 'query is too old'),
+                                       ConnectionError('popup unavailable'))):
+            self.now += 61
+            self.ui.state.update(delivery='failed')
+            self.ui._save()
+            self.failures['answerCallbackQuery'] = [error]
+            identity = 340 + index
+            self.ui.ingest(self.callback(identity))
+            await self.ui.handle_one()
+            self.assertEqual(self.native.call.await_count, index + 2)
+            self.assertEqual(self.ui.state['sample_at'], self.now)
+            self.assertEqual(self.ui.state['delivery'], 'sent')
+            self.assertEqual(self.methods('editMessageText')[-1]['message_id'], mid)
+            self.assertEqual(self.db.execute('SELECT state FROM usage_jobs WHERE id=?',
+                                            (identity,)).fetchone()[0], 'done')
+        self.assertEqual(len(self.methods('sendMessage')), 1)
+
+    async def test_unusable_push_does_not_discard_valid_inflight_quota_read(self):
+        await self.ui.tick()
+        self.now += 61
+        sequence = self.ui.event_sequence
+
+        async def read(*args):
+            for payload in ({}, {'rateLimits': {'primary': {'usedPercent': True,
+                                                            'windowDurationMins': 10080}}}):
+                self.ui.on_account_event({'method': 'account/rateLimits/updated', 'params': payload,
+                                          '_account_epoch': 'epoch'})
+            return limits(30)
+
+        self.native.call.side_effect = read
+        self.assertTrue(await self.ui._fetch(force=True))
+        self.ui._drain()
+        self.assertEqual(self.ui.event_sequence, sequence)
+        self.assertEqual(self.ui.state['sample_at'], self.now)
+        self.assertIn('剩余 70%', self.ui.text())
+
     async def test_simultaneous_refreshes_make_only_one_rpc(self):
         await self.ui.tick()
         self.now += 61
