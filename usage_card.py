@@ -145,6 +145,8 @@ class UsageCard:
         epoch = event.get('_account_epoch')
         if epoch is not None and (not root or epoch != getattr(root.codex, 'user_input_epoch', None)):
             return
+        if event['method'] == 'account/rateLimits/updated' and not snapshot(event.get('params', {})):
+            return  # An unusable push cannot supersede a valid in-flight read.
         self.event_sequence += 1
         if event['method'] == 'account/updated':
             self.generation += 1  # Invalidate an in-flight response immediately.
@@ -271,6 +273,28 @@ class UsageCard:
                             (str(max(self.router.store.offset(), update['update_id'] + 1)),))
         return True
 
+    def _manual_refresh_notice(self):
+        if not self.enabled:
+            return '额度卡片已关闭，请发送 /usage 开启。'
+        if self.fetch_lock.locked():
+            return '额度正在刷新，请稍候。'
+        root = self._root()
+        if root is None or not root.ready.is_set():
+            return 'Codex 尚未连接，暂用缓存。'
+        remaining = math.ceil(self.COOLDOWN - (self.clock() - self.state.get('last_attempt', 0)))
+        if remaining > 0:
+            return f'请在 {remaining} 秒后再次刷新，暂用缓存。'
+        return '正在刷新额度…'
+
+    def _retry_failed_edit(self):
+        mid = self.state.get('message_id')
+        if self.state.get('delivery') == 'failed' and type(mid) is int and mid > 0:
+            # Explicitly retry only an edit to a known card, never an uncertain create.
+            self.state.update(delivery='sent', retry_at=0,
+                              edited_at=self.clock() - self.EDIT_INTERVAL)
+            self.state.pop('sent_text', None)
+            self._save()
+
     async def handle_one(self):
         async with self.job_lock:
             row = self.db.execute("SELECT * FROM usage_jobs WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
@@ -290,8 +314,11 @@ class UsageCard:
                             or origin.get('message_thread_id') or origin.get('date') == 0
                             or origin.get('message_id') != self.state.get('message_id')):
                         raise ValueError('Stale usage callback')
-                    await self.router.telegram.call('answerCallbackQuery', callback_query_id=callback['id'],
-                                                    text='使用缓存显示；额度查询最短间隔 60 秒。')
+                    try:
+                        await asyncio.wait_for(self.router.telegram.call('answerCallbackQuery',
+                            callback_query_id=callback['id'], text=self._manual_refresh_notice()), 5)
+                    except (TelegramError, ConnectionError, OSError, asyncio.TimeoutError):
+                        pass  # An expired popup must not block the query or known-card repair.
                     if self.enabled:
                         await self._fetch(force=True)
                 else:
@@ -302,6 +329,7 @@ class UsageCard:
                         for name in ('message_id', 'delivery', 'sent_text', 'pin_state', 'retry_at'):
                             self.state.pop(name, None)
                         self._save()
+                self._retry_failed_edit()
                 await self.tick()
             except Exception as error:
                 with self.db:
