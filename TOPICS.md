@@ -85,6 +85,16 @@ both `--state-dir` and `--session-name` on every start, stop, status or logs com
 
 Topic mode does not use `--notify`.
 
+Inside a bound topic, `/agents` shows every spawned descendant of that topic's
+native Codex conversation, including nested, stored and archived agents. It
+offers pagination, an active-only filter, refresh and public task/result details.
+All and unbound topics return a location hint without querying Manager or other
+conversations. The browser inherits authorization from the verified parent and
+does not change the normal conversation registry or accept direct child input.
+Only native read methods are used; no model turn, resume, fork or agent control
+is performed. Panels and callbacks stay bound to the original Bot, owner, topic
+and parent conversation.
+
 Starting topic mode with `manage.py start` enables independent alerts-only
 monitoring by default, including when the receiver is already running. Existing
 healthy external monitors are reused; otherwise a separate tmux supervisor keeps
