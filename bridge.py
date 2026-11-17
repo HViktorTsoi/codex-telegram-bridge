@@ -21,6 +21,7 @@ from attachments import AttachmentError, inputs_for, payload_from
 from message_format import message_parts, send_output
 from reply_context import serialized as reply_serialized
 from session_scope import SessionScope, SessionScopeError
+from receiver_lock import BotReceiverLock
 
 LOG = logging.getLogger("codex_telegram")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -950,30 +951,31 @@ class Bridge:
             expected = self.config.get("expected_bot_username")
             if expected and self.username.lower() != expected.lstrip("@").lower():
                 raise RuntimeError("Bot identity does not match expected_bot_username; no polling started")
-            webhook = await self.telegram.call("getWebhookInfo")
-            if webhook.get("url"):
-                raise RuntimeError("Bot already has a webhook; leaving it unchanged")
-            try:
-                scope = {"type": "chat", "chat_id": int(self.owner)}
-                registered = await self.telegram.call("getMyCommands", scope=scope)
-                if registered != BOT_COMMANDS:
-                    await self.telegram.call("setMyCommands", scope=scope, commands=BOT_COMMANDS)
-                    LOG.info("Updated Telegram commands for the allowlisted private chat")
-            except (TelegramError, ConnectionError):
-                LOG.warning("Command menu registration failed; typed commands remain available")
-            tasks = [asyncio.create_task(coro) for coro in (
-                self.connection_loop(notify), self.poll_loop(), self.input_loop(),
-                self.event_loop(), self.sender_loop(), self.maintenance_loop(),
-            )]
-            try:
-                await asyncio.gather(*tasks)
-            finally:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                await self.codex.close()
-                self.ready.clear()
-                refresh_health_snapshot(self)
+            with BotReceiverLock(me["id"], self.username, self.state_dir):
+                webhook = await self.telegram.call("getWebhookInfo")
+                if webhook.get("url"):
+                    raise RuntimeError("Bot already has a webhook; leaving it unchanged")
+                try:
+                    scope = {"type": "chat", "chat_id": int(self.owner)}
+                    registered = await self.telegram.call("getMyCommands", scope=scope)
+                    if registered != BOT_COMMANDS:
+                        await self.telegram.call("setMyCommands", scope=scope, commands=BOT_COMMANDS)
+                        LOG.info("Updated Telegram commands for the allowlisted private chat")
+                except (TelegramError, ConnectionError):
+                    LOG.warning("Command menu registration failed; typed commands remain available")
+                tasks = [asyncio.create_task(coro) for coro in (
+                    self.connection_loop(notify), self.poll_loop(), self.input_loop(),
+                    self.event_loop(), self.sender_loop(), self.maintenance_loop(),
+                )]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await self.codex.close()
+                    self.ready.clear()
+                    refresh_health_snapshot(self)
 
 
 def main():

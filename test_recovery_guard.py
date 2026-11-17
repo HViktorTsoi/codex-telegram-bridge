@@ -73,6 +73,12 @@ class GuardianTests(unittest.IsolatedAsyncioTestCase):
     def write_config(self):
         (self.root / 'config.json').write_text(json.dumps(self.config))
 
+    async def alerts_guard(self):
+        await self.guard.close()
+        self.guard = Guardian(self.root, self.repo, alerts_only=True, telegram=self.telegram,
+            clock=lambda: self.now, process_probe=lambda pid: {'exists': self.running, 'exact': self.exact},
+            start_bridge=self.start, wait_healthy=self.wait)
+
     def write_health(self, pid=100, connected=False, last_poll=None):
         (self.root / 'health.json').write_text(json.dumps({'pid': pid, 'connected': connected,
             'updated_at': self.now, 'last_poll_at': self.now - 1 if last_poll is None else last_poll}))
@@ -132,7 +138,7 @@ class GuardianTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_or_unknown_process_never_stops_or_restarts(self):
         token, row = await self.card()
         self.running = True
-        self.write_health(connected=True)
+        self.write_health(connected=True, last_poll=self.now)
         self.assertTrue((await self.guard.recover(token, row['action_nonce']))['ok'])
         self.exact = False
         with self.assertRaises(GuardianError):
@@ -338,6 +344,181 @@ class GuardianTests(unittest.IsolatedAsyncioTestCase):
         edits = [params for method, params in self.calls if method == 'editMessageText']
         self.assertEqual(edits[-1]['message_id'], row['message_id'])
         self.assertIn('消息接收已恢复', edits[-1]['text'])
+
+    async def test_stale_heartbeat_alerts_once_across_monitor_restart_and_process_exit(self):
+        await self.alerts_guard()
+        self.running = True
+        self.write_health(connected=True, last_poll=self.now)
+        await self.guard.monitor_once()
+        self.now += 59
+        await self.guard.monitor_once()
+        self.assertFalse(any(method == 'sendMessage' for method, _ in self.calls))
+        self.now += 1
+        await self.guard.monitor_once()
+        row = self.guard.db.execute('SELECT * FROM incidents').fetchone()
+        self.assertEqual(row['reason'], 'receiver_heartbeat_stale')
+        await self.alerts_guard()
+        self.now += 100
+        await self.guard.monitor_once()
+        self.running = False
+        self.fault(identity='conflict-after-heartbeat-stall')
+        await self.guard.monitor_once()
+        self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), 1)
+        self.assertEqual(self.guard.db.execute('SELECT count(*) FROM incidents').fetchone()[0], 1)
+        self.start.assert_not_awaited()
+
+    async def test_poll_stall_alerts_with_fresh_heartbeat_and_waits_for_new_poll_to_recover(self):
+        await self.alerts_guard()
+        self.running = True
+        poll = self.now
+        self.write_health(connected=True, last_poll=poll)
+        await self.guard.monitor_once()
+        self.now += 89
+        self.write_health(connected=True, last_poll=poll)
+        await self.guard.monitor_once()
+        self.assertFalse(any(method == 'sendMessage' for method, _ in self.calls))
+        self.now += 1
+        self.write_health(connected=True, last_poll=poll)
+        await self.guard.monitor_once()
+        row = self.guard.db.execute('SELECT * FROM cards').fetchone()
+        self.assertEqual(self.guard.db.execute('SELECT reason FROM incidents').fetchone()[0], 'telegram_poll_stale')
+        self.now += 5
+        self.write_health(connected=True, last_poll=poll)
+        await self.guard.monitor_once()
+        self.assertFalse(any(method == 'editMessageText' for method, _ in self.calls))
+        self.write_health(connected=True, last_poll=self.now)
+        await self.guard.monitor_once()
+        edits = [params for method, params in self.calls if method == 'editMessageText']
+        self.assertEqual(edits[-1]['message_id'], row['message_id'])
+        self.assertIn('消息接收已恢复', edits[-1]['text'])
+        self.start.assert_not_awaited()
+
+    async def test_missing_first_poll_gets_startup_grace_then_alerts(self):
+        await self.alerts_guard()
+        self.running = True
+        started = self.now
+        for elapsed in (0, 30, 60, 89, 90):
+            self.now = started + elapsed
+            self.write_health(connected=True)
+            path = self.root / 'health.json'
+            health = json.loads(path.read_text())
+            health['last_poll_at'] = None
+            path.write_text(json.dumps(health))
+            await self.guard.monitor_once()
+            self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), int(elapsed == 90))
+        self.assertEqual(self.guard.db.execute('SELECT reason FROM incidents').fetchone()[0], 'telegram_poll_stale')
+
+    async def test_short_connection_failure_is_quiet_and_persistent_failure_survives_monitor_restart(self):
+        await self.alerts_guard()
+        self.running = True
+        self.write_health(connected=False, last_poll=self.now)
+        await self.guard.monitor_once()
+        self.now += 30
+        self.write_health(connected=True, last_poll=self.now)
+        await self.guard.monitor_once()
+        self.now += 5
+        self.write_health(connected=False, last_poll=self.now)
+        await self.guard.monitor_once()
+        self.now += 40
+        await self.alerts_guard()
+        self.write_health(connected=False, last_poll=self.now)
+        await self.guard.monitor_once()
+        self.assertFalse(any(method == 'sendMessage' for method, _ in self.calls))
+        self.now += 20
+        self.write_health(connected=False, last_poll=self.now)
+        await self.guard.monitor_once()
+        self.assertEqual(self.guard.db.execute('SELECT reason FROM incidents').fetchone()[0], 'native_disconnected')
+        self.start.assert_not_awaited()
+
+    async def test_persistent_receiver_error_alerts_without_restarting(self):
+        await self.alerts_guard()
+        self.running = True
+        started = self.now
+        for elapsed in (0, 59, 60):
+            self.now = started + elapsed
+            self.write_health(connected=True, last_poll=self.now)
+            path = self.root / 'health.json'
+            health = json.loads(path.read_text())
+            health['last_error'] = 'Telegram poll unavailable'
+            path.write_text(json.dumps(health))
+            await self.guard.monitor_once()
+        self.assertEqual(self.guard.db.execute('SELECT reason FROM incidents').fetchone()[0], 'receiver_error')
+        self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), 1)
+        self.start.assert_not_awaited()
+
+    async def test_same_pid_can_alert_again_only_after_confirmed_recovery(self):
+        await self.alerts_guard()
+        self.running = True
+        started = self.now
+        for elapsed, connected in ((0, False), (60, False), (65, True), (70, False), (130, False)):
+            self.now = started + elapsed
+            self.write_health(connected=connected, last_poll=self.now)
+            await self.guard.monitor_once()
+        self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), 2)
+        self.assertEqual(sum(method == 'editMessageText' for method, _ in self.calls), 1)
+        self.assertEqual(self.guard.db.execute('SELECT count(*) FROM incidents').fetchone()[0], 2)
+
+    async def test_recovery_requires_heartbeat_and_poll_after_incident_even_when_both_are_recent(self):
+        await self.alerts_guard()
+        _, card = await self.card()
+        self.running = True
+        self.now += 5
+        self.write_health(connected=True, last_poll=self.now - 6)
+        await self.guard.monitor_once()
+        self.assertEqual(self.guard.receiver_state()[0], 'running')
+        self.write_health(connected=True, last_poll=self.now)
+        path = self.root / 'health.json'
+        health = json.loads(path.read_text())
+        health['updated_at'] = self.now - 6
+        path.write_text(json.dumps(health))
+        await self.guard.monitor_once()
+        self.assertFalse(any(method == 'editMessageText' for method, _ in self.calls))
+        self.write_health(connected=True, last_poll=self.now)
+        await self.guard.monitor_once()
+        edits = [params for method, params in self.calls if method == 'editMessageText']
+        self.assertEqual(edits[-1]['message_id'], card['message_id'])
+
+    async def test_invalid_heartbeat_timestamps_never_claim_healthy(self):
+        self.running = True
+        for value in (True, 'invalid', -1, float('nan'), float('inf'), self.now + 10):
+            self.write_health(connected=True, last_poll=self.now)
+            path = self.root / 'health.json'
+            health = json.loads(path.read_text())
+            health['updated_at'] = value
+            path.write_text(json.dumps(health))
+            self.assertEqual(self.guard.receiver_state()[0], 'running')
+
+    async def test_new_pid_startup_and_old_fault_share_one_continuous_incident_until_recovery(self):
+        await self.alerts_guard()
+        _, card = await self.card()
+        self.running = True
+        started = self.now
+        for elapsed in (1, 35, 95):
+            self.now = started + elapsed
+            self.write_health(pid=101, connected=False, last_poll=self.now)
+            await self.guard.monitor_once()
+        self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), 1)
+        self.assertEqual(self.guard.db.execute('SELECT count(*) FROM incidents').fetchone()[0], 1)
+        self.now += 5
+        self.write_health(pid=101, connected=True, last_poll=self.now)
+        await self.guard.monitor_once()
+        edits = [params for method, params in self.calls if method == 'editMessageText']
+        self.assertEqual(edits[-1]['message_id'], card['message_id'])
+        self.start.assert_not_awaited()
+
+    async def test_first_observation_of_stale_live_process_gets_short_startup_grace(self):
+        await self.alerts_guard()
+        self.running = True
+        self.write_health(connected=True, last_poll=self.now - 200)
+        path = self.root / 'health.json'
+        health = json.loads(path.read_text())
+        health['updated_at'] = self.now - 200
+        path.write_text(json.dumps(health))
+        started = self.now
+        for elapsed in (0, 34, 35):
+            self.now = started + elapsed
+            await self.guard.monitor_once()
+            self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), int(elapsed == 35))
 
     async def test_default_start_uses_fixed_argv_without_shell_or_client_inputs(self):
         process = type('Process', (), {'returncode': 0, 'communicate': AsyncMock(return_value=(b'', b''))})()
