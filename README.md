@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.50 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.51 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -19,7 +19,7 @@
 按需引导我开启 BotFather Threaded Mode；多会话模式应创建真实 Telegram 话题并保存返回的 topic ID，替换示例里的占位值。
 在 BotFather 开启 Disallow users to create new threads，保留 Threaded Mode，让管理命令能留在主对话而不会被客户端自动建话题。
 安装依赖并运行测试，再启动对应实例；manage.py 支持 --state-dir 和 --session-name，操作独立实例时同时指定两项，不要误操作已有实例。
-为每个实例启用 README 的独立仅告警服务，核对服务开机启动、健康状态和原话题测试；监测不接收更新、不调用模型、不自动重启发生冲突的接收器。
+通过 manage.py start 启动话题 Bot 时，独立仅告警监测默认开启；已有外部监测服务会被核验和复用。核对 manage.py status 的 recovery 状态及原话题测试；需要机器重启后自动运行时，再配置实际宿主的用户服务，不能将 tmux 存活视为已配置开机自启。
 升级到包含 Footer 预览的版本时，先在实际运行桥接的 Python 环境重新安装 requirements.txt；新增 markdown-it-py 依赖必须在服务重启前就绪。
 验证 /status 中的原 thread ID、Markdown 和图片输入；多会话模式还需验证 /sessions 和各话题的消息归属。
 话题模式可使用 /skills 查询当前会话工作目录下可用的本机技能；All 中先选择会话。选择技能并回复文字任务后才运行模型，列表查询不调用模型。
@@ -193,7 +193,7 @@ All 中其他普通文字或附件仍展示消息预览和本机已绑定会话�
 .venv/bin/python manage.py stop
 ```
 
-`manage.py` 根据 `config.json` 的 `mode` 选择单会话或话题模式。单会话首次启动可使用 `start --notify`；话题模式使用 `/sessions`。电脑、网络和 Codex 服务需要保持运行；当前没有配置开机自启。
+`manage.py` 根据 `config.json` 的 `mode` 选择单会话或话题模式。单会话首次启动可使用 `start --notify`；话题模式使用 `/sessions`，并默认建立独立故障监测。电脑、网络和 Codex 服务需要保持运行；tmux 启动不等于机器重启后的自动启动，后者需要另外配置用户服务。
 
 独立实例同时指定状态目录和 tmux 会话名，后续 `status`、`logs`、`stop` 沿用同一对参数：
 
@@ -407,9 +407,9 @@ All 派单和 Codex 客户端用户输入回显中，桥接生成的“你在 Al
 
 ## 独立故障提示
 
-可选的 `recovery_service.py` 使用独立用户服务监控消息接收器，不接收 Telegram 更新、不调用模型、不改写输入队列，也不自动重启接收器。遇到 `getUpdates` 轮询冲突等退出时，原程序先保存故障原因和受影响话题；独立服务在这些原话题发送故障提示及待处理消息、附件数量。也检测进程仍在运行时的持续心跳停滞、收信停滞和连接异常。同一故障只发送一次，确认新心跳及成功收信后更新原提示。没有可定位的工作话题时才回到原 Manager 根话题。
+从 v0.11.51 起，话题模式通过 `manage.py start` 启动时默认启用独立故障监测。`recovery_service.py` 不接收 Telegram 更新、不调用模型、不改写输入队列，也不自动重启接收器。遇到 `getUpdates` 轮询冲突等退出时，原程序先保存故障原因和受影响话题；独立服务在这些原话题发送故障提示及待处理消息、附件数量。也检测进程仍在运行时的持续心跳停滞、收信停滞和连接异常。同一故障只发送一次，确认新心跳及成功收信后更新原提示。没有可定位的工作话题时才回到原 Manager 根话题。
 
-在本机原有状态目录下另建 `recovery/config.json`，不要替换主 `config.json`：
+首次启动时，若不存在 `recovery/config.json`，管理命令会创建下列配置，不替换主 `config.json`。已有配置原样保留；显式 `"enabled": false` 时不会自动启动，已有其他恢复模式也不会被覆盖。修改配置为停用不会强行停止外部服务，仍需在原服务管理器停止该监测。
 
 ```json
 {
@@ -418,6 +418,10 @@ All 派单和 Codex 客户端用户输入回显中，桥接生成的“你在 Al
   "interval_seconds": 5
 }
 ```
+
+启动时先核验已有监测进程、锁和健康状态，复用正常的 systemd 或其他外部监测；没有现成监测时，建立与状态目录对应的独立 tmux 守护进程，子监测退出后约 5 秒重启。接收器和监测使用不同会话，`manage.py stop` 只停止接收器。再次执行 `manage.py start` 可为已运行的接收器补齐告警，不重启 Codex 会话。状态不可核实时不会启动竞争实例或宣称告警已正常启用。
+
+`manage.py status` 的 `recovery` 字段区分配置启用、实际运行和健康状态；若启动接收器后监测仍未就绪，命令会报告部分失败并返回非零状态，检查原因后可再次执行 `start`。直接运行 `topics_bridge.py run` 不经过上述部署入口，需自行配置独立监测；单会话兼容模式不自动启用话题告警。
 
 按上述配置每 5 秒检查本机状态；已记录的 401、409 退出在下一次检查告警，其他异常退出等待约 15 秒。进程仍在时，健康快照停更约 60 秒、成功收信停滞约 90 秒、连接或错误持续约 60 秒会告警；新进程有约 35 秒启动观察期，避免短暂重连刷屏。真实故障提示使用普通 Telegram 通知，测试提示为静音；手机的会话静音及勿扰设置仍然生效。
 

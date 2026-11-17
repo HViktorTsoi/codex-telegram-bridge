@@ -85,6 +85,17 @@ both `--state-dir` and `--session-name` on every start, stop, status or logs com
 
 Topic mode does not use `--notify`.
 
+Starting topic mode with `manage.py start` enables independent alerts-only
+monitoring by default, including when the receiver is already running. Existing
+healthy external monitors are reused; otherwise a separate tmux supervisor keeps
+the monitor child running. Explicitly disabled recovery configuration or another
+recovery mode is preserved. Check the `recovery` field in `manage.py status` for
+actual process and health verification. A nonzero start result can mean the
+receiver is running but monitor readiness is unconfirmed; retry after inspecting
+the cause. Stopping the receiver leaves independent monitoring available. This
+tmux fallback is not automatic startup after a machine reboot; use a host user
+service for that. Direct `topics_bridge.py run` bypasses this deployment helper.
+
 ## Optional three-Bot groups
 
 Run separate `general`, `research` and `development` Bots with independent
