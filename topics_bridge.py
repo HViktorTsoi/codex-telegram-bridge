@@ -22,6 +22,7 @@ from attachments import payload_from
 from bridge import BOT_COMMANDS, Bridge, Codex, GuardedTelegram, InputPreparationError, RpcError, Store, Telegram, TelegramError, chunks, now_ms, permitted, refresh_health_snapshot
 from session_picker import topic_missing_error
 from session_scope import SessionScope, SessionScopeError
+from receiver_lock import BotReceiverLock
 from message_format import send_output
 from activity_indicator import TopicActivity
 from native_mirror import NativeMirror
@@ -1233,56 +1234,57 @@ class TopicRouter:
                 raise RuntimeError("Bot identity mismatch; no polling started")
             if not me.get('has_topics_enabled'):
                 raise RuntimeError("Enable private topics in BotFather before starting topic mode")
-            if (await self.startup_call('getWebhookInfo')).get('url'):
-                raise RuntimeError("Bot already has a webhook; leaving it unchanged")
-            scope = {'type': 'chat', 'chat_id': int(self.owner)}
-            from control_center import COMMANDS
-            commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'},
-                        {'command': 'rename', 'description': '修改会话名称，同步话题名称'},
-                        {'command': 'skills', 'description': '查看本机会话技能并选择使用'},
-                        {'command': 'files', 'description': '查看本话题的 Codex 输出文件'},
-                        {'command': 'keyboard', 'description': '显示底部常用按钮'}, *COMMANDS]
-            commands.append({'command': 'usage', 'description': 'All 置顶 Codex 额度与缓存刷新'})
-            if await self.startup_call('getMyCommands', scope=scope) != commands:
-                await self.startup_call('setMyCommands', scope=scope, commands=commands)
-            self.failure = asyncio.get_running_loop().create_future()
-            self.running = True
-            try:
-                await self.picker.recover()
-                self.status_controls.recover()
-                self.skills.recover()
-                self.questions.recover()
-                self.settings_menu.recover()
-                self.keyboard.recover()
-                self.usage.recover()
-                self.collaboration.recover()
-                self.files_menu.recover()
-                for bridge in self.bridges.values():
-                    self.start_target(bridge)
-                for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
-                    self.spawn(coro)
-                self.spawn(self.picker.home_loop())
-                self.spawn(self.status_controls.loop())
-                self.spawn(self.skills.loop())
-                self.spawn(self.questions.loop())
-                self.spawn(self.settings_menu.loop())
-                self.spawn(self.keyboard.loop())
-                self.spawn(self.usage.loop())
-                self.spawn(self.collaboration.loop())
-                self.spawn(self.files_menu.loop())
-                for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
-                    self.spawn(coro)
-                self.spawn(self.control.sync_loop())
-                await self.failure
-            finally:
-                self.stopping, self.running = True, False
-                for task in self.tasks:
-                    task.cancel()
-                await asyncio.gather(*self.tasks, return_exceptions=True)
-                for bridge in self.bridges.values():
-                    await bridge.codex.close()
-                    bridge.ready.clear()
-                refresh_health_snapshot(self)
+            with BotReceiverLock(me["id"], self.username, self.state_dir):
+                if (await self.startup_call('getWebhookInfo')).get('url'):
+                    raise RuntimeError("Bot already has a webhook; leaving it unchanged")
+                scope = {'type': 'chat', 'chat_id': int(self.owner)}
+                from control_center import COMMANDS
+                commands = [*BOT_COMMANDS, {'command': 'sessions', 'description': '会话列表与添加绑定'},
+                            {'command': 'rename', 'description': '修改会话名称，同步话题名称'},
+                            {'command': 'skills', 'description': '查看本机会话技能并选择使用'},
+                            {'command': 'files', 'description': '查看本话题的 Codex 输出文件'},
+                            {'command': 'keyboard', 'description': '显示底部常用按钮'}, *COMMANDS]
+                commands.append({'command': 'usage', 'description': 'All 置顶 Codex 额度与缓存刷新'})
+                if await self.startup_call('getMyCommands', scope=scope) != commands:
+                    await self.startup_call('setMyCommands', scope=scope, commands=commands)
+                self.failure = asyncio.get_running_loop().create_future()
+                self.running = True
+                try:
+                    await self.picker.recover()
+                    self.status_controls.recover()
+                    self.skills.recover()
+                    self.questions.recover()
+                    self.settings_menu.recover()
+                    self.keyboard.recover()
+                    self.usage.recover()
+                    self.collaboration.recover()
+                    self.files_menu.recover()
+                    for bridge in self.bridges.values():
+                        self.start_target(bridge)
+                    for coro in (self.poll_loop(), self.forwarding_loop(), self.notices_loop(), self.health_loop(), self.picker.loop()):
+                        self.spawn(coro)
+                    self.spawn(self.picker.home_loop())
+                    self.spawn(self.status_controls.loop())
+                    self.spawn(self.skills.loop())
+                    self.spawn(self.questions.loop())
+                    self.spawn(self.settings_menu.loop())
+                    self.spawn(self.keyboard.loop())
+                    self.spawn(self.usage.loop())
+                    self.spawn(self.collaboration.loop())
+                    self.spawn(self.files_menu.loop())
+                    for coro in (self.control.jobs_loop(), self.control.delivery_loop(), self.control.refresh_loop()):
+                        self.spawn(coro)
+                    self.spawn(self.control.sync_loop())
+                    await self.failure
+                finally:
+                    self.stopping, self.running = True, False
+                    for task in self.tasks:
+                        task.cancel()
+                    await asyncio.gather(*self.tasks, return_exceptions=True)
+                    for bridge in self.bridges.values():
+                        await bridge.codex.close()
+                        bridge.ready.clear()
+                    refresh_health_snapshot(self)
 
 
 def main():

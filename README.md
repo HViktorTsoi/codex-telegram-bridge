@@ -7,7 +7,7 @@
 可以把仓库地址和下列文字发给目标机器上的 agent。私有仓库需要先为该机器或 agent 使用的 GitHub 账号配置读取权限；Bot Token、Telegram 用户 ID 和实际会话绑定不在仓库里，需要在目标机器上配置。环境要求见下方“环境”一节。
 
 ```text
-请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.46 或更新的稳定版本。
+请部署 https://github.com/HViktorTsoi/codex-telegram-bridge，使用 v0.11.50 或更新的稳定版本。
 
 先阅读 README.md、DEPLOYMENT.md 和 TOPICS.md，检查目标机器的 Python、tmux 和 Codex 服务。
 复用本机已有 Codex app-server，列出并核对我要绑定的原 session；绑定时保持原 thread ID，不新建或 fork。
@@ -15,9 +15,11 @@
 总览、Inbox 和派单只管理本机会话，不配置任何跨机器同步或路由。
 在 All 回复本机已绑定话题中的消息时，直接投递到该话题，不再选择会话，只把新内容交给 Codex；话题内部回复继续附带引用原文。All 中其他普通消息先暂存，点击接收会话后直接投递；未选择时不发送，也不自动转给默认或最近会话。明确 @别名、/to 和系统指令沿用原流程。
 使用独立 Bot 和私有配置目录，避免与已有实例争用同一个 Token；将访问策略设为仅允许本人 Telegram 用户 ID。
+诊断已有 Bot 时不要另行调用 getUpdates；从 health.json、队列和日志查看收信状态，使用 getMe 或 getWebhookInfo 检查身份及积压数量。临时 getUpdates 也会与正常长轮询冲突。
 按需引导我开启 BotFather Threaded Mode；多会话模式应创建真实 Telegram 话题并保存返回的 topic ID，替换示例里的占位值。
 在 BotFather 开启 Disallow users to create new threads，保留 Threaded Mode，让管理命令能留在主对话而不会被客户端自动建话题。
 安装依赖并运行测试，再启动对应实例；manage.py 支持 --state-dir 和 --session-name，操作独立实例时同时指定两项，不要误操作已有实例。
+为每个实例启用 README 的独立仅告警服务，核对服务开机启动、健康状态和原话题测试；监测不接收更新、不调用模型、不自动重启发生冲突的接收器。
 升级到包含 Footer 预览的版本时，先在实际运行桥接的 Python 环境重新安装 requirements.txt；新增 markdown-it-py 依赖必须在服务重启前就绪。
 验证 /status 中的原 thread ID、Markdown 和图片输入；多会话模式还需验证 /sessions 和各话题的消息归属。
 话题模式可使用 /skills 查询当前会话工作目录下可用的本机技能；All 中先选择会话。选择技能并回复文字任务后才运行模型，列表查询不调用模型。
@@ -405,7 +407,7 @@ All 派单和 Codex 客户端用户输入回显中，桥接生成的“你在 Al
 
 ## 独立故障提示
 
-可选的 `recovery_service.py` 使用独立用户服务监控消息接收器，不接收 Telegram 更新、不调用模型、不改写输入队列，也不自动重启接收器。遇到 `getUpdates` 轮询冲突等退出时，原程序先保存故障原因和受影响话题；独立服务在这些原话题发送故障提示及待处理消息、附件数量。接收恢复后更新同一条提示。没有可定位的工作话题时才回到原 Manager 根话题。
+可选的 `recovery_service.py` 使用独立用户服务监控消息接收器，不接收 Telegram 更新、不调用模型、不改写输入队列，也不自动重启接收器。遇到 `getUpdates` 轮询冲突等退出时，原程序先保存故障原因和受影响话题；独立服务在这些原话题发送故障提示及待处理消息、附件数量。也检测进程仍在运行时的持续心跳停滞、收信停滞和连接异常。同一故障只发送一次，确认新心跳及成功收信后更新原提示。没有可定位的工作话题时才回到原 Manager 根话题。
 
 在本机原有状态目录下另建 `recovery/config.json`，不要替换主 `config.json`：
 
@@ -417,7 +419,13 @@ All 派单和 Codex 客户端用户输入回显中，桥接生成的“你在 Al
 }
 ```
 
+按上述配置每 5 秒检查本机状态；已记录的 401、409 退出在下一次检查告警，其他异常退出等待约 15 秒。进程仍在时，健康快照停更约 60 秒、成功收信停滞约 90 秒、连接或错误持续约 60 秒会告警；新进程有约 35 秒启动观察期，避免短暂重连刷屏。真实故障提示使用普通 Telegram 通知，测试提示为静音；手机的会话静音及勿扰设置仍然生效。
+
 前台运行 `python3 recovery_service.py run --state-dir ~/.local/state/codex-telegram`；长期运行可将 [独立用户服务示例](contrib/codex-telegram-recovery.service) 安装为 `~/.config/systemd/user/codex-telegram-recovery.service`，按实际克隆目录修改路径，再执行 `systemctl --user daemon-reload` 和 `systemctl --user enable --now codex-telegram-recovery.service`。服务及其配置目录应仅对本机用户可读，使用主桥接已有 Bot 身份与白名单，不复制凭据。
+
+每个 Bot 使用自己的监测服务名称和 `--state-dir`，不要替换其他实例的服务。桥接运行在 Docker 容器时，监测也应通过宿主用户服务的 `docker exec` 在同一容器内运行，以核验同一组 `/proc` 进程和锁；容器内与宿主的同名路径不一定指向同一目录，用户服务文件应安装到实际宿主的 systemd 用户配置目录。
+
+接收器还在本用户的 `~/.local/state/codex-telegram-pollers/` 持有按已核验 Bot ID 区分的进程锁；即使误用了另一状态目录，同 Bot 也不能由第二个桥接进程收信。正常退出释放锁，不删除锁文件。此锁只约束本机同一用户下的桥接程序，其他机器或绕过桥接直接请求 Bot API 的脚本仍可能引发冲突，因此排障时不要手动运行 `getUpdates`。不需要停掉正常服务来查看积压，可调用只读的 `getWebhookInfo`。
 
 可用 `python3 recovery_service.py status` 查看独立健康状态，`journalctl --user -u codex-telegram-recovery.service` 查看日志。`python3 recovery_service.py probe --target 会话key` 会向当前绑定话题发送明确标记的测试提示并原地更新，不中断任务；测试不是实际故障。`manage.py` 另支持显式 `--state-dir` 和 `--session-name`，手动停止时写入短期维护标记，避免部署期间误报。
 

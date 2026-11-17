@@ -29,6 +29,10 @@ REASONS = {
     'telegram_poll_conflict': '同一个 Bot 被其它接收器同时轮询，消息接收已暂停。',
     'telegram_auth_failed': 'Telegram 凭据失效，需要先更新 Bot 配置。',
     'receiver_stopped': '消息接收器已停止，原有队列仍然保留。',
+    'receiver_heartbeat_stale': '消息接收器的健康状态已持续停止更新。',
+    'telegram_poll_stale': 'Telegram 消息轮询已持续未成功完成。',
+    'native_disconnected': '消息接收器与 Codex 会话的连接已持续异常。',
+    'receiver_error': '消息接收器已持续报告错误。',
 }
 
 
@@ -54,6 +58,10 @@ class Guardian:
     COOLDOWN = 60
     GRACE = 15
     HEALTH_WAIT = 35
+    STARTUP_GRACE = 35
+    HEARTBEAT_STALE = 60
+    POLL_STALE = 90
+    ERROR_GRACE = 60
 
     def __init__(self, state_dir, repo_dir, public_base_url=None, *, alerts_only=False, telegram=None, clock=time.time,
                  process_probe=None, start_bridge=None, wait_healthy=None):
@@ -228,10 +236,13 @@ class Guardian:
         if probe.get('exists'):
             if not probe.get('exact'):
                 return 'unsafe', health
-            fresh = self.clock() - float(health.get('updated_at') or 0) < 30
-            last_poll = health.get('last_poll_at')
-            polled = (type(last_poll) in (int, float) and math.isfinite(last_poll)
-                      and 0 < last_poll <= self.clock() + 5)
+            now = self.clock()
+            updated = self._health_time(health.get('updated_at'), now)
+            last_poll = self._health_time(health.get('last_poll_at'), now)
+            recovery_after = float(self._get('recovery_after', '0'))
+            fresh = updated is not None and now - updated < 30 and updated >= recovery_after
+            polled = (last_poll is not None and now - last_poll < self.POLL_STALE
+                      and last_poll >= recovery_after)
             return ('healthy' if fresh and polled and health.get('connected')
                     and not health.get('last_error') else 'running'), health
         if not self._lock_free():
@@ -240,6 +251,54 @@ class Guardian:
         if float(maintenance.get('until') or 0) > self.clock():
             return 'maintenance', health
         return 'stopped', health
+
+    @staticmethod
+    def _health_time(value, now):
+        if type(value) in (int, float) and math.isfinite(value) and 0 < value <= now + 5:
+            return value
+        return None
+
+    def _live_watch(self):
+        try:
+            watch = json.loads(self._get('live_watch', '{}'))
+            return watch if isinstance(watch, dict) else {}
+        except ValueError:
+            return {}
+
+    def _watch_live(self, state, health, now):
+        """Persist one incident per uninterrupted failure, including monitor restarts."""
+        watch = self._live_watch()
+        if watch.get('pid') != health.get('pid'):
+            watch = {**{key: watch[key] for key in ('incident_id', 'incident_at', 'reason') if key in watch},
+                     'pid': health.get('pid'), 'observed_at': now}
+        bad_connection = not health.get('connected') or bool(health.get('last_error'))
+        if bad_connection:
+            watch.setdefault('error_since', now)
+        else:
+            watch.pop('error_since', None)
+        reason = None
+        elapsed = now - watch['observed_at']
+        updated = self._health_time(health.get('updated_at'), now)
+        last_poll = self._health_time(health.get('last_poll_at'), now)
+        if state == 'healthy':
+            for key in ('incident_id', 'incident_at', 'reason'):
+                watch.pop(key, None)
+        elif elapsed >= self.STARTUP_GRACE:
+            if now - (updated if updated is not None else watch['observed_at']) >= self.HEARTBEAT_STALE:
+                reason = 'receiver_heartbeat_stale'
+            elif now - (last_poll if last_poll is not None else watch['observed_at']) >= self.POLL_STALE:
+                reason = 'telegram_poll_stale'
+            elif bad_connection and now - watch['error_since'] >= self.ERROR_GRACE:
+                reason = 'native_disconnected' if not health.get('connected') else 'receiver_error'
+            if reason and not watch.get('incident_id'):
+                watch.update(incident_id='receiver-unhealthy:' + str(health.get('pid')) + ':' + secrets.token_hex(8),
+                             incident_at=now, reason=reason)
+        with self.db:
+            self._set('live_watch', _json(watch))
+        if reason:
+            return {'id': watch['incident_id'], 'at': watch['incident_at'],
+                    'reason': watch['reason'], 'targets': []}
+        return None
 
     def _queue_counts(self, card):
         collected = {}
@@ -391,6 +450,15 @@ class Guardian:
             self.db.execute('INSERT OR IGNORE INTO incidents VALUES(?,?,?,?,?,?,?,?,?)',
                 (identity, str(fault['id']), fault['at'], fault.get('code'), fault.get('reason', 'receiver_stopped'),
                  me['id'], me['username'], config.get('host_id'), self._token_digest()))
+            incident_at = self.db.execute('SELECT at FROM incidents WHERE id=?', (identity,)).fetchone()[0]
+            self._set('recovery_after', max(float(self._get('recovery_after', '0')), incident_at))
+            if self.alerts_only:
+                watch = self._live_watch()
+                watch.update(incident_id=str(fault['id']), incident_at=incident_at,
+                             reason=fault.get('reason', 'receiver_stopped'))
+                self._set('live_watch', _json(watch))
+            if self.db.execute('SELECT 1 FROM cards WHERE incident_id=? LIMIT 1', (identity,)).fetchone():
+                return identity
             for target in self._affected_targets(fault):
                 cid = secrets.token_hex(16)
                 token = self._card_token(cid)
@@ -486,6 +554,7 @@ class Guardian:
         state, health = self.receiver_state()
         now = self.clock()
         if state in ('healthy', 'running'):
+            fault = self._watch_live(state, health, now) if self.alerts_only else None
             with self.db:
                 self._set('last_live', now)
                 self._set('last_live_pid', health.get('pid'))
@@ -496,6 +565,8 @@ class Guardian:
                     self.db.execute("UPDATE cards SET result=?,dirty=1 WHERE message_id IS NOT NULL "
                                     "AND state='sent' AND result IS NULL AND (? OR expires_at>?)",
                                     (recovered, int(self.alerts_only), now))
+            if fault:
+                await self._new_incident(fault)
             await self._flush_cards()
             return
         if state in ('busy', 'unsafe'):
@@ -507,7 +578,11 @@ class Guardian:
                        and fault.get('host_id') == self.config().get('host_id'))
         if state == 'maintenance' and not fresh_fault:
             return
-        if fresh_fault:
+        watch = self._live_watch() if self.alerts_only else {}
+        if watch.get('incident_id'):
+            await self._new_incident({'id': watch['incident_id'], 'at': watch['incident_at'],
+                                      'reason': watch['reason'], 'targets': []})
+        elif fresh_fault:
             await self._new_incident(fault)
         else:
             last_live = float(self._get('last_live', str(now)))
