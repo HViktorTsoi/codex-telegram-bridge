@@ -78,6 +78,8 @@ class Guardian:
         self._injected_telegram = telegram is not None
         self._verified = None
         self.last_delivery_error = None
+        self._telegram_verification_failed = False
+        self._delivery_error_before_verification = None
         self._process_probe = process_probe or self._probe_process
         self._starter = start_bridge or self._start_default
         self._waiter = wait_healthy or self._await_healthy
@@ -490,6 +492,9 @@ class Guardian:
         try:
             await self._ensure_telegram()
         except Exception as error:
+            if not self._telegram_verification_failed:
+                self._delivery_error_before_verification = self.last_delivery_error
+            self._telegram_verification_failed = True
             self.last_delivery_error = type(error).__name__
             LOG.warning('Recovery bot unavailable: %s', type(error).__name__)
             return
@@ -547,8 +552,12 @@ class Guardian:
             with self.db:
                 self.db.execute("UPDATE cards SET state='sent',message_id=?,dirty=0,retry_at=0 WHERE id=?", (mid, card['id']))
             delivered = True
-        if delivered and not had_error:
+        if self._telegram_verification_failed and not had_error:
+            self.last_delivery_error = self._delivery_error_before_verification
+        elif delivered and not had_error:
             self.last_delivery_error = None
+        self._telegram_verification_failed = False
+        self._delivery_error_before_verification = None
 
     async def monitor_once(self):
         state, health = self.receiver_state()

@@ -99,7 +99,8 @@ class ManagementTests(unittest.TestCase):
             return SimpleNamespace(returncode=1 if args[1] == 'has-session' else 0)
 
         with patch('sys.argv', ['manage.py', 'start', '--state-dir', str(self.root), '--session-name', 'fixture-bridge']), \
-                patch('manage.subprocess.run', side_effect=run), redirect_stdout(io.StringIO()):
+                patch('manage.subprocess.run', side_effect=run), \
+                patch('manage.ensure_monitor', return_value={'status': 'healthy'}), redirect_stdout(io.StringIO()):
             manage.main()
         self.assertFalse((self.root / 'recovery/maintenance.json').exists())
         create = next(args for args in calls if args[1] == 'new-session')

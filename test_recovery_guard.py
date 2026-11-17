@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from bridge import TelegramError
 from recovery_guard import Guardian, GuardianError
+from recovery_service import write_health as write_monitor_health
 
 
 class GuardianTests(unittest.IsolatedAsyncioTestCase):
@@ -201,6 +202,50 @@ class GuardianTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), 1)
         self.assertIsNone(self.guard.resolve_card(token)['message_id'])
         self.assertEqual(self.guard.last_delivery_error, 'ConnectionError')
+
+    async def test_temporary_bot_verification_failure_without_cards_recovers_monitor_health(self):
+        await self.alerts_guard()
+        self.running = True
+        self.write_health(connected=True, last_poll=self.now)
+        failures = [ConnectionError('temporary connection failure'), TimeoutError('temporary timeout')]
+        with patch.object(self.telegram, 'call', new=AsyncMock(side_effect=failures)) as verify:
+            for failure in failures:
+                await self.guard.monitor_once()
+                write_monitor_health(self.root, self.guard)
+                health = json.loads((self.root / 'recovery/health.json').read_text())
+                self.assertEqual(health['last_error'], type(failure).__name__)
+            self.assertEqual([call.args for call in verify.call_args_list], [('getMe',), ('getMe',)])
+        await self.guard.monitor_once()
+        write_monitor_health(self.root, self.guard)
+        health = json.loads((self.root / 'recovery/health.json').read_text())
+        self.assertIsNone(self.guard.last_delivery_error)
+        self.assertIsNone(health['last_error'])
+        self.assertTrue(health['enabled'])
+        self.assertEqual(self.guard.db.execute('SELECT count(*) FROM cards').fetchone()[0], 0)
+        self.assertEqual([method for method, _ in self.calls], ['getMe'])
+
+    async def test_bot_verification_recovery_preserves_previous_card_delivery_error(self):
+        cases = [(ConnectionError('unknown send'), 'uncertain', 'ConnectionError'),
+                 (TelegramError('sendMessage', 400, 'rejected'), 'failed', 'TelegramError')]
+        for index, (failure, expected_state, expected_error) in enumerate(cases):
+            with self.subTest(state=expected_state):
+                self.errors = [failure]
+                self.fault(identity=f'verification-preserves-delivery-{index}')
+                await self.guard.monitor_once()
+                row = self.guard.db.execute('SELECT * FROM cards ORDER BY rowid DESC LIMIT 1').fetchone()
+                before = dict(row)
+                self.assertEqual(row['state'], expected_state)
+                self.assertEqual(self.guard.last_delivery_error, expected_error)
+                send_count = sum(method == 'sendMessage' for method, _ in self.calls)
+                self.guard._verified = None
+                with patch.object(self.telegram, 'call', new=AsyncMock(side_effect=OSError('verification unavailable'))):
+                    await self.guard._flush_cards()
+                self.assertEqual(self.guard.last_delivery_error, 'OSError')
+                await self.guard._flush_cards()
+                self.assertEqual(self.guard.last_delivery_error, expected_error)
+                self.assertEqual(dict(self.guard.db.execute('SELECT * FROM cards WHERE id=?',
+                                                           (row['id'],)).fetchone()), before)
+                self.assertEqual(sum(method == 'sendMessage' for method, _ in self.calls), send_count)
 
     async def test_known_rate_limit_retries_after_server_cooldown(self):
         self.errors = [TelegramError('sendMessage', 429, 'wait', retry_after=20)]

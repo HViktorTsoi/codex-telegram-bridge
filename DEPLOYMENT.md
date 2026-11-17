@@ -53,6 +53,10 @@ python3 manage.py status --state-dir "$HOME/.local/state/codex-telegram-research
 
 General 与 Development 使用各自的状态目录和 tmux 会话名；`stop`、`logs` 同样携带对应两项参数。跨 Bot 迁移需要上述部署操作，菜单不提供一键迁移。
 
+从 v0.11.51 起，话题模式的 `manage.py start` 默认建立独立仅告警监测，已运行的接收器也会核验并补齐。默认配置只在缺失时创建，显式停用和其他恢复模式保留。已有健康的外部服务会被复用；没有现成监测时使用独立 tmux 守护进程，子监测退出后延迟重启。`manage.py status` 的 `recovery` 字段应显示实际正常，不能只以配置文件存在作为验收依据。启动时监测失败会明确返回非零状态，不回滚或重复启动已经运行的接收器。
+
+tmux 守护不代表机器重启后的自动启动；需要此能力时按 README 的独立用户服务示例配置实际宿主。Docker 部署的监测应在接收器所在容器内核验进程和锁，不应将容器内写入的同名 systemd 路径误当成宿主服务已安装。故障监测不会重启发生 401、409 的接收器，也不启动 Codex 模型。
+
 ## 呈现配置与旧实例迁移
 
 话题模式参考 [config.topics.example.json](config.topics.example.json)。新话题实例默认采用累计正文与持久按钮状态栏；部署或统一迁移时，仍建议将以下三项明确合并到原有私有 `config.json` 顶层：

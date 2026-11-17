@@ -11,8 +11,30 @@ import subprocess
 import sys
 import time
 
+from recovery_bootstrap import ensure_monitor, monitor_status
+
 STATE = Path.home() / ".local/state/codex-telegram"
 SESSION = "codex-telegram-bridge"
+
+
+def start_alerts(state, config):
+    if config.get("mode") != "topics":
+        return
+    result = ensure_monitor(state, Path(__file__).parent, sys.executable)
+    status = result.get("status")
+    if status == "healthy":
+        print("Independent Telegram failure alerts are running.")
+    elif status == "disabled":
+        print("Independent Telegram failure alerts are disabled in configuration.")
+        if result.get("running"):
+            print("An existing monitor is still running; its service was left unchanged.")
+    elif status == "unsupported":
+        print("Existing recovery mode was left unchanged; default alerts were not started.")
+    else:
+        print("Receiver startup was handled, but independent failure alerts are not verified: "
+              + str(result.get("error") or status or "unknown") + ". Retry manage.py start or check status.",
+              file=sys.stderr)
+        raise SystemExit(2)
 
 
 def main():
@@ -34,15 +56,16 @@ def main():
             mark_maintenance(state)
         except OSError:
             print("Recovery maintenance marker could not be cleared.", file=sys.stderr)
-        if exists:
-            print("Telegram bridge is already running.")
-            return
         if not (state / "config.json").exists():
             raise SystemExit(f"Missing configuration: {state / 'config.json'}")
+        config = json.loads((state / "config.json").read_text())
+        if exists:
+            print("Telegram bridge is already running.")
+            start_alerts(state, config)
+            return
         log_path = state / "bridge.log"
         log_path.touch(mode=0o600, exist_ok=True)
         log_path.chmod(0o600)
-        config = json.loads((state / "config.json").read_text())
         entrypoint = "topics_bridge.py" if config.get("mode") == "topics" else "bridge.py"
         command = [sys.executable, "-u", str(Path(__file__).with_name(entrypoint)), "run", "--state-dir", str(state)]
         if args.notify:
@@ -52,6 +75,7 @@ def main():
         shell_command = "exec " + shlex.join(command) + " >> " + shlex.quote(str(state / "bridge.log")) + " 2>&1"
         subprocess.run(["tmux", "new-session", "-d", "-s", session, "-c", str(Path.home()), shell_command], check=True)
         print("Telegram bridge started in tmux: " + session)
+        start_alerts(state, config)
     elif args.action == "stop":
         from recovery_fault import mark_maintenance
         try:
@@ -81,6 +105,7 @@ def main():
         data = json.loads(path.read_text()) if path.exists() else {}
         data["tmux_running"] = exists
         data["health_age_seconds"] = round(time.time() - data["updated_at"], 1) if data.get("updated_at") else None
+        data["recovery"] = monitor_status(state, Path(__file__).parent, sys.executable)
         print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
