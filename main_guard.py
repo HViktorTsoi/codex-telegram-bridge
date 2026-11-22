@@ -1,4 +1,4 @@
-"""Resolve All replies to exact local topics; hold other messages for selection."""
+"""Route All input to its sole bound topic or require an explicit selection."""
 import copy
 import json
 import secrets
@@ -28,12 +28,14 @@ class MainChatGuard:
                 expires_at REAL,presented_revision INTEGER DEFAULT 0,error TEXT,confirmed_at REAL);
             CREATE TABLE IF NOT EXISTS main_guard_messages(
                 update_id INTEGER PRIMARY KEY,draft_id TEXT,payload TEXT,reply_json TEXT,received_at REAL,
-                reply_binding_json TEXT);
+                reply_binding_json TEXT,singleton_binding_json TEXT);
         ''')
         if 'confirmed_at' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_drafts)')}:
             self.db.execute('ALTER TABLE main_guard_drafts ADD COLUMN confirmed_at REAL')
         if 'reply_binding_json' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_messages)')}:
             self.db.execute('ALTER TABLE main_guard_messages ADD COLUMN reply_binding_json TEXT')
+        if 'singleton_binding_json' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_messages)')}:
+            self.db.execute('ALTER TABLE main_guard_messages ADD COLUMN singleton_binding_json TEXT')
         self.db.commit()
 
     def _reply_binding(self, message):
@@ -123,6 +125,44 @@ class MainChatGuard:
             return None
         return bindings[0]
 
+    def _singleton_binding(self):
+        # Count every configured binding, including an unavailable one. A Bot
+        # with several topics must never silently choose its only usable topic.
+        if len(self.router.targets) != 1:
+            return None
+        target = next(iter(self.router.targets.values()))
+        try:
+            binding = self._binding(target)
+            self._validate(binding)
+        except (BindingError, KeyError, TypeError):
+            return None
+        return binding
+
+    def _singleton_selection(self, draft):
+        # This policy authorizes new input only. Existing/previously presented
+        # drafts remain explicit choices, including after an album gains a part.
+        if (draft['state'] != 'held' or draft['panel_id'] is not None
+                or draft['presented_revision'] or draft['error']):
+            return None
+        members = self._members(draft['id'])
+        if not members or any(row['singleton_binding_json'] is None for row in members):
+            return None
+        try:
+            bindings = [json.loads(row['singleton_binding_json']) for row in members]
+            references = [json.loads(row['reply_binding_json']) for row in members]
+        except (ValueError, TypeError):
+            return None
+        # Keep the existing fail-closed treatment of unsafe reply references.
+        if any(value == {} for value in references):
+            return None
+        replies = [value for value in references if value is not None]
+        if replies and any(value != replies[0] for value in replies):
+            return None
+        binding = self._singleton_binding()
+        if not binding or any(value != binding for value in bindings):
+            return None
+        return binding
+
     def _save(self, draft_id, **values):
         allowed = {'state', 'revision', 'selection_json', 'selected_revision', 'panel_id', 'last_at',
                    'expires_at', 'presented_revision', 'error', 'confirmed_at'}
@@ -178,6 +218,11 @@ class MainChatGuard:
                                          (chat_id, album_id)).fetchone() if album_id else None)
                 if draft:
                     draft_id = draft['id']
+                    if draft['state'] == 'expired' or draft['expires_at'] <= now:
+                        # A late album part cannot renew automatic authority for
+                        # input that has already expired while awaiting choice.
+                        self.db.execute('UPDATE main_guard_messages SET singleton_binding_json=NULL WHERE draft_id=?',
+                                        (draft_id,))
                     self.db.execute("UPDATE main_guard_drafts SET state='held',revision=revision+1,"
                                     'selection_json=NULL,selected_revision=NULL,last_at=?,expires_at=?,error=NULL WHERE id=?',
                                     (now, now + self.TTL, draft_id))
@@ -187,11 +232,14 @@ class MainChatGuard:
                                     '(id,chat_id,album_id,state,revision,last_at,expires_at) VALUES(?,?,?,?,?,?,?)',
                                     (draft_id, chat_id, album_id, 'held', 1, now, now + self.TTL))
                 reply_binding = self._reply_binding(message)
+                singleton_binding = self._singleton_binding()
                 self.db.execute('INSERT INTO main_guard_messages '
-                                '(update_id,draft_id,payload,reply_json,received_at,reply_binding_json) VALUES(?,?,?,?,?,?)',
+                                '(update_id,draft_id,payload,reply_json,received_at,reply_binding_json,singleton_binding_json) '
+                                'VALUES(?,?,?,?,?,?,?)',
                                 (update['update_id'], draft_id, json.dumps(update, ensure_ascii=False),
                                  'null', now,
-                                 json.dumps(reply_binding, sort_keys=True)))
+                                 json.dumps(reply_binding, sort_keys=True),
+                                 json.dumps(singleton_binding, sort_keys=True)))
                 self.db.execute('INSERT OR IGNORE INTO ui_jobs(id,payload) VALUES(?,?)',
                                 (update['update_id'], json.dumps(update, ensure_ascii=False)))
             self.db.execute("UPDATE kv SET value=? WHERE key='offset'",
@@ -236,6 +284,12 @@ class MainChatGuard:
         return content
 
     async def _panel(self, update, text, rows, draft=None):
+        if draft and draft['state'] in self.STATES:
+            # Requiring a choice is durable before its Telegram delivery. Even
+            # a lost panel acknowledgement must not make old input auto-send.
+            with self.db:
+                self.db.execute('UPDATE main_guard_messages SET singleton_binding_json=NULL WHERE draft_id=?',
+                                (draft['id'],))
         if utf16_size(text) > 3800:
             text = next(plain_chunks(text, 3700)) + '\n\n（预览已截断，原文完整保留。）'
         if draft and draft['panel_id'] and not update.get('callback_query'):
@@ -300,14 +354,14 @@ class MainChatGuard:
             return await self._panel(update, 'All · 待发送消息已过期\n原文和附件仍保留，请重新选择接收会话。\n\n' + self._preview(draft),
                                      [[('重新选择', 'main:choose', {'id': draft['id']})],
                                       [('取消', 'main:cancel', {'id': draft['id']})]], draft)
-        selected = self._reply_selection(draft)
+        selected = self._reply_selection(draft) or self._singleton_selection(draft)
         if selected:
             try:
                 self._validate(selected)
                 if draft['album_id'] and self.clock() - draft['last_at'] < 2:
                     return
-                # The user's explicit reply selects the destination. Freeze the
-                # same durable handoff used by the destination buttons.
+                # A safe explicit reply or the frozen sole binding selects the
+                # destination, using the same durable handoff as its buttons.
                 self._save(draft['id'], state='releasing',
                            selection_json=json.dumps(selected, ensure_ascii=False, sort_keys=True),
                            selected_revision=draft['revision'], confirmed_at=self.clock())
