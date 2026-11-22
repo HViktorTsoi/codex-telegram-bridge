@@ -54,8 +54,11 @@ Add these fields (the IDs below are placeholders):
 The original top-level `thread_id` must match `root_target`, which retains the
 original session and main-chat system-command context. A topic-less All reply to
 a message in a currently bound local topic selects that exact destination and
-sends directly. Other ordinary All messages are held until explicit target
-selection, rather than automatically using the root or most recent session.
+sends directly. If this Bot has exactly one stored, valid binding, new ordinary
+All messages go directly to that topic. Bots with multiple bindings keep target
+selection, even when only one binding is currently usable; they never default to
+the root or most recent session. Invalid replies and changed bindings retain the
+selector, and existing displayed drafts are not released automatically.
 `initial_telegram_offset` must come from the
 old collector's database after a clean stop with an empty queue; it is used only
 when creating `topics.sqlite` for the first time. Preserve the original database
@@ -259,6 +262,14 @@ are passed to Codex. The parent body and selected quote are neither model input
 nor topic echo. Replies inside an existing topic keep their original quoted
 context behavior.
 
+New ordinary All text and media go directly to the only bound topic when the Bot
+has exactly one stored target and its binding is valid. The target is frozen on
+receipt and must still be the same sole valid binding at handoff. Multiple stored
+targets never become a single-target Bot just because others are unavailable.
+Unknown or conflicting reply references still require selection. Already
+displayed, expired or pre-upgrade drafts do not gain automatic routing when the
+Bot later has one target.
+
 Other ordinary All text and media use a durable held-message selector. Each text
 message is independent; an album is grouped after two seconds of quiet. A group
 whose first member replies to a bound topic can include later unquoted members
@@ -268,8 +279,9 @@ imports the original message(s) with no second confirmation page. Unknown or
 deleted topics, foreign-chat references, unresolved external replies and changed bindings
 never select another target automatically. No attachment download or model
 request occurs before the destination is resolved. A late album member arriving
-before selection invalidates old buttons; members arriving after handoff require
-a fresh choice. Replies stay in the selected topic, without main-chat relay.
+before selection invalidates old buttons; members arriving after handoff form a
+new batch, with a newly checked sole binding or a fresh choice. Replies stay in
+the selected topic, without main-chat relay.
 Find held content under `/sessions` → **待发送**. Cancelled, expired or stale UI
 never falls back to the root session. Creator and dispatch ForceReply inputs,
 plain-text explicit aliases and slash commands retain their existing paths.
@@ -281,8 +293,9 @@ acknowledged preview. Missing identity, ambiguous records and deleted previews
 retain the selector. Message text, sender names and external origins never serve
 as routing evidence.
 
-Direct reply routing or target selection also queues the new text or media
-caption in the selected Telegram topic, prefixed with `📩 你在 All 说：`.
+Single-target routing, direct reply routing or target selection also queues the
+new text or media caption in the selected Telegram topic, prefixed with
+`📩 你在 All 说：`.
 Rich rendering leaves this heading as ordinary text and quotes only the user's
 body; parent reply context is not appended for new ordinary All input.
 This copy uses a durable, deduplicated outbox key;
