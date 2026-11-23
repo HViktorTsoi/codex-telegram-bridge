@@ -160,6 +160,19 @@ class SkillsMenuTests(unittest.IsolatedAsyncioTestCase):
     def starts(self):
         return [params for method, params in self.native_calls if method == 'turn/start']
 
+    def reload_bindings(self, targets):
+        native = self.router.bridges['meeting'].codex
+        for bridge in self.router.bridges.values():
+            bridge.store.db.close()
+        self.router.store.db.close()
+        self.config['targets'] = copy.deepcopy(targets)
+        (self.path / 'config.json').write_text(json.dumps(self.config))
+        self.router = TopicRouter(copy.deepcopy(self.config), self.path)
+        self.router.bot_id, self.router.username, self.router.telegram = 444, 'test_bot', self.telegram
+        for bridge in self.router.bridges.values():
+            bridge.codex, bridge.telegram = native, self.telegram
+            bridge.ready.set()
+
     def expire(self, table):
         columns = [row[1] for row in self.router.store.db.execute('PRAGMA table_info(' + table + ')')]
         column = next(name for name in columns if name.startswith('expires'))
@@ -369,6 +382,102 @@ class SkillsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(echoes[0]['media_json'])
         self.assertEqual(echoes[0]['message_thread_id'], 22)
         self.assertEqual(self.starts(), [])
+
+    async def test_singleton_all_skill_task_keeps_exact_input_and_skill_without_an_echo(self):
+        self.reload_bindings(self.config['targets'][:1])
+        await self.send('/skills', None)
+        await self.click(self.panel(), '会议记录')
+        await self.click(self.panel(), 'pdf')
+        selected_path = next(skill['path'] for skill in self.rows if skill['path'] in self.panel()['text'])
+        await self.click(self.panel(), '使用此技能')
+        original = '单会话技能任务\n**原文** 与 https://example.test/?a=1&b=2'
+        update = await self.answer(self.last(), original, topic=None)
+        row = self.pending()
+        self.assertEqual((row['id'], row['message_thread_id'], row['text']),
+                         (update['update_id'], 11, original))
+        self.assertEqual(json.loads(row['skill_json'])['path'], selected_path)
+        store = self.router.bridges['meeting'].store
+        self.assertEqual(store.db.execute(
+            "SELECT COUNT(*) FROM outbox WHERE key LIKE 'main-guard-input:%'").fetchone()[0], 0)
+        await self.router.bridges['meeting'].dispatch_one(row)
+        self.assertEqual(self.starts()[0]['input'], [
+            {'type': 'text', 'text': original}, {'type': 'skill', 'name': 'pdf', 'path': selected_path}])
+
+    async def interrupted_all_skill_echo(self, initially_single):
+        targets = copy.deepcopy(self.config['targets'])
+        if initially_single:
+            self.reload_bindings(targets[:1])
+        await self.send('/skills', None)
+        await self.click(self.panel(), '会议记录')
+        await self.click(self.panel(), 'pdf')
+        await self.click(self.panel(), '使用此技能')
+        prompt = self.last()
+        message = self.message('恢复后保留原本的回显策略', topic=None, reply_to_message=copy.deepcopy(prompt))
+        update = {'update_id': self.sequence, 'message': message}
+        self.router.ingest(update)
+        with patch.object(self.router.recent, 'record', side_effect=asyncio.CancelledError()):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.router.skills.handle_one()
+        self.assertEqual(self.input_count(), 1)
+        self.reload_bindings(targets if initially_single else targets[:1])
+        self.router.skills.recover()
+        await self.router.skills.handle_one()
+        self.router.skills.recover()
+        self.router.ingest(copy.deepcopy(update))
+        await self.router.skills.handle_one()
+        self.assertEqual(self.input_count(), 1)
+        echoes = self.router.bridges['meeting'].store.db.execute(
+            "SELECT text FROM outbox WHERE key LIKE 'main-guard-input:skills:%'").fetchall()
+        self.assertEqual([row['text'] for row in echoes],
+                         [] if initially_single else ['📩 你在 All 说：\n恢复后保留原本的回显策略'])
+        await self.router.bridges['meeting'].dispatch_one(self.pending())
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(self.starts()[0]['input'][0]['text'], '恢复后保留原本的回显策略')
+
+    async def test_singleton_all_skill_recovery_never_adds_echo_when_a_target_is_added(self):
+        await self.interrupted_all_skill_echo(initially_single=True)
+
+    async def test_multi_target_all_skill_recovery_keeps_echo_when_only_one_target_remains(self):
+        await self.interrupted_all_skill_echo(initially_single=False)
+
+    async def legacy_all_skill_recovery(self, after_insert):
+        self.reload_bindings(self.config['targets'][:1])
+        await self.send('/skills', None)
+        await self.click(self.panel(), '会议记录')
+        await self.click(self.panel(), 'pdf')
+        await self.click(self.panel(), '使用此技能')
+        prompt = self.last()
+        message = self.message('旧版中断的技能任务', topic=None, reply_to_message=copy.deepcopy(prompt))
+        self.router.ingest({'update_id': self.sequence, 'message': message})
+        store = self.router.bridges['meeting'].store
+        accept = store.accept
+
+        def interrupted(*args, **kwargs):
+            if after_insert:
+                accept(*args, **kwargs)
+            raise asyncio.CancelledError()
+
+        with patch.object(store, 'accept', side_effect=interrupted):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.router.skills.handle_one()
+        self.assertEqual(self.input_count(), int(after_insert))
+        with self.router.store.db:
+            self.router.store.db.execute('ALTER TABLE skills_prompts DROP COLUMN mirror_input')
+        self.reload_bindings(self.config['targets'])
+        self.router.skills.recover()
+        await self.router.skills.handle_one()
+        self.router.skills.recover()
+        await self.router.skills.handle_one()
+        self.assertEqual(self.input_count(), 1)
+        echoes = self.router.bridges['meeting'].store.db.execute(
+            "SELECT text FROM outbox WHERE key LIKE 'main-guard-input:skills:%'").fetchall()
+        self.assertEqual([r['text'] for r in echoes], ['📩 你在 All 说：\n旧版中断的技能任务'])
+
+    async def test_upgraded_legacy_submitting_skill_before_import_recovers_with_one_echo(self):
+        await self.legacy_all_skill_recovery(after_insert=False)
+
+    async def test_upgraded_legacy_submitting_skill_after_import_recovers_without_duplicate_input(self):
+        await self.legacy_all_skill_recovery(after_insert=True)
 
     async def test_explicit_skill_prompt_reply_keeps_at_text_out_of_alias_dispatch(self):
         prompt = await self.prompt()

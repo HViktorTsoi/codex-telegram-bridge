@@ -4,6 +4,8 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from completion_delivery import CompletionDelivery
+from native_mirror import NativeMirror
 import test_main_guard as fixtures
 from topics_bridge import TargetBridge, TopicRouter
 
@@ -66,6 +68,11 @@ class SingletonAllTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any('选择接收会话' in message.get('text', '')
                              for message in self.telegram.messages.values()))
 
+    def assert_no_all_echo(self):
+        for child in self.router.bridges.values():
+            self.assertEqual(child.store.db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE key LIKE 'main-guard-input:%'").fetchone()[0], 0)
+
     async def test_plain_all_text_reaches_the_only_native_thread_without_a_selector(self):
         text = '下载这个视频\nhttps://example.test/watch?v=1&sig=keep-this\n第二段 **保留格式**'
         update, _ = await self.send(text)
@@ -77,6 +84,7 @@ class SingletonAllTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(row['main_guard_json'])['thread_id'], 'meeting-native')
         self.assertEqual(self.router.picker.guard.pending_count(), 0)
         self.assert_no_selector()
+        self.assert_no_all_echo()
         self.assertEqual(self.telegram.created, [])
         child = self.router.bridges['meeting']
         child.codex = type('Native', (), {'call': AsyncMock(return_value={'turn': {'id': 'one-turn'}})})()
@@ -105,6 +113,7 @@ class SingletonAllTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.router.store.db.execute('SELECT COUNT(*) FROM cc_jobs').fetchone()[0], 0)
         self.assertEqual(self.router.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
         self.assert_no_selector()
+        self.assert_no_all_echo()
 
     async def test_album_waits_for_all_parts_then_preserves_every_original_part_once(self):
         first = self.message('', caption='整组原文', media_group_id='one-album',
@@ -126,6 +135,7 @@ class SingletonAllTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(r['media_group_id'] == 'one-album' and r['message_thread_id'] == 11 for r in rows))
         self.assertEqual(self.router.picker.guard.pending_count(), 0)
         self.assert_no_selector()
+        self.assert_no_all_echo()
 
     async def test_a_late_album_part_is_delivered_as_new_input_without_reimporting_earlier_parts(self):
         first, _ = await self.send('', media_group_id='late-album', photo=[{'file_id': 'one'}])
@@ -138,7 +148,7 @@ class SingletonAllTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r['id'] for r in self.inbox()], [first['update_id'], second['update_id']])
         self.assert_no_selector()
 
-    async def test_replay_and_restart_do_not_duplicate_input_or_the_topic_echo(self):
+    async def test_replay_and_restart_deliver_input_once_without_adding_a_topic_echo(self):
         update = self.message('跨重启只投递一次')
         self.router.ingest(update)
         self.reload_router()
@@ -152,35 +162,138 @@ class SingletonAllTests(unittest.IsolatedAsyncioTestCase):
         await self.pump()
         self.assertEqual([(r['id'], r['text']) for r in self.inbox()],
                          [(update['update_id'], '跨重启只投递一次')])
-        echoes = self.router.bridges['meeting'].store.db.execute(
-            "SELECT text FROM outbox WHERE key LIKE 'main-guard-input:%'").fetchall()
-        self.assertEqual(len(echoes), 1)
-        self.assertIn('跨重启只投递一次', echoes[0]['text'])
+        self.assert_no_all_echo()
         self.assert_no_selector()
 
-    async def test_crash_after_input_import_recovers_the_same_handoff_without_duplicates(self):
+    async def test_crash_after_input_import_preserves_no_echo_when_a_second_target_is_added(self):
         update = self.message('导入后中断仍只投一次')
         self.router.ingest(update)
-        child = self.router.bridges['meeting']
-        enqueue = child.store.enqueue_at
-
-        def fail_echo(key, *args, **kwargs):
-            if key.startswith('main-guard-input:'):
-                raise RuntimeError('Fixture crash after durable input import')
-            return enqueue(key, *args, **kwargs)
-
-        with patch.object(child.store, 'enqueue_at', side_effect=fail_echo):
+        with patch.object(self.router.recent, 'record', side_effect=RuntimeError('after durable input import')):
             with self.assertRaises(RuntimeError):
                 await self.router.picker.guard.present(update)
         self.assertEqual(len(self.inbox()), 1)
+        self.assert_no_all_echo()
+        self.add_other()
+        self.reload_router()
         self.router.picker.guard.recover()
         self.router.picker.guard.recover()
         self.router.ingest(copy.deepcopy(update))
         await self.pump()
         self.assertEqual(len(self.inbox()), 1)
-        self.assertEqual(child.store.db.execute(
-            "SELECT COUNT(*) FROM outbox WHERE key LIKE 'main-guard-input:%'").fetchone()[0], 1)
+        self.assert_no_all_echo()
         self.assertEqual(self.router.picker.guard.pending_count(), 0)
+
+    async def test_multi_target_handoff_still_recovers_its_echo_after_other_target_is_removed(self):
+        self.add_other()
+        update, panel = await self.send('多会话中选中的输入仍需回显')
+        child = self.router.bridges['meeting']
+        with patch.object(child.store, 'enqueue_at', side_effect=OSError('before echo commit')):
+            await self.click(panel, '会议记录')
+        self.assertEqual([(r['id'], r['text']) for r in self.inbox()],
+                         [(update['update_id'], '多会话中选中的输入仍需回显')])
+        self.assert_no_all_echo()
+        self.remove_other()
+        self.reload_router()
+        await self.router.picker.recover()
+        await self.router.picker.recover()
+        self.assertEqual(len(self.inbox()), 1)
+        echoes = self.router.bridges['meeting'].store.db.execute(
+            "SELECT text,message_thread_id FROM outbox WHERE key LIKE 'main-guard-input:%'").fetchall()
+        self.assertEqual([(r['text'], r['message_thread_id']) for r in echoes],
+                         [('📩 你在 All 说：\n多会话中选中的输入仍需回显', 11)])
+
+    async def test_upgraded_pending_singleton_draft_uses_no_echo_for_its_new_handoff(self):
+        update = self.message('旧版尚未投递的单会话输入')
+        self.router.ingest(update)
+        with self.router.store.db:
+            self.router.store.db.execute('ALTER TABLE main_guard_drafts DROP COLUMN mirror_input')
+        self.reload_router()
+        await self.router.picker.recover()
+        await self.pump()
+        self.assertEqual([(r['id'], r['text']) for r in self.inbox()],
+                         [(update['update_id'], '旧版尚未投递的单会话输入')])
+        self.assert_no_all_echo()
+
+    async def test_upgraded_legacy_releasing_singleton_keeps_one_echo_without_reimporting(self):
+        update = self.message('旧版已经开始投递的输入')
+        self.router.ingest(update)
+        with patch.object(self.router.recent, 'record', side_effect=RuntimeError('old interrupted handoff')):
+            with self.assertRaises(RuntimeError):
+                await self.router.picker.guard.present(update)
+        self.assertEqual(len(self.inbox()), 1)
+        with self.router.store.db:
+            self.router.store.db.execute('ALTER TABLE main_guard_drafts DROP COLUMN mirror_input')
+        self.reload_router()
+        await self.router.picker.recover()
+        await self.router.picker.recover()
+        self.assertEqual(len(self.inbox()), 1)
+        echoes = self.router.bridges['meeting'].store.db.execute(
+            "SELECT text FROM outbox WHERE key LIKE 'main-guard-input:%'").fetchall()
+        self.assertEqual([r['text'] for r in echoes], ['📩 你在 All 说：\n旧版已经开始投递的输入'])
+
+    async def test_singleton_preview_and_completed_packets_contain_only_assistant_output(self):
+        original = 'USER_INPUT_ONLY 不应在预览或完成消息中重复'
+        update, _ = await self.send(original)
+        child = self.router.bridges['meeting']
+        shown = []
+
+        async def display(method, **params):
+            shown.append((method, copy.deepcopy(params)))
+            return {'message_id': 800 + len(shown)}
+
+        child.telegram = type('Telegram', (), {'call': staticmethod(display)})()
+        child.delivery = CompletionDelivery(child, clock=lambda: self.now)
+        child.store.mark(update['update_id'], 'running', 'singleton-work')
+        turn = {'id': 'singleton-work', 'status': 'inProgress', 'startedAt': self.now}
+        child.store.enqueue_at('turn:singleton-work:progress', child.owner, '正在整理材料', 11)
+        await child.delivery.update(child.telegram, turns=[turn])
+        preview_calls = copy.deepcopy(shown)
+        self.assertTrue(any('正在整理材料' in json.dumps(params, ensure_ascii=False)
+                            for _, params in preview_calls))
+        child.store.enqueue_at('turn:singleton-work:final', child.owner, '整理完成，结果如下。', 11)
+        child.delivery.seal({**turn, 'status': 'completed'})
+        packets = []
+        for _ in range(10):
+            row = child.delivery.next_row()
+            if row is None:
+                break
+            packets.append(row['text'])
+            await child.send_one(row)
+        else:
+            self.fail('Completed singleton output failed to drain')
+        self.assertEqual(packets, ['正在整理材料', '整理完成，结果如下。'])
+        for _, params in shown:
+            displayed = json.dumps(params, ensure_ascii=False)
+            self.assertNotIn('USER_INPUT_ONLY', displayed)
+            self.assertNotIn('你在 All 说', displayed)
+        self.assertEqual(self.inbox()[0]['text'], original)
+        self.assert_no_all_echo()
+
+    async def test_singleton_still_mirrors_new_codex_client_input_exactly_once(self):
+        child = self.router.bridges['meeting']
+        child.config['native_mirror'] = True
+        child.mirror = NativeMirror(child.store, clock=lambda: self.now)
+        native_text = '**Codex客户端输入**\n第二行保留'
+
+        class Native:
+            async def items(self, turn_id):
+                yield {'item': {'id': 'desktop-input', 'type': 'userMessage',
+                               'content': [{'type': 'text', 'text': native_text}]}}
+
+        child.codex = Native()
+        await child.update_native_mirror([])
+        self.now += 1
+        turn = {'id': 'desktop-work', 'status': 'inProgress', 'startedAt': self.now}
+        await child.update_native_mirror([turn])
+        self.now += 16
+        await child.update_native_mirror([turn])
+        echoes = child.store.db.execute(
+            "SELECT text,rich_text,message_thread_id FROM outbox WHERE key LIKE 'native-user:%'").fetchall()
+        self.assertEqual(len(echoes), 1)
+        self.assertEqual(echoes[0]['text'], '🖥 你在 Codex 客户端说：\n' + native_text)
+        self.assertEqual(echoes[0]['message_thread_id'], 11)
+        self.assertIn('> ', echoes[0]['rich_text'])
+        self.assert_no_all_echo()
 
     async def test_two_bound_targets_are_not_reduced_to_one_by_visibility_or_availability(self):
         self.add_other()

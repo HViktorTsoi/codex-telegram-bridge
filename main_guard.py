@@ -25,13 +25,16 @@ class MainChatGuard:
             CREATE TABLE IF NOT EXISTS main_guard_drafts(
                 id TEXT PRIMARY KEY,chat_id TEXT,album_id TEXT,state TEXT,revision INTEGER,
                 selection_json TEXT,selected_revision INTEGER,panel_id INTEGER,last_at REAL,
-                expires_at REAL,presented_revision INTEGER DEFAULT 0,error TEXT,confirmed_at REAL);
+                expires_at REAL,presented_revision INTEGER DEFAULT 0,error TEXT,confirmed_at REAL,
+                mirror_input INTEGER);
             CREATE TABLE IF NOT EXISTS main_guard_messages(
                 update_id INTEGER PRIMARY KEY,draft_id TEXT,payload TEXT,reply_json TEXT,received_at REAL,
                 reply_binding_json TEXT,singleton_binding_json TEXT);
         ''')
         if 'confirmed_at' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_drafts)')}:
             self.db.execute('ALTER TABLE main_guard_drafts ADD COLUMN confirmed_at REAL')
+        if 'mirror_input' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_drafts)')}:
+            self.db.execute('ALTER TABLE main_guard_drafts ADD COLUMN mirror_input INTEGER')
         if 'reply_binding_json' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_messages)')}:
             self.db.execute('ALTER TABLE main_guard_messages ADD COLUMN reply_binding_json TEXT')
         if 'singleton_binding_json' not in {row[1] for row in self.db.execute('PRAGMA table_info(main_guard_messages)')}:
@@ -165,7 +168,7 @@ class MainChatGuard:
 
     def _save(self, draft_id, **values):
         allowed = {'state', 'revision', 'selection_json', 'selected_revision', 'panel_id', 'last_at',
-                   'expires_at', 'presented_revision', 'error', 'confirmed_at'}
+                   'expires_at', 'presented_revision', 'error', 'confirmed_at', 'mirror_input'}
         assert values and values.keys() <= allowed
         with self.db:
             self.db.execute('UPDATE main_guard_drafts SET ' + ','.join(k + '=?' for k in values) + ' WHERE id=?',
@@ -364,7 +367,8 @@ class MainChatGuard:
                 # destination, using the same durable handoff as its buttons.
                 self._save(draft['id'], state='releasing',
                            selection_json=json.dumps(selected, ensure_ascii=False, sort_keys=True),
-                           selected_revision=draft['revision'], confirmed_at=self.clock())
+                           selected_revision=draft['revision'], confirmed_at=self.clock(),
+                           mirror_input=int(len(self.router.targets) != 1))
                 self._release(self._draft(draft['id']))
                 return
             except BindingError as error:
@@ -398,7 +402,7 @@ class MainChatGuard:
         if draft['state'] == 'queued':
             selected = json.loads(draft['selection_json'])
             target = self._validate(selected)
-            text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n原文与回复会出现在该会话的话题中。'
+            text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n回复会出现在该会话的话题中。'
         else:
             text = '已取消，这条消息不会交给 Codex。'
         return await self._panel(update, text, [[('待发送', 'main:list', {}), ('返回会话管理', 'home', {})]], draft)
@@ -411,6 +415,13 @@ class MainChatGuard:
         selected = json.loads(draft['selection_json'])
         target = self._validate(selected)
         bridge = self.router.bridges[target['key']]
+        # Freeze display policy with the handoff, before importing any input.
+        # A legacy interrupted handoff keeps its original mirroring behavior.
+        # Recovery must not change it when another binding is added or removed.
+        mirror_input = draft['mirror_input']
+        if mirror_input is None:
+            mirror_input = 1
+            self._save(draft['id'], mirror_input=mirror_input)
         binding = {'draft_id': draft['id'], 'target_key': target['key'],
                    'thread_id': target['thread_id'], 'topic_id': target['message_thread_id']}
         for row in self._members(draft['id']):
@@ -438,7 +449,7 @@ class MainChatGuard:
             # This distinct key retains literal source text for quote rendering
             # and never becomes model input.
             body = message.get('text') or message.get('caption', '')
-            if body:
+            if body and mirror_input:
                 text = '📩 你在 All 说：\n' + body
                 if context:
                     text += '\n\n' + render_reply(context)
@@ -496,7 +507,7 @@ class MainChatGuard:
         self._save(draft['id'], state='releasing',
                    selection_json=json.dumps(selected, ensure_ascii=False, sort_keys=True),
                    selected_revision=draft['revision'], expires_at=self.clock() + self.TTL,
-                   confirmed_at=self.clock())
+                   confirmed_at=self.clock(), mirror_input=int(len(self.router.targets) != 1))
         try:
             self._release(self._draft(draft['id']))
         except BindingError as error:
