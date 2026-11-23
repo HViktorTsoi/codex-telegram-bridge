@@ -449,6 +449,7 @@ class TargetBridge(NativeQuestions, Bridge):
                      "/tasks 本机进度；/inbox 待我处理\n/to 选择本机会话派单；/aliases 查看 @别名\n"
                      "/status 查看此会话及完整 ID\n/model 按钮选择此会话模型\n"
                      "/effort 按钮选择此会话强度\n/stop 停止此会话的当前任务\n"
+                     "/speed 在同一设置菜单选择 Standard 或 Fast 速度\n"
                      "/format 按钮选择回复格式；也支持 /format rich 或 /format plain\n"
                      "/keyboard 重新显示输入框下方的常用按钮\n"
                      "支持图片、文件和相册；附件上限20MB。语音视频暂按文件接收。\n"
@@ -896,7 +897,7 @@ class TopicRouter:
             message = json.loads(row["message_json"])
             target.store.accept({"update_id": row["id"]}, message)
             command = command_of(message)
-            if not command.startswith('/') or command in {'/status', '/model', '/effort', '/format', '/stop'}:
+            if not command.startswith('/') or command in {'/status', '/model', '/effort', '/speed', '/format', '/stop'}:
                 received = row['received_ms']
                 if received is not None:
                     accessed_at = received / 1000

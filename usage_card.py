@@ -1,7 +1,6 @@
 """One cached, event-driven account quota card in the owner's main chat."""
 import asyncio
 from collections import deque
-from datetime import datetime, timedelta, timezone
 import json
 import logging
 import math
@@ -9,6 +8,7 @@ import time
 
 from attachments import payload_from
 from bridge import RpcError, TelegramError, permitted
+from host_network import HostNetwork
 
 
 LOG = logging.getLogger('codex_telegram_usage')
@@ -48,7 +48,7 @@ def snapshot(payload):
 
 def _window_name(minutes):
     if minutes % 1440 == 0:
-        return f'{minutes / 1440:g}天'
+        return f'{minutes / 1440:g}d'
     if minutes % 60 == 0:
         return f'{minutes / 60:g}h'
     return f'{minutes:g}min'
@@ -61,11 +61,9 @@ def _quota_bar(used):
 
 
 def _remaining(seconds):
-    minutes = max(1, math.ceil(seconds / 60))
-    days, minutes = divmod(minutes, 1440)
-    hours, minutes = divmod(minutes, 60)
-    return ''.join((f'{days}天' if days else '', f'{hours}小时' if hours else '',
-                    f'{minutes}分钟' if minutes else '')) + '后'
+    hours = max(0, math.floor(seconds / 3600))
+    days, hours = divmod(hours, 24)
+    return f'{days}d {hours}h' if days else f'{hours}h' if hours else '<1h'
 
 
 class UsageCard:
@@ -75,8 +73,9 @@ class UsageCard:
     COOLDOWN = 60
     EDIT_INTERVAL = 15
 
-    def __init__(self, router, clock=time.time):
+    def __init__(self, router, clock=time.time, network=None):
         self.router, self.db, self.clock = router, router.store.db, clock
+        self.network = network if network is not None else HostNetwork(clock=clock)
         self.db.execute('CREATE TABLE IF NOT EXISTS usage_jobs('
                         'id INTEGER PRIMARY KEY,payload TEXT,state TEXT DEFAULT \'pending\',error TEXT)')
         self.state = self._load(self.KEY, {})
@@ -232,13 +231,19 @@ class UsageCard:
                 if expired:
                     lines.append('\u00a0' * 4 + '重置时间已到，等待同步（上次记录）')
                 elif reset is not None:
-                    try:
-                        stamp = datetime.fromtimestamp(reset, timezone(timedelta(hours=8))).strftime('%m/%d %H:%M')
-                    except (ValueError, OverflowError, OSError):
-                        stamp = '未知'
-                    lines.append('\u00a0' * 4 + '重置：' + stamp + '（香港，' + _remaining(reset - now) + '）')
+                    lines.append('\u00a0' * 4 + '重置 ' + _remaining(reset - now))
         if not buckets:
             lines.append('暂无可用额度数据' if self.state.get('sample_at') else '等待额度同步')
+        network = self.network.label()
+        if network:
+            if displayed:
+                first_bar = next((index for index, line in enumerate(lines) if ' 剩余 ' in line), None)
+                if first_bar is not None:
+                    lines[first_bar] += ' · ' + network
+                else:
+                    lines.append(network)
+            else:
+                lines.append(network)
         if self.state.get('sample_at'):
             age = max(0, int((now - self.state['sample_at']) // 60))
             lines.append(f'缓存 {age} 分钟')
@@ -412,6 +417,7 @@ class UsageCard:
     async def tick(self):
         if not self.enabled or self._bind() is None:
             return False
+        self.network.poll()
         self._drain()
         await self._fetch()
         self._drain()
@@ -419,10 +425,13 @@ class UsageCard:
         return True
 
     async def loop(self):
-        while True:
-            try:
-                await self.handle_one()
-                await self.tick()
-            except Exception as error:
-                LOG.warning('Usage card unavailable: %s', type(error).__name__)
-            await asyncio.sleep(1)
+        try:
+            while True:
+                try:
+                    await self.handle_one()
+                    await self.tick()
+                except Exception as error:
+                    LOG.warning('Usage card unavailable: %s', type(error).__name__)
+                await asyncio.sleep(1)
+        finally:
+            await self.network.aclose()

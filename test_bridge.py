@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from aiohttp import web
 
@@ -359,18 +360,24 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
 
         class SettingsCodex:
             def __init__(self):
-                self.current = {"model": "model-a", "reasoningEffort": "max",
-                                "thread": {"name": "Same conversation", "status": {"type": "active"}}}
+                self.current = {"model": "model-a", "reasoningEffort": "max", "serviceTier": None,
+                                "thread": {"id": "thread", "name": "Same conversation", "status": {"type": "active"}}}
                 self.updates = []
                 self.apply = True
+                self.write_error, self.readback_error = None, None
+                self.omit_tier_after_update = False
                 self.catalog = [
                     {"id": "model-a", "model": "model-a", "defaultReasoningEffort": "low",
-                     "supportedReasoningEfforts": [{"reasoningEffort": x} for x in ["low", "high", "max"]]},
+                     "supportedReasoningEfforts": [{"reasoningEffort": x} for x in ["low", "high", "max"]],
+                     "serviceTiers": [{"id": "priority", "name": "Fast", "description": "Faster"}],
+                     "additionalSpeedTiers": ["fast"]},
                     {"id": "alias-b", "model": "model-b", "defaultReasoningEffort": "medium",
                      "supportedReasoningEfforts": [{"reasoningEffort": x} for x in ["low", "medium"]]},
                 ]
 
             async def settings(self):
+                if self.updates and self.readback_error:
+                    raise self.readback_error
                 return dict(self.current)
 
             async def models(self):
@@ -380,11 +387,17 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
                 if method != "thread/settings/update":
                     raise AssertionError("Settings commands must not start generation: " + method)
                 self.updates.append(params)
+                if self.write_error:
+                    raise self.write_error
                 if self.apply:
                     if "model" in params:
                         self.current["model"] = params["model"]
                     if "effort" in params:
                         self.current["reasoningEffort"] = params["effort"]
+                    if "serviceTier" in params:
+                        self.current["serviceTier"] = params["serviceTier"]
+                        if self.omit_tier_after_update:
+                            self.current.pop('serviceTier')
                 return {}
 
         self.codex = SettingsCodex()
@@ -404,13 +417,116 @@ class SettingsCommandTests(unittest.IsolatedAsyncioTestCase):
         return "".join(row[0] for row in rows)
 
     async def test_queries_show_real_settings_and_catalog_without_starting_generation(self):
-        for text in ["/model", "/effort", "/status"]:
+        for text in ["/model", "/effort", "/speed", "/status"]:
             with self.subTest(command=text):
                 reply = await self.command(text)
                 self.assertIn("model-a", reply)
                 self.assertIn("max", reply)
         self.assertEqual(self.codex.updates, [])
         self.assertEqual(self.bridge.store.counts()["running_inputs"], 0)
+
+    async def test_speed_commands_switch_the_existing_thread_and_preserve_model_and_effort(self):
+        self.assertIn('Standard', await self.command('/speed'))
+        reply = await self.command('/speed@my_bot fast')
+        self.assertEqual(self.codex.updates, [{'threadId': 'thread', 'serviceTier': 'priority'}])
+        self.assertIn('Fast', reply)
+        self.assertIn('下一轮', reply)
+        self.assertEqual(json.loads(self.bridge.store.get('speed-setting:' + str(self.sequence)))['state'], 'done')
+        reply = await self.command('/speed standard')
+        self.assertEqual(self.codex.updates[-1], {'threadId': 'thread', 'serviceTier': 'default'})
+        self.assertIn('Standard', reply)
+        self.assertEqual((self.codex.current['model'], self.codex.current['reasoningEffort']), ('model-a', 'max'))
+        self.assertEqual(self.codex.current['thread']['status']['type'], 'active')
+        self.assertEqual(self.bridge.store.counts()['running_inputs'], 0)
+
+    async def test_speed_command_rejects_unavailable_modes_bad_syntax_and_legacy_native(self):
+        for text in ['/speed ultrafast', '/speed fast extra']:
+            reply = await self.command(text)
+            self.assertTrue(any(word in reply for word in ['不支持', '不可用', '用法']))
+        self.codex.catalog[0]['serviceTiers'] = []
+        self.codex.catalog[0]['additionalSpeedTiers'] = []
+        reply = await self.command('/speed fast')
+        self.assertTrue(any(word in reply for word in ['不支持', '不可用', '未提供']))
+        self.codex.current.pop('serviceTier')
+        reply = await self.command('/speed standard')
+        self.assertTrue(any(word in reply for word in ['未知', '不支持', '未返回']))
+        self.assertEqual(self.codex.updates, [])
+
+    async def test_speed_commands_require_the_exact_native_thread_identity_and_matching_readback(self):
+        self.codex.current['thread']['id'] = 'different-thread'
+        await self.command('/speed fast')
+        self.assertEqual(self.codex.updates, [])
+        self.codex.current['thread']['id'] = 'thread'
+        self.codex.apply = False
+        reply = await self.command('/speed fast')
+        self.assertEqual(self.codex.updates, [{'threadId': 'thread', 'serviceTier': 'priority'}])
+        self.assertNotIn('已更新此会话参数', reply)
+        self.assertIn('回读', reply)
+        self.assertIn('未确认', reply)
+        self.assertIsNone(self.codex.current['serviceTier'])
+
+    async def assert_speed_recovery_without_a_second_write(self, *, write_error=None,
+                                                         readback_error=None, omit_tier=False):
+        self.codex.write_error = write_error
+        self.codex.readback_error = readback_error
+        self.codex.omit_tier_after_update = omit_tier
+        self.sequence += 1
+        identity = self.sequence
+        self.bridge.store.accept({'update_id': identity}, {'chat': {'id': 123}, 'text': '/speed fast'})
+        # Model the process exiting after handling the native outcome but before
+        # its Telegram reply and input completion can be committed.
+        with patch.object(self.bridge.store, 'enqueue', side_effect=RuntimeError('reply interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'reply interrupted'):
+                await self.bridge.dispatch_one(self.bridge.store.pending())
+        ledger = json.loads(self.bridge.store.get('speed-setting:' + str(identity)))
+        self.assertIn(ledger['state'], ['sending', 'uncertain'])
+        self.assertEqual((ledger['thread_id'], ledger['tier']), ('thread', 'priority'))
+        self.assertEqual(self.codex.updates, [{'threadId': 'thread', 'serviceTier': 'priority'}])
+        self.assertEqual(self.bridge.store.pending()['id'], identity)
+        config = self.bridge.config
+        self.bridge.store.db.close()
+        self.bridge = Bridge(config, Path(self.tmp.name))
+        self.bridge.codex = self.codex
+        self.codex.write_error, self.codex.readback_error = None, None
+        self.codex.omit_tier_after_update = False
+        self.codex.current['serviceTier'] = None
+        await self.bridge.dispatch_one(self.bridge.store.pending())
+        self.assertIsNone(self.bridge.store.pending())
+        self.assertEqual(len(self.codex.updates), 1)
+        self.assertIsNone(self.codex.current['serviceTier'])
+        reply = ''.join(row[0] for row in self.bridge.store.db.execute(
+            'SELECT text FROM outbox WHERE key LIKE ?', (f'input:{identity}:reply:%',)))
+        self.assertIn('不会重复写入', reply)
+        self.assertNotIn('已更新此会话速度', reply)
+
+    async def test_unknown_speed_rpc_result_survives_restart_without_replaying_the_write(self):
+        await self.assert_speed_recovery_without_a_second_write(write_error=ConnectionError('ack lost'))
+        ledger = json.loads(self.bridge.store.get('speed-setting:' + str(self.sequence)))
+        self.assertEqual(ledger['state'], 'uncertain')
+
+    async def test_speed_readback_failure_survives_restart_without_replaying_the_write(self):
+        await self.assert_speed_recovery_without_a_second_write(readback_error=ConnectionError('readback lost'))
+
+    async def test_missing_speed_readback_survives_restart_without_claiming_success_or_replaying(self):
+        await self.assert_speed_recovery_without_a_second_write(omit_tier=True)
+
+    async def test_invalid_native_speed_metadata_is_unknown_and_does_not_authorize_a_write(self):
+        for value in [{}, '']:
+            with self.subTest(value=value):
+                self.codex.current['serviceTier'] = value
+                reply = await self.command('/speed fast')
+                self.assertTrue(any(word in reply for word in ['未知', '不支持', '未返回', '无法确认']))
+                self.assertEqual(self.codex.updates, [])
+
+    async def test_speed_command_uses_the_model_after_an_external_change_during_catalog_read(self):
+        async def changed_catalog():
+            self.codex.current.update(model='model-b', reasoningEffort='medium')
+            return self.codex.catalog
+
+        with patch.object(self.codex, 'models', side_effect=changed_catalog):
+            reply = await self.command('/speed fast')
+        self.assertIn('未提供 Fast', reply)
+        self.assertEqual(self.codex.updates, [])
 
     async def test_model_change_uses_supported_default_when_current_effort_is_incompatible(self):
         reply = await self.command("/model alias-b")

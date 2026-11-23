@@ -4,10 +4,11 @@ import json
 import sqlite3
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from bridge import TelegramError
-from usage_card import UsageCard, snapshot
+from host_network import HostNetwork
+from usage_card import UsageCard, snapshot, _remaining
 
 
 def limits(used=20, reset=5000, minutes=10080):
@@ -17,6 +18,9 @@ def limits(used=20, reset=5000, minutes=10080):
 
 class UsageCardTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.network = SimpleNamespace(label=lambda: '网络未知', poll=lambda: None, aclose=AsyncMock())
+        self.network_patch = patch('usage_card.HostNetwork', return_value=self.network)
+        self.network_patch.start()
         self.db = sqlite3.connect(':memory:')
         self.db.row_factory = sqlite3.Row
         self.db.execute('CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT)')
@@ -50,6 +54,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.ui = UsageCard(self.router, clock=lambda: self.now)
 
     async def asyncTearDown(self):
+        self.network_patch.stop()
         self.db.close()
 
     def methods(self, name):
@@ -75,7 +80,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.methods('pinChatMessage')[0]['disable_notification'])
         self.assertNotIn('message_thread_id', self.methods('sendMessage')[0])
         text = self.methods('sendMessage')[0]['text']
-        self.assertEqual(text.splitlines()[0], '████████░░ 剩余 80%')
+        self.assertEqual(text.splitlines()[0], '████████░░ 剩余 80% · 网络未知')
         self.assertIn('████████░░ 剩余 80%', text)
         self.assertNotIn('已用', text)
         self.assertNotIn('Codex', text)
@@ -111,12 +116,14 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_local_reset_countdown_edits_same_card_without_quota_request(self):
         await self.ui.tick()
-        self.assertIn('1小时7分钟后', self.ui.text())
+        self.assertIn('重置 1h', self.ui.text())
+        self.assertNotIn('香港', self.ui.text())
+        self.assertNotRegex(self.ui.text(), r'\d{2}/\d{2}|\d{2}:\d{2}')
         quota_line = self.ui.text().splitlines()[0]
         mid = self.ui.state['message_id']
         self.now += 61
         await self.ui.tick()
-        self.assertIn('1小时6分钟后', self.ui.text())
+        self.assertIn('重置 1h', self.ui.text())
         self.assertEqual(self.ui.text().splitlines()[0], quota_line)
         self.assertEqual(self.native.call.await_count, 1)
         self.assertEqual(self.ui.state['message_id'], mid)
@@ -130,7 +137,7 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(used=used):
                 self.ui.state['buckets'] = snapshot(limits(used))
                 text = self.ui.text()
-                self.assertEqual(text.splitlines()[0], bar + ' 剩余 ' + label)
+                self.assertEqual(text.splitlines()[0], bar + ' 剩余 ' + label + ' · 网络未知')
                 self.assertNotIn('已用', text)
                 self.assertNotIn('周额度', text)
         self.native.call.assert_not_awaited()
@@ -142,9 +149,9 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.native.call.return_value = data
         await self.ui.tick()
         text = self.ui.text()
-        self.assertEqual(text.splitlines()[0], '5h █████░░░░░ 剩余 50%')
+        self.assertEqual(text.splitlines()[0], '5h █████░░░░░ 剩余 50% · 网络未知')
         self.assertIn('5h █████░░░░░ 剩余 50%', text)
-        self.assertRegex(text, r'7天 [█░]{10} 剩余 25%')
+        self.assertRegex(text, r'7d [█░]{10} 剩余 25%')
         self.assertNotIn('已用', text)
         self.native.call.assert_awaited_once_with('account/rateLimits/read', {})
 
@@ -494,6 +501,57 @@ class UsageCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('secret', json.dumps(normalized))
         data['rateLimitsByLimitId']['codex']['primary']['usedPercent'] = True
         self.assertIsNone(snapshot(data))
+
+    def test_reset_countdown_uses_only_days_and_hours(self):
+        for seconds, expected in [(1, '<1h'), (3599, '<1h'), (3600, '1h'),
+                                  (86399, '23h'), (86400, '1d 0h'),
+                                  (4 * 86400 + 7 * 3600 + 1800, '4d 7h')]:
+            with self.subTest(seconds=seconds):
+                self.assertEqual(_remaining(seconds), expected)
+
+    async def test_wifi_changes_edit_same_card_without_an_additional_quota_request(self):
+        provider = AsyncMock(return_value={'type': 'wifi', 'ssid': 'CUHK1x'})
+        network = self.ui.network = HostNetwork(provider=provider, clock=lambda: self.now)
+        await network.refresh()
+        await self.ui.tick()
+        mid = self.ui.state['message_id']
+        self.assertIn('剩余 80% · Wi-Fi CUHK1x', self.methods('sendMessage')[0]['text'].splitlines()[0])
+        self.assertEqual(self.ui.text().count('CUHK1x'), 1)
+        self.now += 61
+        provider.return_value = {'type': 'wifi', 'ssid': 'New WiFi'}
+        await network.refresh()
+        await self.ui.tick()
+        self.assertEqual(self.ui.state['message_id'], mid)
+        self.assertIn('Wi-Fi New WiFi', self.methods('editMessageText')[-1]['text'].splitlines()[0])
+        self.assertNotIn('CUHK1x', self.ui.text())
+        self.assertEqual(len(self.methods('sendMessage')), 1)
+        self.native.call.assert_awaited_once_with('account/rateLimits/read', {})
+        self.assertEqual(provider.await_count, 2)
+
+    async def test_slow_network_collection_does_not_delay_usage_or_quota_controls(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow():
+            entered.set()
+            await release.wait()
+            return {'type': 'wifi', 'ssid': 'eventually'}
+        network = self.ui.network = HostNetwork(provider=slow, timeout=30)
+        try:
+            await asyncio.wait_for(self.ui.tick(), .2)
+            await entered.wait()
+            self.assertEqual(len(self.methods('sendMessage')), 1)
+            self.native.call.assert_awaited_once_with('account/rateLimits/read', {})
+            self.ui.ingest(self.callback())
+            await asyncio.wait_for(self.ui.handle_one(), .2)
+            self.assertTrue(self.methods('answerCallbackQuery'))
+            self.assertEqual(self.native.call.await_count, 1)
+        finally:
+            release.set()
+            await network.aclose()
+
+    def test_network_is_displayed_once_without_quota_data(self):
+        network = self.ui.network = HostNetwork()
+        network.value = {'type': 'wired'}
+        self.assertEqual(self.ui.text(), '等待额度同步\n有线网络')
 
 
 if __name__ == '__main__':
