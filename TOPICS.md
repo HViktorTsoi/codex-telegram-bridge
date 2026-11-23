@@ -293,16 +293,25 @@ acknowledged preview. Missing identity, ambiguous records and deleted previews
 retain the selector. Message text, sender names and external origins never serve
 as routing evidence.
 
-Single-target routing, direct reply routing or target selection also queues the
-new text or media caption in the selected Telegram topic, prefixed with
-`📩 你在 All 说：`.
+When the Bot has exactly one bound topic, All input is handed to Codex without
+copying its text or media caption back into that topic. This also applies to
+text tasks submitted from the All skills menu. The original text and attachment
+payloads still reach the same native conversation. Native Codex-client user
+input mirroring remains enabled according to its existing configuration.
+
+With multiple bound topics, direct reply routing or target selection also queues
+the new text or media caption in the selected Telegram topic, prefixed with
+`📩 你在 All 说：`. The handoff persists its echo decision, so replay or recovery
+cannot change it merely because the number of bindings has changed. Handoffs
+already started by an older version retain their original echo plan.
 Rich rendering leaves this heading as ordinary text and quotes only the user's
 body; parent reply context is not appended for new ordinary All input.
 This copy uses a durable, deduplicated outbox key;
 recovery can complete it after input import without importing the native input
 again or starting another model turn. It copies text only, leaving attachment
 delivery to Codex on the existing path. Unselected/cancelled drafts do not send
-copies, and previously completed records are not backfilled.
+copies, and previously completed records are not backfilled. Already delivered
+messages are not removed.
 
 The receiver validates guarded input's frozen native thread, target key and topic
 before dispatch and again after attachment preparation. A changed/missing binding

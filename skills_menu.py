@@ -44,10 +44,13 @@ class SkillsMenu:
             CREATE TABLE IF NOT EXISTS skills_prompts(
                 id TEXT PRIMARY KEY,chat_id TEXT,topic_id INTEGER,message_id INTEGER,bot_id INTEGER,
                 catalog_id TEXT,selection_json TEXT,state TEXT,update_id INTEGER,
-                expires_at REAL);
+                expires_at REAL,mirror_input INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS skills_prompt_message
                 ON skills_prompts(chat_id,message_id) WHERE message_id IS NOT NULL;
         ''')
+        if 'mirror_input' not in {row[1] for row in self.db.execute('PRAGMA table_info(skills_prompts)')}:
+            self.db.execute('ALTER TABLE skills_prompts ADD COLUMN mirror_input INTEGER')
+        self.db.commit()
 
     @staticmethod
     def binding(target):
@@ -320,7 +323,9 @@ class SkillsMenu:
         await self._fresh(selection)
         target = self._target(selection['binding'])
         with self.db:
-            self.db.execute('INSERT INTO skills_prompts VALUES(?,?,?,?,?,?,?,?,?,?)',
+            self.db.execute('INSERT INTO skills_prompts '
+                            '(id,chat_id,topic_id,message_id,bot_id,catalog_id,selection_json,state,update_id,expires_at) '
+                            'VALUES(?,?,?,?,?,?,?,?,?,?)',
                             (button['token'], str(origin['chat']['id']), self._topic(origin), None,
                              self.router.bot_id, catalog['id'], json.dumps(selection, sort_keys=True),
                              'creating', None, time.time() + self.TTL))
@@ -375,6 +380,7 @@ class SkillsMenu:
         routed.pop('quote', None)
         routed['message_thread_id'] = target['message_thread_id']
         expected_skill = selection['skill']
+        mirror_input = prompt['mirror_input']
         if existing:
             try:
                 same = (existing['text'] == text and existing['message_thread_id'] == target['message_thread_id']
@@ -384,15 +390,23 @@ class SkillsMenu:
                 same = False
             if not same or existing['state'] in ('denied', 'cancelled', 'blocked', 'failed'):
                 raise SkillsError('任务投递记录冲突，未覆盖旧任务，请核对目标会话。')
+            if mirror_input is None:
+                # Input accepted by an older version retains its original echo.
+                mirror_input = 1
+                with self.db:
+                    self.db.execute('UPDATE skills_prompts SET mirror_input=? WHERE id=?',
+                                    (mirror_input, prompt['id']))
         else:
             await self._fresh(selection)
+            if mirror_input is None:
+                mirror_input = (int(len(self.router.targets) != 1) if prompt['state'] == 'active' else 1)
             with self.db:
-                self.db.execute("UPDATE skills_prompts SET state='submitting',update_id=? WHERE id=?",
-                                (update['update_id'], prompt['id']))
+                self.db.execute("UPDATE skills_prompts SET state='submitting',update_id=?,mirror_input=? WHERE id=?",
+                                (update['update_id'], mirror_input, prompt['id']))
             self._target(selection['binding'])
             bridge.store.accept({'update_id': update['update_id']}, routed, reply_context={},
                                 guard_binding=selection['binding'], skill=expected_skill)
-        if prompt['topic_id'] is None:
+        if prompt['topic_id'] is None and mirror_input:
             bridge.store.enqueue_at('main-guard-input:skills:' + str(update['update_id']), self.router.owner,
                                     '📩 你在 All 说：\n' + text, target['message_thread_id'])
         self.router.recent.record(target['thread_id'], 'skill-task:' + str(update['update_id']))
