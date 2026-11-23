@@ -649,12 +649,18 @@ class Bridge:
     async def model_command(self, command, argument, *, update_id=None):
         """Handle settings commands without starting a model turn."""
         native = self.codex
-        models = await native.models()
+        # Speed choices must use settings read after the model catalog await.
+        # Existing model/effort commands retain their metadata access order.
+        first = native.models if command == '/speed' else native.settings
+        second = native.settings if command == '/speed' else native.models
+        first_result = await first()
         if not self.owner_allowed():
             return '会话归属或访问权限已变化，未修改参数。'
-        settings = await native.settings()
+        second_result = await second()
         if not self.owner_allowed() or self.codex is not native:
             return '会话归属或访问权限已变化，未修改参数。'
+        models, settings = ((first_result, second_result) if command == '/speed'
+                            else (second_result, first_result))
         lookup = {str(key).lower(): model for model in models
                   for key in [model.get("id"), model.get("model")] if key}
         current = lookup.get(str(settings.get("model", "")).lower())
