@@ -240,13 +240,13 @@ it must be checked in the existing catalog instead of automatically retried.
 Topic-creation uncertainty retains the existing `binding_ops` protection.
 
 `/status` shows the
-native conversation's complete ID, model and effort. `/model`, `/effort` and
+native conversation's complete ID, model, effort and speed. `/model`, `/effort`, `/speed` and
 `/stop` affect that topic's conversation. Unknown topics are rejected. User-made
 topics are not automatically bound or converted into new Codex conversations.
 
 Global menus and dispatch summaries go to the main chat: `/sessions`, `/tasks`,
 `/inbox`, `/to`, `/aliases`, `/help` and `/start`. Session commands (`/status`,
-`/model`, `/effort`, `/format`, `/stop`) act on the original native conversation
+`/model`, `/effort`, `/speed`, `/format`, `/stop`) act on the original native conversation
 and send their results, confirmations and errors back to the input topic, or
 the main chat when entered there. Unknown commands and unbound-topic session
 errors also reply at the input location without selecting another native target.
@@ -254,6 +254,30 @@ Old management menus migrate to a main-chat panel on their next use, keeping
 the exact message/topic checks on callbacks and ForceReply prompts. Regular
 output and activity indicators keep their original topics; already queued output
 retains its stored destination.
+
+`/model`, `/effort`, `/speed` and `/format` share one topic-local settings menu.
+The Speed page offers Standard and Fast when supported by the current native
+model catalog; it also displays the thread's current speed. Fast uses more plan
+allowance or credits, independently of reasoning effort. The bridge does not
+enable Fast or impose another speed default during deployment or ordinary input:
+existing native thread settings are inherited. A speed selection writes only
+`serviceTier` through `thread/settings/update` and confirms the result by reading
+the original thread again. It affects subsequent turns, leaving an active turn,
+model, effort and global configuration unchanged. Missing native speed fields
+are shown as unknown; unadvertised Fast tiers are not offered. Model changes,
+stale bindings and uncertain writes require a refreshed menu rather than an
+automatic retry. In All, these settings explicitly address the configured root
+conversation; they do not select a recent topic.
+
+The pinned All quota card also includes this machine's current Wi-Fi SSID from
+local network collection. Unavailable network information is shown as unknown;
+container interfaces are not treated as host Wi-Fi names. This display does not
+read Wi-Fi credentials, call a model, or aggregate another machine's state.
+Quota reset times retain the existing four-space indent and use only a relative
+day/hour duration such as `2d 6h` (`<1h` below one hour), without dates, time zones,
+minutes or seconds.
+The shared quota cache, push updates, fallback query interval and refresh
+cooldown remain unchanged.
 
 An ordinary topic-less All reply to a same-chat message in a currently bound
 local topic goes directly to that topic's native input queue, without target

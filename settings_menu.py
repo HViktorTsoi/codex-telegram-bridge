@@ -1,4 +1,4 @@
-"""Topic-local model, reasoning and display settings without model turns."""
+"""Topic-local model, reasoning, speed and display settings without model turns."""
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -9,10 +9,11 @@ import time
 from attachments import payload_from
 from bridge import TelegramError, permitted
 from message_format import plain_chunks
+from speed_settings import current_speed, speed_choices, speed_label, speed_matches
 
 
 LOG = logging.getLogger('codex_telegram_settings')
-COMMANDS = {'/model': 'model', '/effort': 'effort', '/format': 'format'}
+COMMANDS = {'/model': 'model', '/effort': 'effort', '/speed': 'speed', '/format': 'format'}
 
 
 class SettingsError(RuntimeError):
@@ -121,9 +122,11 @@ class SettingsMenu:
         if mode == 'format':
             return bridge, {}, [], display
         native = bridge.codex
-        settings = await native.settings()
-        self._bridge(binding, native=True)
         models = await native.models()
+        self._bridge(binding, native=True)
+        # Read settings last: a desktop model change while the catalog request
+        # is pending must invalidate options bound to the earlier model.
+        settings = await native.settings()
         self._bridge(binding, native=True)
         if bridge.codex is not native or settings.get('thread', {}).get('id') != binding['thread_id']:
             raise SettingsError('原生会话身份未能核验，请刷新菜单。')
@@ -139,7 +142,7 @@ class SettingsMenu:
                        if isinstance(entry, dict) and isinstance(entry.get('reasoningEffort'), str)
                        and entry['reasoningEffort']]
             valid.append({'id': mid, 'efforts': list(dict.fromkeys(efforts)),
-                          'default': model.get('defaultReasoningEffort')})
+                          'default': model.get('defaultReasoningEffort'), 'speeds': speed_choices(model)})
         return bridge, settings, valid, display
 
     async def _notice(self, update, text):
@@ -162,10 +165,12 @@ class SettingsMenu:
             raise SettingsError('设置菜单的位置或机器人身份已变化，请重新打开。')
         revision = panel['revision'] + 1
         current_model, effort = settings.get('model'), settings.get('reasoningEffort')
-        heading = {'model': '模型 Model', 'effort': '推理强度 Effort', 'format': '显示格式 Format'}[mode]
+        heading = {'model': '模型 Model', 'effort': '推理强度 Effort',
+                   'speed': '回复速度 Speed', 'format': '显示格式 Format'}[mode]
         text = '会话设置 · ' + label(bridge.target['name'], 90) + '\n' + heading
         if mode != 'format':
             text += '\n\n当前 model：' + str(current_model or '默认') + '\n当前 effort：' + str(effort or '默认')
+            text += '\n当前 speed：' + speed_label(settings)
         text += '\n当前格式：' + ('Rich Markdown' if display == 'rich' else '纯文本')
         if note:
             text += '\n\n' + note
@@ -192,18 +197,29 @@ class SettingsMenu:
             rows.extend([[('✓ ' + value if value == effort else value, 'effort', value)] for value in choices])
             if not choices:
                 text += '\n\n当前模型没有可选择的强度，请先选择模型或刷新。'
+        elif mode == 'speed':
+            model = next((model for model in models if model['id'] == current_model), None)
+            choices = model['speeds'] if model else speed_choices(None)
+            known = current_speed(settings) is not None
+            rows.extend([[('✓ ' + choice['label'] if speed_matches(settings, choice['id']) else choice['label'],
+                           'speed' if known else 'disabled', choice['id'])] for choice in choices])
+            text += '\n\nStandard 使用常规速度；Fast 消耗更多额度，具体用量取决于模型与套餐。'
+            if not known:
+                text += '\n当前 Codex 服务未返回速度设置，暂不能安全切换；请升级 Codex 后刷新。'
+            elif len(choices) == 1:
+                text += '\n当前模型没有公布可用的 Fast 模式。'
         else:
             rows.extend([[('✓ ' + name if value == display else name, 'format', value)]
                          for name, value in [('Rich Markdown', 'rich'), ('纯文本', 'plain')]])
         rows.append([(name, 'tab', value) for name, value in
-                     [('模型', 'model'), ('强度', 'effort'), ('格式', 'format')]])
+                     [('模型', 'model'), ('强度', 'effort'), ('速度', 'speed'), ('格式', 'format')]])
         rows.append([('刷新', 'refresh', None), ('关闭', 'close', None)])
         keyboard, tokens = [], []
         with self.db:
             for row in rows:
                 keys = []
                 for name, action, value in row:
-                    if action == 'tab' and value == mode:
+                    if action == 'disabled' or (action == 'tab' and value == mode):
                         keys.append({'text': label(name), 'disabled': {}})
                         continue
                     token = secrets.token_urlsafe(12)
@@ -288,6 +304,18 @@ class SettingsMenu:
                 if not selected or value not in selected['efforts']:
                     return await self._render(update, panel, action, note='该强度已不可用，请重新选择。', snapshot=snapshot)
                 changes['effort'] = value
+            elif action == 'speed':
+                if settings.get('model') != panel['model_snapshot']:
+                    return await self._render(update, panel, action, note='模型已变化，已刷新当前模型的可选速度。', snapshot=snapshot)
+                if current_speed(settings) is None:
+                    return await self._render(update, panel, action, note='当前 Codex 服务未返回速度设置，未修改参数。', snapshot=snapshot)
+                selected = next((model for model in models if model['id'] == settings.get('model')), None)
+                choices = selected['speeds'] if selected else speed_choices(None)
+                if value not in [choice['id'] for choice in choices]:
+                    return await self._render(update, panel, action, note='该速度已不可用，请重新选择。', snapshot=snapshot)
+                if speed_matches(settings, value):
+                    return await self._render(update, panel, action, note='当前已使用此速度，无需修改。', snapshot=snapshot)
+                changes['serviceTier'] = value
             elif value not in ('rich', 'plain'):
                 raise SettingsError('显示格式无效，请刷新菜单。')
             # Recheck after every metadata await and immediately before the
@@ -299,7 +327,7 @@ class SettingsMenu:
                 if not claimed:
                     raise SettingsError('这个选项已经处理，请刷新菜单。')
                 self.db.execute("UPDATE settings_buttons SET state='used' WHERE panel_id=? AND revision=? "
-                                "AND action IN ('model','effort','format')", (panel['id'], panel['revision']))
+                                "AND action IN ('model','effort','speed','format')", (panel['id'], panel['revision']))
                 self.db.execute('INSERT INTO settings_applies(token,update_id,state) VALUES(?,?,?)',
                                 (button['token'], update['update_id'], 'sending'))
             try:
@@ -319,9 +347,12 @@ class SettingsMenu:
                     self._bridge(binding, native=True)
                     if bridge.codex is not native or actual.get('thread', {}).get('id') != binding['thread_id']:
                         raise SettingsError('设置已提交，但当前会话身份无法回读确认，请刷新。')
-                    expected = {'model' if field == 'model' else 'reasoningEffort': desired for field, desired in changes.items()}
+                    expected = {field if field != 'effort' else 'reasoningEffort': desired
+                                for field, desired in changes.items() if field != 'serviceTier'}
                     if any(actual.get(field) != desired for field, desired in expected.items()):
                         raise SettingsError('设置已提交，但回读参数不同，请刷新查看当前值。')
+                    if 'serviceTier' in changes and not speed_matches(actual, changes['serviceTier']):
+                        raise SettingsError('速度设置已提交，但回读参数不同，请刷新查看当前值。')
                     snapshot = (bridge, actual, models, display)
                     note = '已更新此会话参数，从下一轮开始生效。'
                 with self.db:

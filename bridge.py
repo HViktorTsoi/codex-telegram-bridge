@@ -22,6 +22,7 @@ from message_format import message_parts, send_output
 from reply_context import serialized as reply_serialized
 from session_scope import SessionScope, SessionScopeError
 from receiver_lock import BotReceiverLock
+from speed_settings import current_speed, speed_choices, speed_label, speed_matches
 
 LOG = logging.getLogger("codex_telegram")
 DEFAULT_STATE = Path.home() / ".local/state/codex-telegram"
@@ -29,6 +30,7 @@ BOT_COMMANDS = [
     {"command": "start", "description": "开始使用 Codex 对话"},
     {"command": "model", "description": "查看或切换模型，例如 /model gpt-6.1-sol"},
     {"command": "effort", "description": "查看或修改推理强度，例如 /effort high"},
+    {"command": "speed", "description": "选择回复速度：Standard 或 Fast"},
     {"command": "format", "description": "回复格式：/format rich 或 /format plain"},
     {"command": "status", "description": "查看连接状态、模型和推理强度"},
     {"command": "stop", "description": "停止当前任务"},
@@ -641,19 +643,75 @@ class Bridge:
 
     @staticmethod
     def settings_text(settings):
-        return f"model：{settings.get('model') or '默认'}\neffort：{settings.get('reasoningEffort') or '默认'}"
+        return (f"model：{settings.get('model') or '默认'}\neffort：{settings.get('reasoningEffort') or '默认'}"
+                + '\nspeed：' + speed_label(settings))
 
-    async def model_command(self, command, argument):
+    async def model_command(self, command, argument, *, update_id=None):
         """Handle settings commands without starting a model turn."""
-        settings = await self.codex.settings()
+        native = self.codex
+        # Speed choices must use settings read after the model catalog await.
+        # Existing model/effort commands retain their metadata access order.
+        first = native.models if command == '/speed' else native.settings
+        second = native.settings if command == '/speed' else native.models
+        first_result = await first()
         if not self.owner_allowed():
             return '会话归属或访问权限已变化，未修改参数。'
-        models = await self.codex.models()
-        if not self.owner_allowed():
+        second_result = await second()
+        if not self.owner_allowed() or self.codex is not native:
             return '会话归属或访问权限已变化，未修改参数。'
+        models, settings = ((first_result, second_result) if command == '/speed'
+                            else (second_result, first_result))
         lookup = {str(key).lower(): model for model in models
                   for key in [model.get("id"), model.get("model")] if key}
         current = lookup.get(str(settings.get("model", "")).lower())
+        if command == '/speed':
+            if settings.get('thread', {}).get('id') != self.thread_id:
+                return '原生会话身份未能核验，未修改速度；请稍后重试。'
+            if not argument:
+                choices = speed_choices(current)
+                available = '、'.join(choice['label'] for choice in choices)
+                return ('当前会话参数\n' + self.settings_text(settings)
+                        + '\n\n可选速度：' + available
+                        + '\n用法：/speed standard 或 /speed fast\nFast 会消耗更多额度。')
+            requested = argument.strip().lower()
+            if requested not in ('standard', 'default', 'fast'):
+                return '用法：/speed standard 或 /speed fast。每次只设置一个参数。'
+            if current_speed(settings) is None:
+                return '当前 Codex 未返回速度设置，无法确认支持；请升级 Codex 后重试。'
+            desired = ('default' if requested in ('standard', 'default') else
+                       next((choice['id'] for choice in speed_choices(current)
+                             if choice['id'] in ('fast', 'priority')), None))
+            if desired is None:
+                return '当前模型未提供 Fast，请使用 Standard 或重新选择支持的模型。'
+            request_key = 'speed-setting:' + str(update_id) if update_id is not None else None
+            if request_key and self.store.get(request_key):
+                return '本条速度请求已经处理或结果待确认，不会重复写入。\n当前参数：\n' + self.settings_text(settings)
+            if speed_matches(settings, desired):
+                if request_key:
+                    self.store.set(request_key, json.dumps({'state': 'done', 'thread_id': self.thread_id, 'tier': desired}))
+                return '此会话已使用该速度。\n' + self.settings_text(settings)
+            if not self.owner_allowed():
+                return '会话归属或访问权限已变化，未修改速度。'
+            if request_key:
+                self.store.set(request_key, json.dumps({'state': 'sending', 'thread_id': self.thread_id, 'tier': desired}))
+            try:
+                await native.call('thread/settings/update', {'threadId': self.thread_id, 'serviceTier': desired})
+            except Exception:
+                if request_key:
+                    self.store.set(request_key, json.dumps({'state': 'uncertain', 'thread_id': self.thread_id, 'tier': desired}))
+                return '速度请求结果尚未确认，不会自动重试；请查询 /speed 查看当前值。'
+            if not self.owner_allowed():
+                return '速度请求已提交，会话归属或访问权限已变化，未继续读取参数。'
+            try:
+                actual = await native.settings()
+            except Exception:
+                return '速度请求已提交，但暂时无法回读确认；请查询 /speed，不要重复提交。'
+            if (self.codex is not native or actual.get('thread', {}).get('id') != self.thread_id
+                    or not speed_matches(actual, desired)):
+                return '速度请求已提交，但回读结果尚未确认，请查询 /speed；不要重复提交。'
+            if request_key:
+                self.store.set(request_key, json.dumps({'state': 'done', 'thread_id': self.thread_id, 'tier': desired}))
+            return '已更新此会话速度，从下一轮开始生效。\n' + self.settings_text(actual)
         if not argument:
             reply = "当前会话参数\n" + self.settings_text(settings)
             if command == "/model":
@@ -733,14 +791,15 @@ class Bridge:
             reply = ("这里已连接你现有的 Codex 会话，直接发送文字即可继续对话。\n"
                      "/model 查看当前模型和可选模型\n/model <模型 ID> 切换模型\n"
                      "/effort 查看当前强度和可选级别\n/effort <级别> 修改推理强度\n"
+                     "/speed 查看回复速度\n/speed standard 或 /speed fast 切换速度\n"
                      "/format rich 开启 Markdown 排版；/format plain 使用纯文本\n"
-                     "/status 查看状态、model 和 effort\n/stop 停止当前任务\n/help 查看说明\n\n"
+                     "/status 查看状态、model、effort 和 speed\n/stop 停止当前任务\n/help 查看说明\n\n"
                      "支持文字、图片、文件、位置和联系人；相册会合并发送。附件目前上限20MB。\n"
                      "语音和视频可接收为文件，尚未自动转写或提取视频帧。\n"
                      "参数修改从下一轮开始生效，沿用此会话的上下文。\n"
                      "会话忙碌时，新消息会作为补充要求加入当前任务。电脑和 Codex 服务运行期间可用。")
-        elif command in {"/model", "/effort"}:
-            reply = await self.model_command(command, argument)
+        elif command in {"/model", "/effort", "/speed"}:
+            reply = await self.model_command(command, argument, update_id=update_id)
         elif command == '/format':
             if argument and argument.lower() not in {'rich', 'plain'}:
                 reply = '用法：/format rich 或 /format plain。'

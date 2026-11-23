@@ -26,6 +26,7 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.ui = getattr(self.router, 'settings_menu', None) or SettingsMenu(self.router)
         self.sequence, self.calls, self.updates, self.native_reads = 100, [], [], []
         self.messages, self.settings, self.fail_update = {}, {}, None
+        self.ignore_speed_update, self.normalize_default_speed = False, False
         self.after_models, self.block_models = None, None
         self.catalog = [self.model('native-A', ['low', 'high'], 'low'),
                         self.model('native-B', ['Medium', 'XHigh'], 'Medium')]
@@ -53,9 +54,13 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
                 test.updates.append((self.tid, copy.deepcopy(params)))
                 if test.fail_update:
                     raise test.fail_update
-                for key, field in [('model', 'model'), ('effort', 'reasoningEffort')]:
+                for key, field in [('model', 'model'), ('effort', 'reasoningEffort'), ('serviceTier', 'serviceTier')]:
                     if key in params:
+                        if key == 'serviceTier' and test.ignore_speed_update:
+                            continue
                         test.settings[self.tid][field] = params[key]
+                        if key == 'serviceTier' and params[key] == 'default' and test.normalize_default_speed:
+                            test.settings[self.tid][field] = None
                 return {}
 
         class Telegram:
@@ -78,7 +83,8 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.router.telegram = Telegram()
         for bridge in self.router.bridges.values():
             tid = bridge.thread_id
-            self.settings[tid] = {'thread': {'id': tid}, 'model': 'native-A', 'reasoningEffort': 'high'}
+            self.settings[tid] = {'thread': {'id': tid}, 'model': 'native-A',
+                                  'reasoningEffort': 'high', 'serviceTier': None}
             bridge.codex, bridge.telegram = Native(tid), self.router.telegram
             bridge.ready.set()
 
@@ -91,7 +97,9 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def model(name, efforts, default):
         return {'id': name, 'model': name, 'supportedReasoningEfforts':
-                [{'reasoningEffort': value} for value in efforts], 'defaultReasoningEffort': default}
+                [{'reasoningEffort': value} for value in efforts], 'defaultReasoningEffort': default,
+                'serviceTiers': [{'id': 'default', 'name': 'Standard', 'description': 'Normal speed'},
+                                 {'id': 'fast', 'name': 'Fast', 'description': 'Faster speed'}]}
 
     def message(self, text, topic=42, sender=123, **extra):
         self.sequence += 1
@@ -158,6 +166,152 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(tid == 'other-native' for _, tid in self.native_reads))
         self.assertTrue(all(len(button['callback_data']) < 64 for row in panel['reply_markup']['inline_keyboard']
                             for button in row if 'callback_data' in button))
+
+    async def test_speed_shares_the_model_effort_menu_and_retains_its_topic_and_message(self):
+        panel = await self.send('/model', topic=99)
+        identity = panel['message_id']
+        self.assertIn('Standard', panel['text'])
+        await self.click(panel, '速度')
+        panel = self.panel()
+        self.assertEqual((panel['message_id'], panel['message_thread_id']), (identity, 99))
+        self.assertIn('Standard', panel['text'])
+        self.assertTrue(any('Fast' in value for value in self.labels(panel)))
+        self.assertIn('额度', panel['text'])
+        self.assertEqual(self.updates, [])
+        self.assertTrue(all(tid == 'other-native' for _, tid in self.native_reads))
+
+    async def test_speed_change_writes_only_the_selected_threads_tier(self):
+        panel = await self.send('/speed', topic=99)
+        self.assertTrue(any(value.startswith('✓') and 'Standard' in value for value in self.labels(panel)))
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [('other-native', {'threadId': 'other-native', 'serviceTier': 'fast'})])
+        self.assertEqual(self.settings['other-native'], {'thread': {'id': 'other-native'},
+            'model': 'native-A', 'reasoningEffort': 'high', 'serviceTier': 'fast'})
+        self.assertIsNone(self.settings['manager-native']['serviceTier'])
+        self.assertTrue(any(value.startswith('✓') and 'Fast' in value for value in self.labels(self.panel())))
+        self.assertIn('下一轮', self.panel()['text'])
+
+    async def test_standard_explicitly_clears_fast_and_accepts_native_null_readback(self):
+        self.settings['manager-native']['serviceTier'] = 'priority'
+        self.normalize_default_speed = True
+        panel = await self.send('/speed')
+        self.assertTrue(any(value.startswith('✓') and 'Fast' in value for value in self.labels(panel)))
+        await self.click(panel, 'Standard')
+        self.assertEqual(self.updates, [('manager-native', {'threadId': 'manager-native', 'serviceTier': 'default'})])
+        self.assertTrue(any(value.startswith('✓') and 'Standard' in value for value in self.labels(self.panel())))
+        self.assertIn('下一轮', self.panel()['text'])
+
+    async def test_speed_in_all_targets_the_explicit_root_and_keeps_the_menu_in_all(self):
+        panel = await self.send('/speed', topic=None)
+        self.assertNotIn('message_thread_id', panel)
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [('manager-native', {'threadId': 'manager-native', 'serviceTier': 'fast'})])
+        self.assertNotIn('message_thread_id', self.panel())
+
+    async def test_speed_menu_does_not_offer_unadvertised_fast_or_ultrafast(self):
+        self.catalog[0]['serviceTiers'] = [{'id': 'ultrafast', 'name': 'Ultra Fast', 'description': ''}]
+        panel = await self.send('/speed')
+        speed_buttons = self.ui.db.execute("SELECT value FROM settings_buttons WHERE action='speed' "
+                                          "AND state='active'").fetchall()
+        self.assertEqual([json.loads(row['value']) for row in speed_buttons], ['default'])
+        self.assertEqual(self.updates, [])
+
+    async def test_speed_uses_the_catalogs_priority_id_and_matches_fast_alias_on_readback(self):
+        self.catalog[0].update(serviceTiers=[{'id': 'priority', 'name': 'Fast', 'description': ''}],
+                               additionalSpeedTiers=['fast'])
+        panel = await self.send('/speed')
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [('manager-native', {'threadId': 'manager-native', 'serviceTier': 'priority'})])
+        self.assertTrue(any(value.startswith('✓') and 'Fast' in value for value in self.labels(self.panel())))
+
+    async def test_catalog_withdrawal_or_model_change_invalidates_a_previously_offered_speed(self):
+        panel = await self.send('/speed')
+        self.catalog[0]['serviceTiers'] = []
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [])
+        self.catalog[0]['serviceTiers'] = [{'id': 'fast', 'name': 'Fast', 'description': ''}]
+        panel = await self.send('/speed')
+        self.settings['manager-native'].update(model='native-B', reasoningEffort='Medium')
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [])
+        self.assertIn('模型已变化', self.panel()['text'])
+
+    async def test_desktop_model_change_during_catalog_read_refreshes_speed_without_a_write(self):
+        panel = await self.send('/speed')
+
+        async def desktop_changes_model():
+            self.settings['manager-native'].update(model='native-B', reasoningEffort='Medium')
+
+        self.after_models = desktop_changes_model
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [])
+        self.assertIn('模型已变化', self.panel()['text'])
+        self.assertIn('native-B', self.panel()['text'])
+
+    async def test_legacy_server_missing_tier_does_not_mislabel_or_modify_standard(self):
+        self.settings['manager-native'].pop('serviceTier')
+        panel = await self.send('/speed')
+        self.assertNotIn('✓ Standard', self.labels(panel))
+        self.assertIn('未知', panel['text'])
+        self.assertEqual(self.ui.db.execute("SELECT COUNT(*) FROM settings_buttons WHERE action='speed' "
+                                           "AND state='active'").fetchone()[0], 0)
+        self.assertEqual(self.updates, [])
+        await self.click(panel, '强度')
+        await self.click(self.panel(), 'low')
+        self.assertEqual(self.updates, [('manager-native', {'threadId': 'manager-native', 'effort': 'low'})])
+
+    async def test_speed_rechecks_owner_binding_bot_topic_and_native_field_before_writing(self):
+        panel = await self.send('/speed')
+        await self.click(panel, 'Fast', sender=999)
+        await self.click(panel, 'Fast', message_thread_id=99)
+        await self.click(panel, 'Fast', **{'from': {'id': 999}})
+        self.assertEqual(self.updates, [])
+        self.settings['manager-native'].pop('serviceTier')
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [])
+        self.settings['manager-native']['serviceTier'] = None
+        panel = await self.send('/speed')
+        self.router.targets['manager'] = {**self.router.targets['manager'], 'thread_id': 'rebound-native'}
+        await self.click(panel, 'Fast')
+        self.assertEqual(self.updates, [])
+
+    async def test_speed_readback_mismatch_and_restart_never_repeat_the_write(self):
+        panel = await self.send('/speed')
+        self.ignore_speed_update = True
+        update = await self.click(panel, 'Fast')
+        self.assertEqual(len(self.updates), 1)
+        self.assertEqual(self.ui.db.execute('SELECT state FROM settings_applies').fetchone()[0], 'uncertain')
+        self.ui = SettingsMenu(self.router)
+        self.ui.recover()
+        self.ui.ingest(update)
+        await self.ui.handle_one()
+        await self.click(panel, 'Fast')
+        self.assertEqual(len(self.updates), 1)
+        self.assertIsNone(self.settings['manager-native']['serviceTier'])
+        await self.click(panel, '刷新')
+        self.assertTrue(any(value.startswith('✓') and 'Standard' in value for value in self.labels(self.panel())))
+
+    async def test_duplicate_speed_callback_does_not_reapply_and_other_setting_changes_preserve_fast(self):
+        panel = await self.send('/speed')
+        update = await self.click(panel, 'Fast')
+        self.ui.ingest(update)
+        await self.ui.handle_one()
+        await self.click(panel, 'Fast')
+        self.assertEqual(len(self.updates), 1)
+        await self.click(self.panel(), '强度')
+        await self.click(self.panel(), 'low')
+        await self.click(self.panel(), '模型')
+        await self.click(self.panel(), 'native-B')
+        self.assertEqual(self.settings['manager-native']['serviceTier'], 'fast')
+        self.assertTrue(all('serviceTier' not in params for _, params in self.updates[1:]))
+
+    async def test_selecting_the_actual_current_speed_refreshes_without_mutation(self):
+        panel = await self.send('/speed')
+        await self.click(panel, 'Standard')
+        self.assertEqual(self.updates, [])
+        self.settings['manager-native']['serviceTier'] = 'priority'
+        await self.click(self.panel(), 'Fast')
+        self.assertEqual(self.updates, [])
 
     async def test_all_operates_explicit_root_and_keeps_menu_in_all(self):
         panel = await self.send('/effort', topic=None)
@@ -277,9 +431,9 @@ class SettingsMenuTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_navigation_tab_is_disabled_in_each_settings_page(self):
         panel = await self.send('/model')
-        for current, next_tab in [('模型', '强度'), ('强度', '格式'), ('格式', '模型')]:
+        for current, next_tab in [('模型', '强度'), ('强度', '速度'), ('速度', '格式'), ('格式', '模型')]:
             buttons = {button['text']: button for row in panel['reply_markup']['inline_keyboard']
-                       for button in row if button['text'] in ('模型', '强度', '格式')}
+                       for button in row if button['text'] in ('模型', '强度', '速度', '格式')}
             self.assertEqual(buttons[current], {'text': current, 'disabled': {}})
             self.assertTrue(all('callback_data' in button and 'disabled' not in button
                                 for title, button in buttons.items() if title != current))
