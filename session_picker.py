@@ -442,6 +442,8 @@ class SessionPicker:
         return target
 
     async def create_topic(self, thread_id, target):
+        if not self.router.owner_allowed():
+            raise BindingError('当前账号没有访问权限，未创建话题。')
         self.router.session_scope.require(thread_id)
         self.check_topic_creation_available()
         self.operation(thread_id, target, 'creating')
@@ -646,7 +648,6 @@ class SessionPicker:
 
     async def recover(self):
         self.creator.recover()
-        self.guard.recover()
         self.renamer.recover()
         with self.db:
             self.db.execute("UPDATE ui_jobs SET state='pending' WHERE state='processing'")
@@ -659,3 +660,4 @@ class SessionPicker:
             old_topic = target.get('previous_message_thread_id')
             await self.router.install_target(target, replace_topic=old_topic is not None, expected_topic_id=old_topic)
             self.operation(row['thread_id'], target, 'active')
+        self.guard.recover()

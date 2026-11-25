@@ -1,5 +1,6 @@
 """Explicit, durable new-session wizard; existing-session binding stays separate."""
 import asyncio
+import json
 from pathlib import Path
 import secrets
 import time
@@ -23,6 +24,9 @@ class SessionCreator:
             CREATE TABLE IF NOT EXISTS ui_new_prompts(
                 chat_id TEXT,message_id INTEGER,topic_id INTEGER,draft_id TEXT,
                 kind TEXT,state TEXT,expires_at REAL,PRIMARY KEY(chat_id,message_id));
+            CREATE TABLE IF NOT EXISTS ui_new_all(
+                guard_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,bot_id INTEGER NOT NULL,
+                creator_id TEXT NOT NULL UNIQUE,binding_json TEXT);
         ''')
 
     def is_reply(self, update):
@@ -35,12 +39,13 @@ class SessionCreator:
         # Also catch an orphaned prompt if sendMessage succeeded but its response was lost.
         return bool(row or parent.get('text', '').startswith(PROMPT_TITLE))
 
-    def draft(self, draft_id, chat_id):
+    def draft(self, draft_id, chat_id, *, allow_expired=False):
         row = self.db.execute('SELECT * FROM ui_new_drafts WHERE id=? AND chat_id=?',
                               (draft_id, str(chat_id))).fetchone()
         if not row:
             raise BindingError('创建记录不存在，请重新打开 /sessions。')
-        if row['expires_at'] <= time.time() and row['state'] in ('browse', 'naming', 'review'):
+        if (not allow_expired and row['expires_at'] <= time.time()
+                and row['state'] in ('browse', 'naming', 'review')):
             raise BindingError('新建流程已过期，请重新打开 /sessions。')
         return row
 
@@ -215,8 +220,80 @@ class SessionCreator:
         await self.show(update, draft, '已取消新建会话。此流程中已新建的文件夹会保留。',
                         [[('返回会话管理', 'home', {})]])
 
+    def _check_access(self, draft, bot_id=None):
+        if (str(self.router.owner) != draft['chat_id'] or not self.router.owner_allowed()
+                or (bot_id is not None and self.router.bot_id != bot_id)):
+            raise BindingError('会话创建的机器人或访问权限已变化，请恢复原设置后重试。')
+
+    async def _name_new_thread(self, draft, bot_id=None):
+        self._check_access(draft, bot_id)
+        if not draft['thread_id']:
+            if draft['state'] != 'review':
+                raise BindingError('请先选择目录并填写会话名称。')
+            cwd = str(self.resolve(draft['cwd']))
+            if cwd != draft['cwd']:
+                raise BindingError('目录位置已经改变，请重新选择目录后确认。')
+            self.picker.check_topic_creation_available()
+            if not self.router.bridges[self.router.root_target['key']].ready.is_set():
+                raise BindingError('本机 Codex 正在连接，请稍后重试新建会话。')
+            # Commit intent before the non-idempotent RPC. A lost response must never create twice.
+            self.save(draft['id'], state='creating')
+            try:
+                result = await self.router.catalog_call('thread/start', {'cwd': cwd})
+            except (RpcError, OSError, asyncio.TimeoutError, SessionScopeError):
+                self.save(draft['id'], state='uncertain')
+                raise BindingError('新建会话的返回结果未确认。请检查已有会话列表；不会自动重复创建。') from None
+            thread = result.get('thread') if isinstance(result, dict) else None
+            tid = thread.get('id') if isinstance(thread, dict) else None
+            if not isinstance(tid, str) or not tid:
+                self.save(draft['id'], state='uncertain')
+                raise BindingError('新建会话的返回结果异常，请检查已有会话列表。')
+            try:
+                valid = (not any(t['thread_id'] == tid for t in self.router.targets.values())
+                         and not thread.get('ephemeral') and thread.get('canAcceptDirectInput') is not False
+                         and str(self.resolve(thread.get('cwd') or result.get('cwd') or cwd)) == cwd)
+            except BindingError:
+                valid = False
+            if not valid:
+                self.save(draft['id'], thread_id=tid, state='blocked')
+                raise BindingError('新建会话信息与预期不符，已停止绑定；请检查已有会话列表。')
+            # Keep the verified native ID before claiming the Bot scope. If the
+            # process stops here, a later attempt can finish claiming this ID.
+            self.save(draft['id'], thread_id=tid, state='received')
+            draft = self.draft(draft['id'], draft['chat_id'])
+        tid = draft['thread_id']
+        self._check_access(draft, bot_id)
+        if draft['state'] == 'received':
+            try:
+                self.router.session_scope.claim_created(tid)
+            except SessionScopeError:
+                self.save(draft['id'], state='blocked')
+                raise BindingError('新会话已创建，但归属登记未完成，已停止命名和绑定；请核对会话后再处理。') from None
+            self.save(draft['id'], state='created')
+            draft = self.draft(draft['id'], draft['chat_id'])
+        self.router.session_scope.require(tid)
+        if draft['state'] == 'created':
+            result = await self.router.catalog_call('thread/read', {'threadId': tid})
+            thread = result.get('thread') if isinstance(result, dict) else None
+            try:
+                valid = (isinstance(thread, dict) and thread.get('id') == tid and thread.get('cwd')
+                         and not thread.get('ephemeral') and thread.get('canAcceptDirectInput') is not False
+                         and not any(t['thread_id'] == tid for t in self.router.targets.values())
+                         and str(self.resolve(thread['cwd'])) == draft['cwd'])
+            except BindingError:
+                valid = False
+            if not valid:
+                self.save(draft['id'], state='blocked')
+                raise BindingError('新会话信息无法核对，已停止命名和绑定，请检查已有会话列表。')
+            self._check_access(draft, bot_id)
+            await self.router.catalog_call('thread/name/set', {'threadId': tid, 'name': draft['name']})
+            self.save(draft['id'], state='named')
+            draft = self.draft(draft['id'], draft['chat_id'])
+        self._check_access(draft, bot_id)
+        return draft
+
     async def resume(self, update, draft, confirm=False):
-        if draft['thread_id']:
+        if draft['thread_id'] and draft['state'] != 'received':
             self.router.session_scope.require(draft['thread_id'])
         if draft['state'] == 'done':
             target = next((t for t in self.router.targets.values() if t['thread_id'] == draft['thread_id']), None)
@@ -229,61 +306,16 @@ class SessionCreator:
                                    '请到“添加会话”中检查最新会话，确认后绑定。' +
                                    (f"\n已返回 ID：{draft['thread_id']}" if draft['thread_id'] else ''),
                                    [[('检查已有会话', 'catalog', {}), ('返回', 'home', {})]])
-        if not draft['thread_id']:
+        if not draft['thread_id'] and not confirm:
             if draft['state'] != 'review':
                 raise BindingError('请先选择目录并填写会话名称。')
-            if not confirm:
-                return await self.review(update, draft)
-            try:
-                self.picker.check_topic_creation_available()
-            except TopicCreationUnavailable as error:
-                return await self.review(update, draft, str(error) +
-                                         '\n本次尚未新建 Codex 会话，名称和目录已保留，请稍后再确认。')
-            cwd = str(self.resolve(draft['cwd']))
-            if cwd != draft['cwd']:
-                raise BindingError('目录位置已经改变，请重新选择目录后确认。')
-            # Commit intent before the non-idempotent RPC. A lost response must never create twice.
-            self.save(draft['id'], state='creating')
-            try:
-                result = await self.router.catalog_call('thread/start', {'cwd': cwd})
-            except (RpcError, ConnectionError, asyncio.TimeoutError):
-                self.save(draft['id'], state='uncertain')
-                raise BindingError('新建会话的返回结果未确认。请检查已有会话列表；不会自动重复创建。') from None
-            thread = result.get('thread') if isinstance(result, dict) else None
-            tid = thread.get('id') if isinstance(thread, dict) else None
-            if not isinstance(tid, str) or not tid:
-                self.save(draft['id'], state='uncertain')
-                raise BindingError('新建会话的返回结果异常，请检查已有会话列表。')
-            self.save(draft['id'], thread_id=tid, state='created')
-            if (any(t['thread_id'] == tid for t in self.router.targets.values())
-                    or thread.get('ephemeral') or thread.get('canAcceptDirectInput') is False
-                    or str(self.resolve(thread.get('cwd') or result.get('cwd') or cwd)) != cwd):
-                self.save(draft['id'], state='blocked')
-                raise BindingError('新建会话信息与预期不符，已停止绑定；请检查已有会话列表。')
-            try:
-                self.router.session_scope.claim_created(tid)
-            except SessionScopeError:
-                self.save(draft['id'], state='blocked')
-                raise BindingError('新会话已创建，但归属登记未完成，已停止命名和绑定；请核对会话后再处理。') from None
-            draft = self.draft(draft['id'], draft['chat_id'])
-        # The ID is durable before naming or binding; retries operate on this same session.
+            return await self.review(update, draft)
+        try:
+            draft = await self._name_new_thread(draft)
+        except TopicCreationUnavailable as error:
+            return await self.review(update, draft, str(error) +
+                                     '\n本次尚未新建 Codex 会话，名称和目录已保留，请稍后再确认。')
         tid = draft['thread_id']
-        self.router.session_scope.require(tid)
-        if draft['state'] == 'created':
-            result = await self.router.catalog_call('thread/read', {'threadId': tid})
-            thread = result.get('thread', {})
-            try:
-                valid = (thread.get('id') == tid and thread.get('cwd')
-                         and not thread.get('ephemeral') and thread.get('canAcceptDirectInput') is not False
-                         and not any(t['thread_id'] == tid for t in self.router.targets.values())
-                         and str(self.resolve(thread['cwd'])) == draft['cwd'])
-            except BindingError:
-                valid = False
-            if not valid:
-                self.save(draft['id'], state='blocked')
-                raise BindingError('新会话信息无法核对，已停止命名和绑定，请检查已有会话列表。')
-            await self.router.catalog_call('thread/name/set', {'threadId': tid, 'name': draft['name']})
-            self.save(draft['id'], state='named')
         try:
             target = await self.picker.bind(tid)
         except TopicCreationUnavailable as error:
@@ -296,6 +328,85 @@ class SessionCreator:
                                     [('返回会话管理', 'home', {})]])
         self.save(draft['id'], state='done')
         await self.picker.bound_panel(update, target)
+
+    def _all_request(self, guard_id):
+        return self.db.execute('SELECT a.*,d.chat_id,d.thread_id,d.state FROM ui_new_all a '
+                               'JOIN ui_new_drafts d ON d.id=a.creator_id WHERE a.guard_id=?',
+                               (guard_id,)).fetchone()
+
+    @staticmethod
+    def _binding(target):
+        return {key: target[key] for key in ('key', 'thread_id', 'message_thread_id')}
+
+    def created_all_binding(self, draft_id, revision, chat_id):
+        """Recover only an acknowledged, still-installed binding with no RPC."""
+        request = self._all_request(draft_id)
+        if (not request or request['revision'] != revision or request['chat_id'] != str(chat_id)
+                or request['bot_id'] != self.router.bot_id or request['state'] not in ('named', 'done')
+                or not self.router.owner_allowed() or not self.router.thread_allowed(request['thread_id'])):
+            return None
+        try:
+            if request['binding_json']:
+                binding = json.loads(request['binding_json'])
+            else:
+                operation = self.db.execute("SELECT target_json FROM binding_ops WHERE thread_id=? "
+                                            "AND status IN ('topic_created','configured','active')",
+                                            (request['thread_id'],)).fetchone()
+                if not operation:
+                    return None
+                target = json.loads(operation['target_json'])
+                if 'previous_message_thread_id' in target:
+                    return None
+                binding = self._binding(target)
+            target = self.router.targets.get(binding['key'])
+            if (binding['thread_id'] == request['thread_id'] and target and not target.get('topic_missing')
+                    and self._binding(target) == binding):
+                return binding
+        except (KeyError, TypeError, ValueError):
+            return None
+        return None
+
+    async def create_for_all(self, draft_id, revision, chat_id):
+        """Provision one Home session for an authorized, frozen All message."""
+        chat_id, bot_id = str(chat_id), self.router.bot_id
+        if type(bot_id) is not int or bot_id <= 0:
+            raise BindingError('当前 Bot 身份尚未确认，请稍后重试。')
+        self._check_access({'chat_id': chat_id}, bot_id)
+        request = self._all_request(draft_id)
+        if not request:
+            creator_id = secrets.token_urlsafe(12)
+            cwd = str(self.resolve(Path.home()))
+            now = time.time()
+            name = '新会话 ' + time.strftime('%m-%d %H:%M', time.localtime(now)) + ' · ' + creator_id[-6:]
+            with self.db:
+                self.db.execute('INSERT INTO ui_new_drafts VALUES(?,?,?,?,?,?,?,?,?)',
+                                (creator_id, chat_id, 'review', cwd, name, None, None, now + 900, now))
+                self.db.execute('INSERT INTO ui_new_all(guard_id,revision,bot_id,creator_id) VALUES(?,?,?,?)',
+                                (draft_id, revision, bot_id, creator_id))
+            request = self._all_request(draft_id)
+        if (request['revision'], request['chat_id'], request['bot_id']) != (revision, chat_id, bot_id):
+            raise BindingError('原消息版本或 Bot 身份已变化，请从待发送查看原消息。')
+        draft = self.draft(request['creator_id'], chat_id, allow_expired=True)
+        if draft['state'] in ('creating', 'uncertain', 'blocked'):
+            raise BindingError('上次新建会话的结果需要核对，不会再次创建。原消息保留在待发送。')
+        binding = self.created_all_binding(draft_id, revision, chat_id)
+        if binding is None:
+            if draft['state'] == 'done' or any(t['thread_id'] == draft['thread_id'] for t in self.router.targets.values()):
+                raise BindingError('新会话的话题绑定已变化，原消息保留在待发送。')
+            draft = await self._name_new_thread(draft, bot_id)
+            try:
+                target = await self.picker.bind(draft['thread_id'])
+            except TopicCreationUnavailable as error:
+                raise BindingError(f"会话「{draft['name']}」已保留。{error}\n重试将连接原会话。") from None
+            self._check_access(draft, bot_id)
+            binding = self._binding(target)
+            if binding['thread_id'] != draft['thread_id']:
+                raise BindingError('新话题未连接预期的 Codex 会话，原消息保留在待发送。')
+        with self.db:
+            self.db.execute('UPDATE ui_new_all SET binding_json=? WHERE guard_id=?',
+                            (json.dumps(binding, ensure_ascii=False), draft_id))
+            self.db.execute("UPDATE ui_new_drafts SET state='done',updated_at=? WHERE id=?", (time.time(), draft['id']))
+        return binding
 
     async def handle(self, update, action, data):
         if action == 'new:start':
@@ -319,11 +430,13 @@ class SessionCreator:
         raise BindingError('未知新建步骤，请重新打开 /sessions。')
 
     def unfinished(self, chat_id):
-        rows = self.db.execute("SELECT * FROM ui_new_drafts WHERE chat_id=? AND (state IN "
-                               "('created','named','creating','uncertain','blocked') OR "
-                               "(state='review' AND expires_at>?)) ORDER BY updated_at DESC LIMIT 5",
+        rows = self.db.execute("SELECT * FROM ui_new_drafts d WHERE chat_id=? AND (state IN "
+                               "('received','created','named','creating','uncertain','blocked') OR "
+                               "(state='review' AND expires_at>?)) AND NOT EXISTS "
+                               "(SELECT 1 FROM ui_new_all a WHERE a.creator_id=d.id) ORDER BY updated_at DESC LIMIT 5",
                                (str(chat_id), time.time())).fetchall()
-        return [row for row in rows if not row['thread_id'] or self.router.thread_allowed(row['thread_id'])]
+        return [row for row in rows if not row['thread_id'] or row['state'] == 'received'
+                or self.router.thread_allowed(row['thread_id'])]
 
     def recover(self):
         with self.db:
