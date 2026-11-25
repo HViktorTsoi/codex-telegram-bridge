@@ -306,6 +306,15 @@ request occurs before the destination is resolved. A late album member arriving
 before selection invalidates old buttons; members arriving after handoff form a
 new batch, with a newly checked sole binding or a fresh choice. Replies stay in
 the selected topic, without main-chat relay.
+
+The selector also offers **🆕 新建对话**. One click creates a new Codex session in
+the local user's home directory, assigns a temporary name, binds a new topic on
+this Bot, and delivers the selected card's original text and media. Pending
+creation keeps the selected draft revision fixed. The pending list can continue
+an interrupted operation. An acknowledged binding can resume delivery after a
+restart, while an ambiguous creation response requires checking existing sessions
+or topics before taking further action.
+
 Find held content under `/sessions` → **待发送**. Cancelled, expired or stale UI
 never falls back to the root session. Creator and dispatch ForceReply inputs,
 plain-text explicit aliases and slash commands retain their existing paths.

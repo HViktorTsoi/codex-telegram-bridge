@@ -442,6 +442,7 @@ class TargetBridge(NativeQuestions, Bridge):
                      "All 仅绑定一个会话时直接发送；多个会话时先选择接收会话。\n"
                      "/sessions → 待发送可找回未发内容。\n"
                      "在 All 回复已有话题消息可直接发到对应会话，仅发送新内容。\n"
+                     "All 的接收会话菜单可新建对话，在本机主目录创建会话并发送原消息。\n"
                      "/sessions 查看会话并添加绑定\n"
                      "/skills 查看本机会话可用技能并选择使用\n"
                      "/files 查看本话题的 Codex 输出文件\n"

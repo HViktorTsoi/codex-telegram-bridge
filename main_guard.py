@@ -1,14 +1,16 @@
 """Route All input to its sole bound topic or require an explicit selection."""
+import asyncio
 import copy
 import json
 import secrets
 import time
 
 from attachments import payload_from
-from bridge import permitted
+from bridge import RpcError, TelegramError, permitted
 from message_format import plain_chunks, utf16_size
 from reply_context import serialized as reply_serialized, render as render_reply
 from session_picker import BindingError, clean_name
+from session_scope import SessionScopeError
 
 
 class MainChatGuard:
@@ -257,7 +259,7 @@ class MainChatGuard:
 
     def pending_count(self):
         return self.db.execute("SELECT COUNT(*) FROM main_guard_drafts WHERE chat_id=? "
-                               "AND state IN ('held','review','expired')", (str(self.router.owner),)).fetchone()[0]
+                               "AND state IN ('held','review','expired','creating')", (str(self.router.owner),)).fetchone()[0]
 
     def _preview(self, draft):
         texts, files = [], []
@@ -320,6 +322,8 @@ class MainChatGuard:
             return await self._closed(update, draft)
         if draft['state'] == 'releasing':
             raise BindingError('这条消息正在投递，请稍后查看；不要重复选择。')
+        if draft['state'] == 'creating':
+            return await self._creation_panel(update, draft)
         targets = self.router.recent.ordered(t for t in self.router.targets.values()
             if not t.get('topic_missing') and (bridge := self.router.bridges.get(t['key']))
             and bridge.owner_allowed())
@@ -335,13 +339,42 @@ class MainChatGuard:
             navigation.append(('下一页', 'main:choose', {**base, 'page': page + 1}))
         if navigation:
             rows.append(navigation)
+        rows.append([('🆕 新建对话', 'main:new', base)])
         rows.append([('取消', 'main:cancel', base), ('待发送', 'main:list', {})])
         text = ('All · 选择接收会话\n这条消息尚未发送给 Codex。\n\n' + self._preview(draft) +
                 f"\n\n{self.router.config.get('host_id', '本机')} · 第 {page + 1}/{pages} 页\n"
-                '按最近访问排序。点击本机会话即发送。')
-        if not targets:
-            text += '\n暂无可用的已绑定会话，请先通过 /sessions 添加或修复绑定。'
+                '点击本机会话即发送，也可在主目录新建对话并发送。')
         return await self._panel(update, text, rows, draft)
+
+    async def _creation_panel(self, update, draft):
+        data = {'id': draft['id'], 'revision': draft['revision']}
+        text = ('All · 继续新建对话\n这条消息仍待发送。\n\n' + self._preview(draft)
+                + '\n\n' + (draft['error'] or '请继续处理已选的新建对话。'))
+        navigation = [('待发送', 'main:list', {}), ('会话管理', 'home', {})]
+        if not draft['selection_json']:
+            navigation.insert(0, ('取消发送', 'main:cancel', data))
+        rows = [[('重试新建并发送', 'main:new', data)], navigation]
+        return await self._panel(update, text, rows, draft)
+
+    def _release_created(self, draft, selected):
+        self._validate(selected)
+        self._save(draft['id'], state='releasing', selection_json=json.dumps(selected, sort_keys=True))
+        try:
+            self._release(self._draft(draft['id']))
+        except BindingError as error:
+            self._save(draft['id'], state='creating', error=str(error))
+            raise
+
+    async def _create_and_release(self, update, draft):
+        try:
+            selected = await self.picker.creator.create_for_all(draft['id'], draft['revision'], draft['chat_id'])
+            self._release_created(draft, selected)
+        except (BindingError, SessionScopeError, RpcError, TelegramError,
+                ConnectionError, OSError, asyncio.TimeoutError) as error:
+            detail = str(error) if isinstance(error, BindingError) else '暂时无法完成创建或连接，请稍后重试。'
+            self._save(draft['id'], error=detail)
+            return await self._creation_panel(update, self._draft(draft['id']))
+        return await self._closed(update, self._draft(draft['id']), created=True)
 
     async def present(self, update):
         row = self.db.execute('SELECT draft_id FROM main_guard_messages WHERE update_id=?',
@@ -349,7 +382,7 @@ class MainChatGuard:
         if not row:
             return
         draft = self._draft(row['draft_id'])
-        if draft['state'] in ('queued', 'cancelled', 'releasing'):
+        if draft['state'] in ('queued', 'cancelled', 'releasing', 'creating'):
             return
         if draft['panel_id'] and draft['presented_revision'] == draft['revision']:
             return
@@ -378,7 +411,7 @@ class MainChatGuard:
 
     async def listing(self, update, page=0):
         drafts = self.db.execute("SELECT id FROM main_guard_drafts WHERE chat_id=? "
-                                 "AND state IN ('held','review','expired') ORDER BY last_at,id",
+                                 "AND state IN ('held','review','expired','creating') ORDER BY last_at,id",
                                  (str(self.router.owner),)).fetchall()
         pages = max(1, (len(drafts) + self.PAGE - 1) // self.PAGE)
         page = max(0, min(int(page), pages - 1))
@@ -398,11 +431,15 @@ class MainChatGuard:
         rows.append([('刷新待发送', 'main:list', {'page': page}), ('返回会话管理', 'home', {})])
         return await self._panel(update, '\n'.join(text), rows)
 
-    async def _closed(self, update, draft):
+    async def _closed(self, update, draft, *, created=False):
         if draft['state'] == 'queued':
             selected = json.loads(draft['selection_json'])
             target = self._validate(selected)
-            text = '已加入「' + clean_name(target.get('name') or selected['key']) + '」的队列。\n回复会出现在该会话的话题中。'
+            name = clean_name(target.get('name') or selected['key'])
+            if created:
+                text = f'已新建「{name}」，原消息已加入队列。\n回复会出现在新话题中。'
+            else:
+                text = f'已加入「{name}」的队列。\n回复会出现在该会话的话题中。'
         else:
             text = '已取消，这条消息不会交给 Codex。'
         return await self._panel(update, text, [[('待发送', 'main:list', {}), ('返回会话管理', 'home', {})]], draft)
@@ -466,10 +503,19 @@ class MainChatGuard:
             return await self.listing(update, data.get('page', 0))
         origin = update.get('callback_query', {}).get('message') or update['message']
         draft = self._draft(data['id'], origin['chat']['id'])
+        if action == 'main:new' and origin['message_id'] != draft['panel_id']:
+            raise BindingError('这张消息卡片已更新，请从待发送打开最新入口。')
         if draft['state'] in ('queued', 'cancelled'):
             return await self._closed(update, draft)
         if draft['state'] == 'releasing':
             raise BindingError('这条消息正在投递，不能更换目标或取消；请稍后查看所选话题。')
+        if draft['state'] == 'creating':
+            if action == 'main:choose':
+                return await self._creation_panel(update, draft)
+            if action == 'main:new' and data.get('revision') == draft['selected_revision'] == draft['revision']:
+                return await self._create_and_release(update, draft)
+            if action != 'main:cancel' or draft['selection_json']:
+                raise BindingError('请继续处理已选的新建对话。')
         if action == 'main:cancel':
             self._save(draft['id'], state='cancelled', selection_json=None, selected_revision=None)
             return await self._closed(update, self._draft(draft['id']))
@@ -481,6 +527,13 @@ class MainChatGuard:
             raise BindingError('这条待发送消息已过期，原文仍保留；请从 /sessions → 待发送重新选择。')
         if data.get('revision') != draft['revision']:
             raise BindingError('相册内容已变化，消息未发送；请从 /sessions → 待发送重新选择。')
+        if action == 'main:new':
+            if draft['album_id'] and self.clock() - draft['last_at'] < 2:
+                raise BindingError('相册仍在接收，请稍后点击新建对话。')
+            # Freeze the selected message and album membership before creating anything.
+            self._save(draft['id'], state='creating', selection_json=None, selected_revision=draft['revision'],
+                       confirmed_at=self.clock(), mirror_input=int(len(self.router.targets) != 1), error=None)
+            return await self._create_and_release(update, self._draft(draft['id']))
         if action == 'main:select':
             selected = data['target']
             self._validate(selected)
@@ -522,3 +575,13 @@ class MainChatGuard:
                 self._release(draft)
             except BindingError as error:
                 self._save(draft['id'], state='expired', selection_json=None, selected_revision=None, error=str(error))
+        for row in self.db.execute("SELECT id FROM main_guard_drafts WHERE state='creating'").fetchall():
+            draft = self._draft(row['id'])
+            if not self.router.owner_allowed() or draft['selected_revision'] != draft['revision']:
+                continue
+            try:
+                selected = self.picker.creator.created_all_binding(draft['id'], draft['revision'], draft['chat_id'])
+                if selected:
+                    self._release_created(draft, selected)
+            except (BindingError, SessionScopeError) as error:
+                self._save(draft['id'], error=str(error))
